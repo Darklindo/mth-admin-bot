@@ -40,7 +40,7 @@ load_dotenv(BASE_DIR / ".env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "6822870889"))
-SECOND_OWNER_ID = 6466326477  # @MHZINTADEVOLTAPORRRRRRAAAA
+SECOND_OWNER_ID = 6466326477
 
 if not BOT_TOKEN:
     print("ERRO: BOT_TOKEN não configurado no .env")
@@ -53,7 +53,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.WARNING,
 )
-logger = logging.getLogger("mth-admin")
+logger = logging.getLogger("Jtzin-Admin")
 logger.setLevel(logging.INFO)
 
 # --- DECORADOR DE ERROS ---
@@ -109,18 +109,15 @@ class Database:
         row = self.execute("SELECT 1 FROM link_whitelist WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id))).fetchone()
         return row is not None
 
-    def add_link_whitelist(self, chat_id, user_id):
-        self.execute("INSERT OR IGNORE INTO link_whitelist(chat_id, user_id) VALUES(?,?)", (int(chat_id), int(user_id)), commit=True)
-
-    def remove_link_whitelist(self, chat_id, user_id):
-        self.execute("DELETE FROM link_whitelist WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)), commit=True)
-
     def get_global_status(self, user_id):
         row = self.execute("SELECT type FROM global_blacklist WHERE user_id=?", (int(user_id),)).fetchone()
         return row['type'] if row else None
 
     def add_global_blacklist(self, user_id, type_name, reason=""):
         self.execute("INSERT OR REPLACE INTO global_blacklist(user_id, type, reason, created_at) VALUES(?,?,?,?)", (int(user_id), type_name, reason, int(time.time())), commit=True)
+
+    def remove_global_blacklist(self, user_id):
+        self.execute("DELETE FROM global_blacklist WHERE user_id=?", (int(user_id),), commit=True)
 
     def is_shadow_banned(self, user_id):
         row = self.execute("SELECT 1 FROM shadow_ban WHERE user_id=?", (int(user_id),)).fetchone()
@@ -198,31 +195,45 @@ def get_target(update: Update):
 # --- COMANDOS ---
 @error_handler
 async def cmd_start(update, context):
-    await update.message.reply_text("🛡️ <b>MTH ADMIN SUPREMO V5.0</b>\n\nImunidade Absoluta Ativada.", parse_mode=ParseMode.HTML)
+    await update.message.reply_text("🛡️ <b>Jtzin Administrator V1</b>", parse_mode=ParseMode.HTML)
 
 @error_handler
-async def cmd_painel(update, context):
+async def cmd_help(update, context):
+    text = (
+        "🛡️ <b>LISTA DE COMANDOS</b>\n\n"
+        "<b>Moderação:</b> /ban, /mute, /kick, /warn, /purge, /lock, /unlock\n"
+        "<b>Segurança:</b> /settings, /allowlink, /removelink, /shadow, /unshadow\n"
+        "<b>Global:</b> /allban, /allblack, /blacklist, /unblacklist\n"
+        "<b>Broadcast:</b> /msg, /chats"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+@error_handler
+async def cmd_allban(update, context):
     if update.effective_user.id != OWNER_ID: return
-    webapp_url = "https://manus.im" 
-    keyboard = [[InlineKeyboardButton("🖥️ Abrir Painel Supremo", web_app=WebAppInfo(url=webapp_url))]]
-    await update.message.reply_text("📊 <b>Painel de Controle Supremo</b>\n\nGerencie seus grupos visualmente:", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
-
-@error_handler
-async def cmd_shadow(update, context):
-    if not await is_admin(update, context): return
     target_id = get_target(update)
-    if not target_id: return await update.message.reply_text("Uso: /shadow [ID ou Resposta]")
-    if is_immune(target_id): return await update.message.reply_text("❌ Impossível punir o Mestre.")
-    db.add_shadow_ban(target_id)
-    await update.message.reply_text(f"🌑 <b>Usuário em Shadow Ban!</b>", parse_mode=ParseMode.HTML)
+    if not target_id or is_immune(target_id): return
+    db.add_global_blacklist(target_id, 'ban', "Ban Global")
+    for row in db.all_chats():
+        try: await context.bot.ban_chat_member(row['chat_id'], target_id)
+        except: continue
+    await update.message.reply_text(f"✅ Usuário {target_id} banido globalmente.")
 
 @error_handler
-async def cmd_unshadow(update, context):
-    if not await is_admin(update, context): return
+async def cmd_allblack(update, context):
+    if update.effective_user.id != OWNER_ID: return
+    target_id = get_target(update)
+    if not target_id or is_immune(target_id): return
+    db.add_global_blacklist(target_id, 'black', "Blacklist Global")
+    await update.message.reply_text(f"✅ Usuário {target_id} em blacklist global.")
+
+@error_handler
+async def cmd_unblacklist(update, context):
+    if update.effective_user.id != OWNER_ID: return
     target_id = get_target(update)
     if not target_id: return
-    db.remove_shadow_ban(target_id)
-    await update.message.reply_text("✅ Shadow Ban removido.")
+    db.remove_global_blacklist(target_id)
+    await update.message.reply_text(f"✅ Usuário {target_id} removido da blacklist.")
 
 @error_handler
 async def cmd_msg(update, context):
@@ -240,20 +251,20 @@ async def cmd_msg(update, context):
             sent += 1
             await asyncio.sleep(0.3)
         except: continue
-    await msg.reply_text(f"📢 Transmissão concluída para {sent} chats.")
+    await msg.reply_text(f"📢 Transmissão concluída: {sent} chats.")
 
 @error_handler
 async def cmd_lock(update, context):
     if not await is_admin(update, context): return
     await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=False))
-    await update.message.reply_text("🔒 <b>Grupo Fechado!</b>", parse_mode=ParseMode.HTML)
+    await update.message.reply_text("🔒 Grupo Fechado.")
 
 @error_handler
 async def cmd_unlock(update, context):
     if not await is_admin(update, context): return
     perms = ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True, can_send_photos=True, can_send_videos=True, can_send_other_messages=True, can_add_web_page_previews=True)
     await context.bot.set_chat_permissions(update.effective_chat.id, perms)
-    await update.message.reply_text("🔓 <b>Grupo Aberto!</b>", parse_mode=ParseMode.HTML)
+    await update.message.reply_text("🔓 Grupo Aberto.")
 
 @error_handler
 async def cmd_purge(update, context):
@@ -262,7 +273,7 @@ async def cmd_purge(update, context):
     amount = int(context.args[0]) if context.args and context.args[0].isdigit() else 0
     if not amount and msg.reply_to_message:
         amount = msg.message_id - msg.reply_to_message.message_id
-    if not amount: return await msg.reply_text("Uso: /purge [número] ou responda.")
+    if not amount: return
     amount = min(amount, 100)
     await safe_delete(msg)
     for i in range(amount):
@@ -278,15 +289,38 @@ async def cmd_ban(update, context):
     await update.message.reply_text("🚫 Usuário banido.")
 
 @error_handler
-async def cmd_allban(update, context):
-    if update.effective_user.id != OWNER_ID: return
+async def cmd_mute(update, context):
+    if not await is_admin(update, context): return
     target_id = get_target(update)
     if not target_id or is_immune(target_id): return
-    db.add_global_blacklist(target_id, 'ban', "Nuclear")
-    for row in db.all_chats():
-        try: await context.bot.ban_chat_member(row['chat_id'], target_id)
-        except: continue
-    await update.message.reply_text("☢️ Banimento Global aplicado.")
+    await context.bot.restrict_chat_member(update.effective_chat.id, target_id, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now() + timedelta(hours=24))
+    await update.message.reply_text("🔇 Usuário mutado por 24h.")
+
+@error_handler
+async def cmd_shadow(update, context):
+    if not await is_admin(update, context): return
+    target_id = get_target(update)
+    if not target_id or is_immune(target_id): return
+    db.add_shadow_ban(target_id)
+    await update.message.reply_text("🌑 Usuário em Shadow Ban.")
+
+@error_handler
+async def cmd_unshadow(update, context):
+    if not await is_admin(update, context): return
+    target_id = get_target(update)
+    if not target_id: return
+    db.remove_shadow_ban(target_id)
+    await update.message.reply_text("✅ Shadow Ban removido.")
+
+@error_handler
+async def cmd_chats(update, context):
+    if update.effective_user.id != OWNER_ID: return
+    rows = db.all_chats()
+    if not rows: return await update.message.reply_text("Nenhum chat registrado.")
+    lines = ["📡 <b>CHATS:</b>"]
+    for row in rows:
+        lines.append(f"• <code>{row['chat_id']}</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 @error_handler
 async def cmd_settings(update, context):
@@ -297,18 +331,7 @@ async def cmd_settings(update, context):
         [InlineKeyboardButton(f"Anti-Link: {'✅' if db.get_setting(chat_id, 'antilink', 0) else '❌'}", callback_data="toggle_antilink")],
         [InlineKeyboardButton(f"Captcha: {'✅' if db.get_setting(chat_id, 'captcha_enabled', 0) else '❌'}", callback_data="toggle_captcha")]
     ]
-    await update.message.reply_text("⚙️ <b>CONFIGURAÇÕES V5.0</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
-
-# --- TAREFAS AUTOMÁTICAS ---
-async def captcha_monitor(context: ContextTypes.DEFAULT_TYPE):
-    expired = db.get_expired_captchas()
-    for row in expired:
-        try:
-            await context.bot.ban_chat_member(row['chat_id'], row['user_id'])
-            await context.bot.unban_chat_member(row['chat_id'], row['user_id'])
-            await context.bot.delete_message(row['chat_id'], row['message_id'])
-        except: pass
-        db.remove_captcha_pending(row['chat_id'], row['user_id'])
+    await update.message.reply_text("⚙️ <b>CONFIGURAÇÕES</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
 # --- HANDLERS ---
 @error_handler
@@ -320,8 +343,8 @@ async def join_handler(update, context):
         if is_immune(user.id): return
         try:
             await context.bot.restrict_chat_member(chat.id, user.id, permissions=ChatPermissions(can_send_messages=False))
-            keyboard = [[InlineKeyboardButton("✅ Não sou um robô", callback_data=f"verify_{user.id}")]]
-            msg = await context.bot.send_message(chat.id, f"👋 Olá {user.first_name}!\nClique no botão abaixo em 60s.", reply_markup=InlineKeyboardMarkup(keyboard))
+            keyboard = [[InlineKeyboardButton("✅ Verificar", callback_data=f"verify_{user.id}")]]
+            msg = await context.bot.send_message(chat.id, f"👋 {user.first_name}, clique abaixo para verificar.", reply_markup=InlineKeyboardMarkup(keyboard))
             db.add_captcha_pending(chat.id, user.id, msg.message_id)
         except: pass
 
@@ -351,8 +374,8 @@ async def on_callback(update, context):
         db.remove_captcha_pending(chat_id, target_id)
         perms = ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True, can_send_photos=True, can_send_videos=True, can_send_other_messages=True, can_add_web_page_previews=True)
         await context.bot.restrict_chat_member(chat_id, target_id, permissions=perms)
-        await query.message.edit_text(f"✅ Verificado!")
-        await asyncio.sleep(3)
+        await query.message.edit_text("✅ Verificado.")
+        await asyncio.sleep(2)
         await safe_delete(query.message)
     elif await is_admin(update, context):
         if data == "toggle_antispam": db.set_setting(chat_id, "antispam", 1 - db.get_setting(chat_id, "antispam", 1))
@@ -362,27 +385,30 @@ async def on_callback(update, context):
 
 async def post_init(app: Application):
     await app.bot.set_my_commands([
-        BotCommand("start", "Iniciar"), BotCommand("settings", "Configurações"),
-        BotCommand("painel", "Painel WebApp"), BotCommand("shadow", "Shadow Ban"),
-        BotCommand("msg", "Transmissão Supremo"), BotCommand("purge", "Limpar"),
-        BotCommand("ban", "Banir"), BotCommand("lock", "Fechar"), BotCommand("unlock", "Abrir")
+        BotCommand("start", "Iniciar"), BotCommand("help", "Ajuda"), BotCommand("settings", "Configurações"),
+        BotCommand("lock", "Fechar"), BotCommand("unlock", "Abrir"), BotCommand("purge", "Limpar"),
+        BotCommand("ban", "Banir"), BotCommand("mute", "Silenciar"), BotCommand("msg", "Transmissão")
     ])
-    if app.job_queue: app.job_queue.run_repeating(captcha_monitor, interval=10)
-    logger.info("MTH ADMIN SUPREMO V5.0 ONLINE!")
+    logger.info("Jtzin Administrator V1 ONLINE!")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("painel", cmd_painel))
-    app.add_handler(CommandHandler("shadow", cmd_shadow))
-    app.add_handler(CommandHandler("unshadow", cmd_unshadow))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("msg", cmd_msg))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("purge", cmd_purge))
     app.add_handler(CommandHandler("ban", cmd_ban))
+    app.add_handler(CommandHandler("mute", cmd_mute))
     app.add_handler(CommandHandler("lock", cmd_lock))
     app.add_handler(CommandHandler("unlock", cmd_unlock))
     app.add_handler(CommandHandler("allban", cmd_allban))
+    app.add_handler(CommandHandler("allblack", cmd_allblack))
+    app.add_handler(CommandHandler("blacklist", cmd_allblack))
+    app.add_handler(CommandHandler("unblacklist", cmd_unblacklist))
+    app.add_handler(CommandHandler("shadow", cmd_shadow))
+    app.add_handler(CommandHandler("unshadow", cmd_unshadow))
+    app.add_handler(CommandHandler("chats", cmd_chats))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, join_handler))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, message_handler))
