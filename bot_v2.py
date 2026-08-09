@@ -273,7 +273,7 @@ def target_from_update(update: Update):
 # --- COMANDOS ---
 async def cmd_start(update, context):
     keyboard = [[InlineKeyboardButton("📚 Ajuda", callback_data="help_main")]]
-    await update.message.reply_text("🛡️ <b>MTH ADMIN BOT V2.2</b>\n\nPronto para moderar!", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("🛡️ <b>MTH ADMIN BOT V2.2.4</b>\n\nMenu de comandos corrigido!", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cmd_help(update, context):
     text = (
@@ -306,11 +306,9 @@ async def cmd_purge(update, context):
     msg = update.effective_message
     chat_id = update.effective_chat.id
     
-    # Caso 1: Por quantidade (/purge 20)
     if context.args and context.args[0].isdigit():
         amount = int(context.args[0])
         if amount > 100: amount = 100
-        
         await safe_delete(msg)
         count = 0
         current_id = msg.message_id
@@ -319,13 +317,11 @@ async def cmd_purge(update, context):
                 await context.bot.delete_message(chat_id, current_id - i - 1)
                 count += 1
             except: continue
-        
         status = await context.bot.send_message(chat_id, f"🧹 {count} mensagens limpas!")
         await asyncio.sleep(3)
         await safe_delete(status)
         return
 
-    # Caso 2: Por resposta (Range)
     if msg.reply_to_message:
         start_id = msg.reply_to_message.message_id
         end_id = msg.message_id
@@ -392,7 +388,6 @@ async def cmd_warn(update, context):
     if not target:
         await update.message.reply_text("Uso: /warn @user ou responda a uma mensagem.")
         return
-    uid = target.id if hasattr(target, 'id') else target
     await update.message.reply_text(f"⚠️ Usuário advertido.")
 
 async def cmd_allowlink(update, context):
@@ -551,7 +546,6 @@ async def on_callback(update, context):
         elif query.data == "toggle_night":
             db.set_setting(chat_id, "night_mode_auto", 0 if db.get_setting(chat_id, "night_mode_auto", 0) else 1)
         
-        # Recriar o teclado para refletir a mudança
         antispam = "✅" if db.get_setting(chat_id, "antispam", 1) else "❌"
         antilink = "✅" if db.get_setting(chat_id, "antilink", 0) else "❌"
         antiraid = "✅" if db.get_setting(chat_id, "antiraid", 1) else "❌"
@@ -565,25 +559,31 @@ async def on_callback(update, context):
         try:
             await query.edit_message_text("⚙️ <b>CONFIGURAÇÕES</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
         except BadRequest as e:
-            if "Message is not modified" not in str(e):
-                raise e
+            if "Message is not modified" not in str(e): raise e
     except Exception as e:
         logger.error(f"Erro no callback: {e}")
 
 async def post_init(app: Application):
     try:
+        # COMANDOS QUE APARECERÃO NO MENU "/"
         commands = [
-            BotCommand("start", "Iniciar"),
-            BotCommand("help", "Ajuda"),
+            BotCommand("start", "Iniciar o bot"),
+            BotCommand("help", "Ver ajuda"),
             BotCommand("settings", "Configurações"),
             BotCommand("lock", "Fechar grupo"),
             BotCommand("unlock", "Abrir grupo"),
             BotCommand("purge", "Limpar mensagens"),
+            BotCommand("ban", "Banir usuário"),
+            BotCommand("kick", "Expulsar usuário"),
+            BotCommand("mute", "Silenciar usuário"),
+            BotCommand("warn", "Advertir usuário"),
+            BotCommand("allowlink", "Autorizar links"),
+            BotCommand("removelink", "Remover autorização"),
         ]
         await app.bot.set_my_commands(commands)
         if app.job_queue:
             app.job_queue.run_repeating(night_mode_checker, interval=60, first=10)
-        logger.info("MTH ADMIN BOT V2.2 ONLINE!")
+        logger.info("MTH ADMIN BOT V2.2.4 ONLINE!")
     except Exception as e:
         logger.error(f"Erro no post_init: {e}")
 
