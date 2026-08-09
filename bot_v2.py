@@ -59,25 +59,40 @@ logger.setLevel(logging.INFO)
 class Cache:
     def __init__(self):
         self.global_blacklist = set()
+        self.local_blacklist = defaultdict(set)
+        self.local_banperm = defaultdict(set)
         self.shadow_ban = set()
         self.link_whitelist = defaultdict(set)
         self.settings = {}
 
     def load_all(self, db_conn):
         try:
+            # Global
             cursor = db_conn.execute("SELECT user_id FROM global_blacklist")
             self.global_blacklist = {row[0] for row in cursor.fetchall()}
+            
+            # Local Blacklist
+            cursor = db_conn.execute("SELECT chat_id, user_id FROM local_blacklist")
+            for row in cursor.fetchall():
+                self.local_blacklist[row[0]].add(row[1])
+                
+            # Local BanPerm
+            cursor = db_conn.execute("SELECT chat_id, user_id FROM local_banperm")
+            for row in cursor.fetchall():
+                self.local_banperm[row[0]].add(row[1])
+
             cursor = db_conn.execute("SELECT user_id FROM shadow_ban")
             self.shadow_ban = {row[0] for row in cursor.fetchall()}
+            
             cursor = db_conn.execute("SELECT chat_id, user_id FROM link_whitelist")
             for row in cursor.fetchall():
                 self.link_whitelist[row[0]].add(row[1])
+                
             cursor = db_conn.execute("SELECT chat_id, antispam, antilink, captcha_enabled FROM settings")
             for row in cursor.fetchall():
                 self.settings[row[0]] = {
                     "antispam": row[1], "antilink": row[2], "captcha_enabled": row[3]
                 }
-            logger.info(f"Cache carregado: {len(self.global_blacklist)} bans, {len(self.shadow_ban)} shadows.")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -113,6 +128,40 @@ class Database:
             self.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (int(chat_id),), commit=True)
             cache.settings[int(chat_id)] = {"antispam": 1, "antilink": 0, "captcha_enabled": 0}
 
+    # Punições Locais
+    def add_local_banperm(self, chat_id, user_id, reason=None):
+        self.execute("INSERT OR REPLACE INTO local_banperm(chat_id, user_id, reason, created_at) VALUES(?,?,?,?)", (int(chat_id), int(user_id), reason, int(time.time())), commit=True)
+        cache.local_banperm[int(chat_id)].add(int(user_id))
+
+    def remove_local_banperm(self, chat_id, user_id):
+        self.execute("DELETE FROM local_banperm WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)), commit=True)
+        if int(chat_id) in cache.local_banperm: cache.local_banperm[int(chat_id)].discard(int(user_id))
+
+    def add_local_blacklist(self, chat_id, user_id, reason=None):
+        self.execute("INSERT OR REPLACE INTO local_blacklist(chat_id, user_id, reason, created_at) VALUES(?,?,?,?)", (int(chat_id), int(user_id), reason, int(time.time())), commit=True)
+        cache.local_blacklist[int(chat_id)].add(int(user_id))
+
+    def remove_local_blacklist(self, chat_id, user_id):
+        self.execute("DELETE FROM local_blacklist WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)), commit=True)
+        if int(chat_id) in cache.local_blacklist: cache.local_blacklist[int(chat_id)].discard(int(user_id))
+
+    # Punições Globais
+    def add_global_blacklist(self, user_id, type_name="ban", reason=None):
+        self.execute("INSERT OR REPLACE INTO global_blacklist(user_id, type, reason, created_at) VALUES(?,?,?,?)", (int(user_id), type_name, reason, int(time.time())), commit=True)
+        cache.global_blacklist.add(int(user_id))
+
+    def remove_global_blacklist(self, user_id):
+        self.execute("DELETE FROM global_blacklist WHERE user_id=?", (int(user_id),), commit=True)
+        cache.global_blacklist.discard(int(user_id))
+
+    def add_shadow_ban(self, user_id, reason=None):
+        self.execute("INSERT OR REPLACE INTO shadow_ban(user_id, reason, created_at) VALUES(?,?,?)", (int(user_id), reason, int(time.time())), commit=True)
+        cache.shadow_ban.add(int(user_id))
+
+    def remove_shadow_ban(self, user_id):
+        self.execute("DELETE FROM shadow_ban WHERE user_id=?", (int(user_id),), commit=True)
+        cache.shadow_ban.discard(int(user_id))
+
     def get_setting(self, chat_id, key, default=0):
         if chat_id in cache.settings:
             return cache.settings[chat_id].get(key, default)
@@ -129,24 +178,7 @@ class Database:
 
     def remove_link_whitelist(self, chat_id, user_id):
         self.execute("DELETE FROM link_whitelist WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)), commit=True)
-        if int(chat_id) in cache.link_whitelist:
-            cache.link_whitelist[int(chat_id)].discard(int(user_id))
-
-    def add_global_blacklist(self, user_id, type_name="ban", reason=None):
-        self.execute("INSERT OR REPLACE INTO global_blacklist(user_id, type, reason, created_at) VALUES(?,?,?,?)", (int(user_id), type_name, reason, int(time.time())), commit=True)
-        cache.global_blacklist.add(int(user_id))
-
-    def remove_global_blacklist(self, user_id):
-        self.execute("DELETE FROM global_blacklist WHERE user_id=?", (int(user_id),), commit=True)
-        cache.global_blacklist.discard(int(user_id))
-
-    def add_shadow_ban(self, user_id, reason=None):
-        self.execute("INSERT OR REPLACE INTO shadow_ban(user_id, reason, created_at) VALUES(?,?,?)", (int(user_id), reason, int(time.time())), commit=True)
-        cache.shadow_ban.add(int(user_id))
-
-    def remove_shadow_ban(self, user_id):
-        self.execute("DELETE FROM shadow_ban WHERE user_id=?", (int(user_id),), commit=True)
-        cache.shadow_ban.discard(int(user_id))
+        if int(chat_id) in cache.link_whitelist: cache.link_whitelist[int(chat_id)].discard(int(user_id))
 
     def resolve_username(self, username):
         username = username.lower().lstrip("@")
@@ -207,17 +239,6 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         return member.status in ("administrator", "creator")
     except: return False
 
-def parse_time(time_str):
-    if not time_str: return None
-    match = re.match(r"(\d+)([smhd])", time_str.lower())
-    if not match: return None
-    val, unit = int(match.group(1)), match.group(2)
-    if unit == 's': return timedelta(seconds=val)
-    if unit == 'm': return timedelta(minutes=val)
-    if unit == 'h': return timedelta(hours=val)
-    if unit == 'd': return timedelta(days=val)
-    return None
-
 def get_target(update: Update):
     msg = update.effective_message
     if not msg: return None
@@ -249,11 +270,23 @@ async def global_security_filter(update: Update, context: ContextTypes.DEFAULT_T
 
     if is_owner(user.id): return
 
-    if user.id in cache.global_blacklist or user.id in cache.shadow_ban:
-        try: await msg.delete()
+    # Verificação de Punições Globais e Locais
+    is_banned = (
+        user.id in cache.global_blacklist or 
+        user.id in cache.shadow_ban or 
+        user.id in cache.local_blacklist[msg.chat_id] or
+        user.id in cache.local_banperm[msg.chat_id]
+    )
+
+    if is_banned:
+        try:
+            await msg.delete()
+            if user.id in cache.global_blacklist or user.id in cache.local_banperm[msg.chat_id]:
+                await context.bot.ban_chat_member(msg.chat_id, user.id)
         except: pass
         return True
 
+    # Anti-Link
     if db.get_setting(msg.chat_id, "antilink") and any(e.type in ["url", "text_link"] for e in msg.entities or []):
         if user.id not in cache.link_whitelist[msg.chat_id]:
             try: await msg.delete()
@@ -265,20 +298,19 @@ async def global_security_filter(update: Update, context: ContextTypes.DEFAULT_T
 @error_handler
 async def cmd_start(update, context):
     text = (
-        "🛡️ <b>Jtzin Administrator V1.4.0</b>\n\n"
-        "O bot de administração definitivo para elevar o nível do seu grupo ou canal. "
-        "Segurança avançada, moderação rápida e controle total em suas mãos.\n\n"
+        "🛡️ <b>Jtzin Administrator V1.4.1</b>\n\n"
+        "O bot de administração definitivo para elevar o nível do seu grupo ou canal.\n\n"
         "💎 <b>Equipe Diamond</b> — <i>Excelência em Automação</i>\n\n"
         "🚀 <b>Recursos de Elite:</b>\n"
         "• Anti-Link e Anti-Spam inteligente\n"
-        "• Punições Globais e Blacklist\n"
+        "• Punições Locais e Globais\n"
         "• Sistema de Shadow Ban\n"
         "• Moderação por Resposta e ID\n\n"
-        "Use os botões abaixo para navegar e configurar seu bot."
+        "Use os botões abaixo para navegar."
     )
     keyboard = [
         [InlineKeyboardButton("💎 Canal Oficial Diamond", url="https://t.me/upadatesproxymodmenu")],
-        [InlineKeyboardButton("🛡️ Coloque o bot no seu Canal ou Grupo!", url="https://t.me/Jtcaciadminbot?startgroup=true")],
+        [InlineKeyboardButton("🛡️ Adicionar ao Grupo!", url="https://t.me/Jtcaciadminbot?startgroup=true")],
         [InlineKeyboardButton("🐞 Feedbacks / Bugs", url="https://t.me/OnlyExaltarei")]
     ]
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -287,122 +319,91 @@ async def cmd_start(update, context):
 async def cmd_help(update, context):
     text = (
         "📖 <b>GUIA DE COMANDOS - Jtzin Admin</b>\n\n"
-        "🛡️ <b>MODERAÇÃO:</b>\n"
-        "• <code>/ban</code> - Bane o usuário (aceita tempo: 1h, 7d).\n"
-        "• <code>/mute</code> - Silencia o usuário (aceita tempo).\n"
-        "• <code>/kick</code> - Expulsa o usuário do grupo.\n"
-        "• <code>/warn</code> - Aplica uma advertência.\n"
-        "• <code>/shadow</code> - Ativa Shadow Ban (mensagens apagadas).\n"
-        "• <code>/unshadow</code> - Remove Shadow Ban.\n\n"
-        "⚙️ <b>CONFIGURAÇÃO DO GRUPO:</b>\n"
-        "• <code>/settings</code> - Menu visual de configurações.\n"
-        "• <code>/lock</code> - Fecha o grupo para membros.\n"
-        "• <code>/unlock</code> - Abre o grupo novamente.\n"
-        "• <code>/purge</code> - Limpa mensagens (ex: /purge 20).\n"
-        "• <code>/allowlink</code> - Autoriza usuário a mandar links.\n"
-        "• <code>/removelink</code> - Remove autorização de links.\n\n"
+        "🛡️ <b>MODERAÇÃO LOCAL:</b>\n"
+        "• <code>/banperm</code> - Bane permanentemente deste grupo.\n"
+        "• <code>/blacklist</code> - Apaga mensagens deste usuário neste grupo.\n"
+        "• <code>/ban</code> - Bane o usuário temporário.\n"
+        "• <code>/mute</code> - Silencia o usuário.\n"
+        "• <code>/purge</code> - Limpa mensagens.\n\n"
+        "⚙️ <b>CONFIGURAÇÃO:</b>\n"
+        "• <code>/settings</code> - Menu de configurações.\n"
+        "• <code>/lock</code> / <code>/unlock</code> - Fecha/Abre grupo.\n\n"
         "🛠️ <b>UTILITÁRIOS:</b>\n"
-        "• <code>/id</code> - Mostra seu ID ou de quem você responder.\n"
-        "• <code>/start</code> - Mensagem inicial e botões.\n\n"
-        "<i>Dica: Todos os comandos de moderação funcionam respondendo a uma mensagem!</i>"
+        "• <code>/id</code> - Mostra o ID.\n"
+        "<i>Comandos Nucleares são exclusivos para Donos.</i>"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 @error_handler
 async def cmd_id(update, context):
-    target_id = get_target(update)
-    if not target_id: target_id = update.effective_user.id
+    target_id = get_target(update) or update.effective_user.id
     await update.message.reply_text(f"🆔 ID: <code>{target_id}</code>", parse_mode=ParseMode.HTML)
 
+# PUNIÇÕES LOCAIS
 @error_handler
-async def cmd_listdn(update, context):
-    if not is_owner(update.effective_user.id): return
-    shadow, glob = db.get_all_banned_list_detailed()
-    text = "📋 <b>RELATÓRIO DE PUNIÇÕES:</b>\n\n"
-    
-    text += "🌑 <b>Shadow Ban:</b>\n"
-    if not shadow: text += "<i>Nenhum</i>\n"
-    for r in shadow:
-        dt = datetime.fromtimestamp(r['created_at']).strftime('%d/%m %H:%M')
-        reason = f" | Motivo: {r['reason']}" if r['reason'] else ""
-        text += f"• {db.get_user_info(r['user_id'])} (<code>{r['user_id']}</code>)\n  └ 📅 {dt}{reason}\n\n"
-    
-    text += "🌎 <b>Global Blacklist:</b>\n"
-    if not glob: text += "<i>Nenhum</i>\n"
-    for r in glob:
-        dt = datetime.fromtimestamp(r['created_at']).strftime('%d/%m %H:%M')
-        reason = f" | Motivo: {r['reason']}" if r['reason'] else ""
-        type_icon = "🚫" if r['type'] == 'ban' else "🌑"
-        text += f"• {db.get_user_info(r['user_id'])} (<code>{r['user_id']}</code>) [{r['type'].upper()}]\n  └ {type_icon} {dt}{reason}\n\n"
-    
-    text += f"📊 <b>Total Neutralizados:</b> {len(shadow) + len(glob)}"
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+async def cmd_banperm(update, context):
+    if not await is_admin(update, context): return
+    target_id = get_target(update)
+    if not target_id or is_owner(target_id): return
+    db.add_local_banperm(update.effective_chat.id, target_id, get_reason(update))
+    try: await context.bot.ban_chat_member(update.effective_chat.id, target_id)
+    except: pass
+    await update.message.reply_text(f"✅ {target_id} banido permanentemente deste grupo.")
 
+@error_handler
+async def cmd_blacklist(update, context):
+    if not await is_admin(update, context): return
+    target_id = get_target(update)
+    if not target_id or is_owner(target_id): return
+    db.add_local_blacklist(update.effective_chat.id, target_id, get_reason(update))
+    await update.message.reply_text(f"✅ {target_id} em blacklist local.")
+
+# PUNIÇÕES GLOBAIS (SÓ DONOS)
 @error_handler
 async def cmd_allban(update, context):
     if not is_owner(update.effective_user.id): return
     target_id = get_target(update)
-    reason = get_reason(update)
     if not target_id or is_owner(target_id): return
-    db.add_global_blacklist(target_id, 'ban', reason)
-    chats = db.all_chats_detailed()
-    for row in chats:
-        if row['chat_type'] == 'private': continue
-        try: await context.bot.ban_chat_member(row['chat_id'], target_id)
-        except: continue
-    await update.message.reply_text(f"✅ {target_id} banido globalmente (BanPerm).")
+    db.add_global_blacklist(target_id, 'ban', get_reason(update))
+    for chat in db.all_chats_detailed():
+        if chat['chat_type'] != 'private':
+            try: await context.bot.ban_chat_member(chat['chat_id'], target_id)
+            except: continue
+    await update.message.reply_text(f"☢️ {target_id} BANIDO GLOBALMENTE.")
 
 @error_handler
 async def cmd_allblack(update, context):
     if not is_owner(update.effective_user.id): return
     target_id = get_target(update)
-    reason = get_reason(update)
     if not target_id or is_owner(target_id): return
-    db.add_global_blacklist(target_id, 'black', reason)
-    await update.message.reply_text(f"✅ {target_id} em blacklist global.")
+    db.add_global_blacklist(target_id, 'black', get_reason(update))
+    await update.message.reply_text(f"☢️ {target_id} em BLACKLIST GLOBAL.")
 
 @error_handler
-async def cmd_unblacklist(update, context):
+async def cmd_listdn(update, context):
     if not is_owner(update.effective_user.id): return
-    target_id = get_target(update)
-    if not target_id: return
-    db.remove_global_blacklist(target_id)
-    await update.message.reply_text(f"✅ {target_id} removido da blacklist.")
+    shadow, glob = db.get_all_banned_list_detailed()
+    text = "📋 <b>RELATÓRIO DE PUNIÇÕES GLOBAIS:</b>\n\n"
+    for r in glob:
+        text += f"• {db.get_user_info(r['user_id'])} (<code>{r['user_id']}</code>) [{r['type'].upper()}]\n"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
+# MODERAÇÃO COMUM
 @error_handler
 async def cmd_ban(update, context):
     if not await is_admin(update, context): return
     target_id = get_target(update)
     if not target_id or is_owner(target_id): return
-    t = parse_time(context.args[1]) if len(context.args) > 1 else None
-    await context.bot.ban_chat_member(update.effective_chat.id, target_id, until_date=datetime.now() + t if t else None)
-    await update.message.reply_text(f"🚫 Banido{' por ' + context.args[1] if t else ''}.")
+    await context.bot.ban_chat_member(update.effective_chat.id, target_id)
+    await update.message.reply_text("🚫 Banido.")
 
 @error_handler
 async def cmd_mute(update, context):
     if not await is_admin(update, context): return
     target_id = get_target(update)
     if not target_id or is_owner(target_id): return
-    t = parse_time(context.args[1]) if len(context.args) > 1 else timedelta(hours=24)
-    await context.bot.restrict_chat_member(update.effective_chat.id, target_id, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now() + t)
-    await update.message.reply_text(f"🔇 Mutado por {context.args[1] if len(context.args) > 1 else '24h'}.")
-
-@error_handler
-async def cmd_shadow(update, context):
-    if not await is_admin(update, context): return
-    target_id = get_target(update)
-    reason = get_reason(update)
-    if not target_id or is_owner(target_id): return
-    db.add_shadow_ban(target_id, reason)
-    await update.message.reply_text("🌑 Shadow Ban ativado.")
-
-@error_handler
-async def cmd_unshadow(update, context):
-    if not await is_admin(update, context): return
-    target_id = get_target(update)
-    if not target_id: return
-    db.remove_shadow_ban(target_id)
-    await update.message.reply_text("✅ Shadow Ban removido.")
+    await context.bot.restrict_chat_member(update.effective_chat.id, target_id, permissions=ChatPermissions(can_send_messages=False))
+    await update.message.reply_text("🔇 Mutado.")
 
 @error_handler
 async def cmd_purge(update, context):
@@ -412,10 +413,10 @@ async def cmd_purge(update, context):
     if not amount and msg.reply_to_message:
         amount = msg.message_id - msg.reply_to_message.message_id
     if not amount: return
-    amount = min(amount, 100)
     await msg.delete()
-    tasks = [context.bot.delete_message(msg.chat_id, msg.message_id - i - 1) for i in range(amount)]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    for i in range(min(amount, 100)):
+        try: await context.bot.delete_message(msg.chat_id, msg.message_id - i - 1)
+        except: continue
 
 @error_handler
 async def cmd_msg(update, context):
@@ -423,13 +424,12 @@ async def cmd_msg(update, context):
     msg = update.effective_message
     chats = db.active_chats()
     sent = 0
-    caption = " ".join(context.args)
     for row in chats:
         try:
             if msg.reply_to_message:
-                await context.bot.copy_message(row['chat_id'], msg.chat_id, msg.reply_to_message.message_id, caption=caption or None)
+                await context.bot.copy_message(row['chat_id'], msg.chat_id, msg.reply_to_message.message_id, caption=" ".join(context.args) or None)
             else:
-                if caption: await context.bot.send_message(row['chat_id'], caption)
+                await context.bot.send_message(row['chat_id'], " ".join(context.args))
             sent += 1
             await asyncio.sleep(0.1)
         except: continue
@@ -439,81 +439,12 @@ async def cmd_msg(update, context):
 async def cmd_chats(update, context):
     if not is_owner(update.effective_user.id): return
     rows = db.all_chats_detailed()
-    if not rows: return await update.message.reply_text("Nenhum chat registrado.")
-    
-    groups, channels, privates = [], [], 0
-    for row in rows:
-        if row['chat_type'] == 'private': privates += 1
-        elif "group" in row['chat_type']: groups.append(row)
-        else: channels.append(row)
-            
-    text = "📡 <b>RELATÓRIO DE CHATS</b>\n\n"
-    if groups:
-        text += "👥 <b>GRUPOS:</b>\n"
-        for g in groups:
-            status = "✅" if g['active'] else "❌"
-            text += f"{status} <b>{g['title']}</b> (<code>{g['chat_id']}</code>)\n"
-        text += "\n"
-        
-    if channels:
-        text += "📣 <b>CANAIS:</b>\n"
-        for c in channels:
-            status = "✅" if c['active'] else "❌"
-            text += f"{status} <b>{c['title']}</b> (<code>{c['chat_id']}</code>)\n"
-        text += "\n"
-        
-    active_total = sum(1 for r in rows if r['active'] and r['chat_type'] != 'private')
-    text += f"📊 <b>RESUMO:</b>\n"
-    text += f"• Grupos/Canais: {len(groups) + len(channels)}\n"
-    text += f"• Ativos p/ Msg: {active_total}\n"
-    text += f"• Usuários no Privado: {privates}"
-    
+    text = "📡 <b>CHATS REGISTRADOS:</b>\n\n"
+    for r in rows:
+        if r['chat_type'] == 'private': continue
+        status = "✅" if r['active'] else "❌"
+        text += f"{status} {r['title']} (<code>{r['chat_id']}</code>)\n"
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-
-@error_handler
-async def cmd_adddivulgar(update, context):
-    if not is_owner(update.effective_user.id): return
-    target = context.args[0] if context.args else None
-    if not target: return
-    db.set_chat_active(target, 1)
-    await update.message.reply_text(f"✅ Chat {target} ativo.")
-
-@error_handler
-async def cmd_rmdivulgar(update, context):
-    if not is_owner(update.effective_user.id): return
-    target = context.args[0] if context.args else None
-    if not target: return
-    db.set_chat_active(target, 0)
-    await update.message.reply_text(f"❌ Chat {target} inativo.")
-
-@error_handler
-async def cmd_allowlink(update, context):
-    if not await is_admin(update, context): return
-    target_id = get_target(update)
-    if not target_id: return
-    db.add_link_whitelist(update.effective_chat.id, target_id)
-    await update.message.reply_text(f"✅ {target_id} autorizado.")
-
-@error_handler
-async def cmd_removelink(update, context):
-    if not await is_admin(update, context): return
-    target_id = get_target(update)
-    if not target_id: return
-    db.remove_link_whitelist(update.effective_chat.id, target_id)
-    await update.message.reply_text(f"❌ {target_id} desautorizado.")
-
-@error_handler
-async def cmd_lock(update, context):
-    if not await is_admin(update, context): return
-    await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=False))
-    await update.message.reply_text("🔒 Grupo Fechado.")
-
-@error_handler
-async def cmd_unlock(update, context):
-    if not await is_admin(update, context): return
-    perms = ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True, can_send_photos=True, can_send_videos=True, can_send_other_messages=True, can_add_web_page_previews=True)
-    await context.bot.set_chat_permissions(update.effective_chat.id, perms)
-    await update.message.reply_text("🔓 Grupo Aberto.")
 
 @error_handler
 async def cmd_settings(update, context):
@@ -521,22 +452,18 @@ async def cmd_settings(update, context):
     cid = update.effective_chat.id
     keyboard = [
         [InlineKeyboardButton(f"Anti-Spam: {'✅' if db.get_setting(cid, 'antispam', 1) else '❌'}", callback_data="toggle_antispam")],
-        [InlineKeyboardButton(f"Anti-Link: {'✅' if db.get_setting(cid, 'antilink', 0) else '❌'}", callback_data="toggle_antilink")],
-        [InlineKeyboardButton(f"Captcha: {'✅' if db.get_setting(cid, 'captcha_enabled', 0) else '❌'}", callback_data="toggle_captcha")]
+        [InlineKeyboardButton(f"Anti-Link: {'✅' if db.get_setting(cid, 'antilink', 0) else '❌'}", callback_data="toggle_antilink")]
     ]
-    await update.message.reply_text("⚙️ <b>CONFIGURAÇÕES</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("⚙️ <b>CONFIGURAÇÕES</b>", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# --- HANDLERS ---
 @error_handler
 async def on_callback(update, context):
     query = update.callback_query
     await query.answer()
     if not await is_admin(update, context): return
     cid = query.message.chat_id
-    data = query.data
-    if data == "toggle_antispam": db.set_setting(cid, "antispam", 1 - db.get_setting(cid, "antispam", 1))
-    elif data == "toggle_antilink": db.set_setting(cid, "antilink", 1 - db.get_setting(cid, "antilink", 0))
-    elif data == "toggle_captcha": db.set_setting(cid, "captcha_enabled", 1 - db.get_setting(cid, "captcha_enabled", 0))
+    if query.data == "toggle_antispam": db.set_setting(cid, "antispam", 1 - db.get_setting(cid, "antispam", 1))
+    elif query.data == "toggle_antilink": db.set_setting(cid, "antilink", 1 - db.get_setting(cid, "antilink", 0))
     await cmd_settings(update, context)
 
 async def post_init(app: Application):
@@ -544,10 +471,9 @@ async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "Iniciar"), BotCommand("help", "Ajuda"), BotCommand("id", "Ver ID"), 
         BotCommand("settings", "Configurações"), BotCommand("lock", "Fechar"), BotCommand("unlock", "Abrir"), 
-        BotCommand("purge", "Limpar"), BotCommand("ban", "Banir"), BotCommand("mute", "Silenciar"), 
-        BotCommand("msg", "Transmissão")
+        BotCommand("purge", "Limpar"), BotCommand("ban", "Banir"), BotCommand("mute", "Silenciar")
     ])
-    logger.info("Jtzin Administrator V1.4.0 ONLINE!")
+    logger.info("Jtzin Administrator V1.4.1 ONLINE!")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
@@ -555,24 +481,17 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("banperm", cmd_banperm))
+    app.add_handler(CommandHandler("blacklist", cmd_blacklist))
+    app.add_handler(CommandHandler("allban", cmd_allban))
+    app.add_handler(CommandHandler("allblack", cmd_allblack))
     app.add_handler(CommandHandler("listdn", cmd_listdn))
     app.add_handler(CommandHandler("msg", cmd_msg))
     app.add_handler(CommandHandler("chats", cmd_chats))
-    app.add_handler(CommandHandler("adddivulgar", cmd_adddivulgar))
-    app.add_handler(CommandHandler("rmdivulgar", cmd_rmdivulgar))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("purge", cmd_purge))
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("mute", cmd_mute))
-    app.add_handler(CommandHandler("allban", cmd_allban))
-    app.add_handler(CommandHandler("banperm", cmd_allban)) # Alias para banperm
-    app.add_handler(CommandHandler("allblack", cmd_allblack))
-    app.add_handler(CommandHandler("blacklist", cmd_allblack)) # Alias para blacklist
-    app.add_handler(CommandHandler("unblacklist", cmd_unblacklist))
-    app.add_handler(CommandHandler("shadow", cmd_shadow))
-    app.add_handler(CommandHandler("unshadow", cmd_unshadow))
-    app.add_handler(CommandHandler("allowlink", cmd_allowlink))
-    app.add_handler(CommandHandler("removelink", cmd_removelink))
     app.add_handler(CommandHandler("lock", cmd_lock))
     app.add_handler(CommandHandler("unlock", cmd_unlock))
     app.add_handler(CallbackQueryHandler(on_callback))
