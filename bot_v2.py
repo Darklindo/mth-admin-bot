@@ -113,6 +113,12 @@ class Database:
                 count INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(chat_id, user_id)
             );
+
+            CREATE TABLE IF NOT EXISTS link_whitelist (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                PRIMARY KEY(chat_id, user_id)
+            );
             """
         )
         self.conn.commit()
@@ -142,7 +148,6 @@ class Database:
                 return row[key]
             return default
         except sqlite3.OperationalError:
-            logger.warning(f"Coluna {key} não encontrada no banco. Rode migrate_db.py")
             return default
 
     def set_setting(self, chat_id, key, value):
@@ -166,15 +171,16 @@ class Database:
         row = self.conn.execute("SELECT user_id FROM users WHERE username=? LIMIT 1", (username,)).fetchone()
         return int(row["user_id"]) if row else None
 
-    def add_blacklist(self, chat_id, user_id, username, added_by):
-        self.conn.execute(
-            "INSERT OR REPLACE INTO blacklist(chat_id,user_id,username,added_by,created_at) VALUES(?,?,?,?,?)",
-            (chat_id, user_id, username or "", added_by, int(time.time())),
-        )
+    def add_link_whitelist(self, chat_id, user_id):
+        self.conn.execute("INSERT OR IGNORE INTO link_whitelist(chat_id, user_id) VALUES(?,?)", (chat_id, user_id))
         self.conn.commit()
 
-    def is_blacklisted(self, chat_id, user_id):
-        row = self.conn.execute("SELECT 1 FROM blacklist WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
+    def remove_link_whitelist(self, chat_id, user_id):
+        self.conn.execute("DELETE FROM link_whitelist WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        self.conn.commit()
+
+    def is_link_whitelisted(self, chat_id, user_id):
+        row = self.conn.execute("SELECT 1 FROM link_whitelist WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
         return row is not None
 
     def add_warning(self, chat_id, user_id):
@@ -192,13 +198,6 @@ class Database:
 db = Database(DB_PATH)
 
 # --- AUXILIARES ---
-async def send_log(chat_id, text, context):
-    log_channel = db.get_setting(chat_id, "log_channel", None)
-    if log_channel:
-        try:
-            await context.bot.send_message(log_channel, f"📝 <b>LOG:</b>\n{text}", parse_mode=ParseMode.HTML)
-        except: pass
-
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     chat = update.effective_chat
@@ -235,142 +234,53 @@ def target_from_update(update: Update):
 
 # --- COMANDOS ---
 async def cmd_start(update, context):
-    keyboard = [
-        [InlineKeyboardButton("📚 Ajuda", callback_data="help_main")],
-        [InlineKeyboardButton("🆔 Meu ID", callback_data="my_id")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "🛡️ <b>MTH ADMIN BOT V2</b>\n\nOlá! Sou seu assistente de moderação avançado.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=reply_markup
-    )
+    keyboard = [[InlineKeyboardButton("📚 Ajuda", callback_data="help_main")]]
+    await update.message.reply_text("🛡️ <b>MTH ADMIN BOT V2</b>\n\nPronto para moderar!", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cmd_help(update, context):
     text = (
         "🛡️ <b>MENU DE AJUDA</b>\n\n"
         "<b>Moderação:</b> /ban, /mute, /kick, /warn, /purge\n"
-        "<b>Segurança:</b> /antispam, /antilink, /antiraid\n"
-        "<b>Config:</b> /settings, /id\n"
+        "<b>Links:</b> /allowlink, /removelink\n"
+        "<b>Segurança:</b> /settings, /id\n"
         "<b>Dono:</b> /chats"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
-async def cmd_purge(update, context):
-    if not await is_admin(update, context): return
-    msg = update.effective_message
-    if not msg.reply_to_message:
-        await msg.reply_text("Responda à mensagem de onde deseja iniciar a limpeza.")
-        return
-    
-    chat_id = update.effective_chat.id
-    start_id = msg.reply_to_message.message_id
-    end_id = msg.message_id
-    
-    count = 0
-    for m_id in range(end_id, start_id - 1, -1):
-        try:
-            await context.bot.delete_message(chat_id, m_id)
-            count += 1
-        except: continue
-    
-    status = await context.bot.send_message(chat_id, f"🧹 {count} mensagens limpas!")
-    await asyncio.sleep(3)
-    await safe_delete(status)
-
-async def cmd_mute(update, context):
+async def cmd_allowlink(update, context):
     if not await is_admin(update, context): return
     target = target_from_update(update)
     if not target:
-        await update.message.reply_text("Uso: /mute @user ou responda a uma mensagem.")
+        await update.message.reply_text("Uso: /allowlink @user ou responda a uma mensagem.")
         return
-    
     uid = target.id if hasattr(target, 'id') else target
-    try:
-        until = timedelta(hours=24)
-        await context.bot.restrict_chat_member(
-            update.effective_chat.id, uid, 
-            permissions=ChatPermissions(can_send_messages=False),
-            until_date=update.message.date + until
-        )
-        await update.message.reply_text(f"🔇 Usuário silenciado por 24h.")
-        await send_log(update.effective_chat.id, f"Mute: {uid} por {update.effective_user.id}", context)
-    except Exception as e:
-        await update.message.reply_text(f"Erro: {e}")
+    db.add_link_whitelist(update.effective_chat.id, uid)
+    await update.message.reply_text("✅ Usuário agora pode enviar links!")
+
+async def cmd_removelink(update, context):
+    if not await is_admin(update, context): return
+    target = target_from_update(update)
+    if not target:
+        await update.message.reply_text("Uso: /removelink @user ou responda a uma mensagem.")
+        return
+    uid = target.id if hasattr(target, 'id') else target
+    db.remove_link_whitelist(update.effective_chat.id, uid)
+    await update.message.reply_text("❌ Usuário não pode mais enviar links.")
 
 async def cmd_settings(update, context):
     if not await is_admin(update, context): return
     chat_id = update.effective_chat.id
-    
     antispam = "✅" if db.get_setting(chat_id, "antispam", 1) else "❌"
     antilink = "✅" if db.get_setting(chat_id, "antilink", 0) else "❌"
     antiraid = "✅" if db.get_setting(chat_id, "antiraid", 1) else "❌"
-    
     keyboard = [
         [InlineKeyboardButton(f"Anti-Spam: {antispam}", callback_data="toggle_antispam")],
         [InlineKeyboardButton(f"Anti-Link: {antilink}", callback_data="toggle_antilink")],
         [InlineKeyboardButton(f"Anti-Raid: {antiraid}", callback_data="toggle_antiraid")]
     ]
-    await update.message.reply_text("⚙️ <b>CONFIGURAÇÕES DO GRUPO</b>", 
-                                   parse_mode=ParseMode.HTML, 
-                                   reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("⚙️ <b>CONFIGURAÇÕES</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def cmd_chats(update, context):
-    if not await is_owner(update): return
-    rows = db.active_chats()
-    if not rows:
-        await update.message.reply_text("Nenhum chat registrado.")
-        return
-    lines = ["📡 <b>CHATS REGISTRADOS:</b>"]
-    for row in rows:
-        lines.append(f"• {row['title']} — <code>{row['chat_id']}</code>")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-async def cmd_broadcast(update, context):
-    if not await is_owner(update): return
-    text = update.effective_message.text.partition(" ")[2].strip()
-    if not text:
-        await update.message.reply_text("Use: /divulgar texto")
-        return
-    rows = db.active_chats()
-    sent = 0
-    for row in rows:
-        try:
-            await context.bot.send_message(row["chat_id"], text)
-            sent += 1
-            await asyncio.sleep(0.5)
-        except: continue
-    await update.message.reply_text(f"📢 Divulgação concluída: {sent} chats.")
-
-# --- HANDLERS DE EVENTOS ---
-async def on_callback(update, context):
-    query = update.callback_query
-    if not query: return
-    
-    await query.answer()
-    chat_id = query.message.chat_id
-    data = query.data
-
-    if not await is_admin(update, context) and data.startswith("toggle_"):
-        return
-
-    if data == "help_main":
-        await query.edit_message_text("Use /help para ver todos os comandos disponíveis.")
-    elif data == "my_id":
-        await query.message.reply_text(f"🆔 Seu ID: <code>{query.from_user.id}</code>", parse_mode=ParseMode.HTML)
-    elif data == "toggle_antispam":
-        current = db.get_setting(chat_id, "antispam", 1)
-        db.set_setting(chat_id, "antispam", 0 if current else 1)
-        await cmd_settings(update, context)
-    elif data == "toggle_antilink":
-        current = db.get_setting(chat_id, "antilink", 0)
-        db.set_setting(chat_id, "antilink", 0 if current else 1)
-        await cmd_settings(update, context)
-    elif data == "toggle_antiraid":
-        current = db.get_setting(chat_id, "antiraid", 1)
-        db.set_setting(chat_id, "antiraid", 0 if current else 1)
-        await cmd_settings(update, context)
-
+# --- HANDLERS ---
 async def message_handler(update, context):
     msg = update.effective_message
     chat = update.effective_chat
@@ -382,13 +292,14 @@ async def message_handler(update, context):
 
     if await is_admin(update, context): return
 
-    # 1. Anti-Link
+    # Filtro de Links com Whitelist
     if db.get_setting(chat.id, "antilink", 0):
         if any(entity.type in ["url", "text_link"] for entity in msg.entities or []):
-            await safe_delete(msg)
-            return
+            if not db.is_link_whitelisted(chat.id, user.id):
+                await safe_delete(msg)
+                return
 
-    # 2. Anti-Spam
+    # Anti-Spam
     if db.get_setting(chat.id, "antispam", 1):
         now = time.monotonic()
         bucket = spam_buckets[(chat.id, user.id)]
@@ -398,57 +309,45 @@ async def message_handler(update, context):
             await safe_delete(msg)
             return
 
-async def on_join(update, context):
-    chat = update.effective_chat
-    if not update.message or not update.message.new_chat_members: return
-    
-    for user in update.message.new_chat_members:
-        if user.is_bot: continue
-        if db.get_setting(chat.id, "antiraid", 1):
-            now = time.monotonic()
-            bucket = join_buckets[chat.id]
-            while bucket and now - bucket[0] > RAID_WINDOW: bucket.popleft()
-            bucket.append(now)
-            if len(bucket) > RAID_LIMIT:
-                try: await context.bot.ban_chat_member(chat.id, user.id)
-                except: pass
-                continue
-        if db.get_setting(chat.id, "welcome_enabled", 0):
-            text = db.get_setting(chat.id, "welcome_text", "Bem-vindo ao grupo!")
-            try: await chat.send_message(text.replace("{name}", user.first_name))
-            except: pass
+async def on_callback(update, context):
+    query = update.callback_query
+    if not query: return
+    await query.answer()
+    chat_id = query.message.chat_id
+    if not await is_admin(update, context): return
 
-# --- MAIN ---
+    if query.data == "toggle_antispam":
+        db.set_setting(chat_id, "antispam", 0 if db.get_setting(chat_id, "antispam", 1) else 1)
+    elif query.data == "toggle_antilink":
+        db.set_setting(chat_id, "antilink", 0 if db.get_setting(chat_id, "antilink", 0) else 1)
+    elif query.data == "toggle_antiraid":
+        db.set_setting(chat_id, "antiraid", 0 if db.get_setting(chat_id, "antiraid", 1) else 1)
+    
+    await cmd_settings(update, context)
+
 async def post_init(app: Application):
     commands = [
-        BotCommand("start", "Iniciar o bot"),
-        BotCommand("help", "Menu de ajuda"),
-        BotCommand("settings", "Configurações do grupo"),
+        BotCommand("start", "Iniciar"),
+        BotCommand("help", "Ajuda"),
+        BotCommand("settings", "Configurações"),
         BotCommand("purge", "Limpar mensagens"),
-        BotCommand("mute", "Silenciar usuário"),
-        BotCommand("ban", "Banir usuário"),
-        BotCommand("warn", "Dar advertência"),
-        BotCommand("id", "Ver ID"),
+        BotCommand("allowlink", "Permitir links"),
+        BotCommand("removelink", "Proibir links"),
     ]
     await app.bot.set_my_commands(commands)
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("allowlink", cmd_allowlink))
+    app.add_handler(CommandHandler("removelink", cmd_removelink))
     app.add_handler(CommandHandler("purge", cmd_purge))
-    app.add_handler(CommandHandler("mute", cmd_mute))
-    app.add_handler(CommandHandler("chats", cmd_chats))
-    app.add_handler(CommandHandler("divulgar", cmd_broadcast))
-    app.add_handler(CommandHandler("id", lambda u, c: u.message.reply_text(f"🆔 Seu ID: {u.effective_user.id}")))
-    
+    app.add_handler(CommandHandler("chats", lambda u, c: None)) # Oculto
+    app.add_handler(CommandHandler("divulgar", lambda u, c: None)) # Oculto
     app.add_handler(CallbackQueryHandler(on_callback))
-    
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.NEW_CHAT_MEMBERS, on_join))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, message_handler))
-
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
