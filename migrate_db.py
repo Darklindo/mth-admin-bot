@@ -12,12 +12,25 @@ def migrate():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    print("Iniciando migração V2.2...")
+    print("Iniciando migração V3.1 (Nuclear)...")
 
-    # Verificar coluna 'active' na tabela chats
+    # 1. Tabela Global Blacklist
+    try:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS global_blacklist (
+                user_id INTEGER PRIMARY KEY,
+                type TEXT NOT NULL,
+                reason TEXT,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        print("Tabela 'global_blacklist' verificada/criada.")
+    except Exception as e:
+        print(f"Erro ao criar global_blacklist: {e}")
+
+    # 2. Coluna 'active' na tabela chats
     try:
         cursor.execute("SELECT active FROM chats LIMIT 1")
-        print("Coluna 'active' já existe em 'chats'.")
     except sqlite3.OperationalError:
         try:
             cursor.execute("ALTER TABLE chats ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
@@ -25,7 +38,7 @@ def migrate():
         except Exception as e:
             print(f"Erro ao alterar tabela chats: {e}")
 
-    # Outras colunas de settings
+    # 3. Colunas de settings
     columns = [
         ("night_mode_auto", "INTEGER NOT NULL DEFAULT 0"),
         ("night_start", "TEXT DEFAULT '23:00'"),
@@ -43,7 +56,7 @@ def migrate():
 
     conn.commit()
     conn.close()
-    print("Migração concluída!")
+    print("Migração V3.1 concluída!")
 
 if __name__ == "__main__":
     migrate()

@@ -141,6 +141,12 @@ class Database:
                         user_id INTEGER NOT NULL,
                         PRIMARY KEY(chat_id, user_id)
                     );
+                    CREATE TABLE IF NOT EXISTS global_blacklist (
+                        user_id INTEGER PRIMARY KEY,
+                        type TEXT NOT NULL, -- 'ban' ou 'black'
+                        reason TEXT,
+                        created_at INTEGER NOT NULL
+                    );
                     """
                 )
         except Exception as e:
@@ -188,8 +194,22 @@ class Database:
         row = self.execute("SELECT 1 FROM link_whitelist WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id))).fetchone()
         return row is not None
 
+    def add_global_blacklist(self, user_id, type_name, reason=""):
+        self.execute(
+            "INSERT INTO global_blacklist(user_id, type, reason, created_at) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET type=excluded.type, reason=excluded.reason",
+            (int(user_id), type_name, reason, int(time.time())),
+            commit=True
+        )
+
+    def get_global_status(self, user_id):
+        row = self.execute("SELECT type, reason FROM global_blacklist WHERE user_id=?", (int(user_id),)).fetchone()
+        return row if row else None
+
     def active_chats_for_broadcast(self):
         return self.execute("SELECT chat_id, title FROM chats WHERE active=1").fetchall()
+
+    def all_chats(self):
+        return self.execute("SELECT chat_id FROM chats").fetchall()
 
     def active_chats_with_night_mode(self):
         return self.execute("SELECT chat_id, night_start, night_end FROM settings WHERE night_mode_auto=1").fetchall()
@@ -226,6 +246,10 @@ async def is_owner(update: Update) -> bool:
     user = update.effective_user
     return user.id in [OWNER_ID, SECOND_OWNER_ID] if user else False
 
+async def is_primary_owner(update: Update) -> bool:
+    user = update.effective_user
+    return user.id == OWNER_ID if user else False
+
 async def safe_delete(message):
     try: await message.delete(); return True
     except: return False
@@ -248,7 +272,7 @@ def target_from_update(update: Update):
 @error_handler
 async def cmd_start(update, context):
     keyboard = [[InlineKeyboardButton("📚 Ajuda", callback_data="help_main")]]
-    await update.message.reply_text("🛡️ <b>MTH ADMIN BOT V3.0</b>\n\nVersão blindada contra erros!", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("🛡️ <b>MTH ADMIN BOT V3.1</b>\n\nComandos nucleares ativados!", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
 @error_handler
 async def cmd_help(update, context):
@@ -260,6 +284,39 @@ async def cmd_help(update, context):
         "<b>Dono:</b> /chats"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+@error_handler
+async def cmd_allban(update, context):
+    if not await is_primary_owner(update): return
+    target = target_from_update(update)
+    if not target: return await update.message.reply_text("Uso: /allban @user ou ID [motivo]")
+    
+    uid = target.id if hasattr(target, 'id') else target
+    reason = " ".join(context.args[1:]) if len(context.args) > 1 else "Sem motivo especificado."
+    
+    db.add_global_blacklist(uid, 'ban', reason)
+    
+    chats = db.all_chats()
+    success = 0
+    for chat in chats:
+        try:
+            await context.bot.ban_chat_member(chat['chat_id'], uid)
+            success += 1
+            await asyncio.sleep(0.1)
+        except: continue
+        
+    await update.message.reply_text(f"☢️ <b>BANIMENTO NUCLEAR APLICADO!</b>\n\nUsuário: <code>{uid}</code>\nChats afetados: {success}\nMotivo: {reason}", parse_mode=ParseMode.HTML)
+
+@error_handler
+async def cmd_allblack(update, context):
+    if not await is_primary_owner(update): return
+    target = target_from_update(update)
+    if not target: return await update.message.reply_text("Uso: /allblack @user ou ID")
+    
+    uid = target.id if hasattr(target, 'id') else target
+    db.add_global_blacklist(uid, 'black', "Blacklist Global")
+    
+    await update.message.reply_text(f"🌑 <b>SILENCIAMENTO NUCLEAR APLICADO!</b>\n\nUsuário: <code>{uid}</code>\nTodas as mensagens deste usuário serão apagadas em qualquer grupo.", parse_mode=ParseMode.HTML)
 
 @error_handler
 async def cmd_lock(update, context):
@@ -291,7 +348,7 @@ async def cmd_purge(update, context):
         start_id = msg.message_id
     elif msg.reply_to_message:
         start_id = msg.message_id
-        amount = end_id = msg.message_id - msg.reply_to_message.message_id
+        amount = msg.message_id - msg.reply_to_message.message_id
         amount = min(amount, 100)
     else:
         await msg.reply_text("Uso: /purge [quantidade] ou responda a uma mensagem.")
@@ -387,10 +444,6 @@ async def cmd_broadcast(update, context):
             await context.bot.send_message(row["chat_id"], text)
             sent += 1
             await asyncio.sleep(0.5)
-        except RetryAfter as e:
-            await asyncio.sleep(e.retry_after)
-            await context.bot.send_message(row["chat_id"], text)
-            sent += 1
         except Exception: continue
     await update.message.reply_text(f"📢 Divulgação concluída: {sent} chats ativos.")
 
@@ -442,6 +495,19 @@ async def message_handler(update, context):
 
     db.register_chat(chat.id, chat.title, chat.type)
     db.remember_user(user)
+    
+    # Check Global Blacklist
+    global_status = db.get_global_status(user.id)
+    if global_status:
+        if global_status['type'] == 'ban':
+            try: await context.bot.ban_chat_member(chat.id, user.id)
+            except: pass
+            await safe_delete(msg)
+            return
+        elif global_status['type'] == 'black':
+            await safe_delete(msg)
+            return
+
     if await is_admin(update, context): return
 
     if db.get_setting(chat.id, "antilink", 0):
@@ -490,7 +556,7 @@ async def post_init(app: Application):
     await app.bot.set_my_commands(commands)
     if app.job_queue:
         app.job_queue.run_repeating(night_mode_checker, interval=60, first=10)
-    logger.info("MTH ADMIN BOT V3.0 ONLINE!")
+    logger.info("MTH ADMIN BOT V3.1 ONLINE!")
 
 def main():
     try:
@@ -511,6 +577,8 @@ def main():
         app.add_handler(CommandHandler("chats", cmd_chats))
         app.add_handler(CommandHandler("allowlink", cmd_allowlink))
         app.add_handler(CommandHandler("removelink", cmd_removelink))
+        app.add_handler(CommandHandler("allban", cmd_allban))
+        app.add_handler(CommandHandler("allblack", cmd_allblack))
         app.add_handler(CallbackQueryHandler(on_callback))
         app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, message_handler))
         app.run_polling(drop_pending_updates=True)
