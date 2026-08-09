@@ -166,8 +166,8 @@ class Database:
     def active_chats(self):
         return self.execute("SELECT chat_id FROM chats WHERE active=1").fetchall()
 
-    def all_chats(self):
-        return self.execute("SELECT chat_id FROM chats").fetchall()
+    def all_chats_detailed(self):
+        return self.execute("SELECT chat_id, title, chat_type, active FROM chats").fetchall()
 
     def set_chat_active(self, chat_id, status):
         self.execute("UPDATE chats SET active=? WHERE chat_id=?", (status, int(chat_id)), commit=True)
@@ -257,7 +257,7 @@ async def global_security_filter(update: Update, context: ContextTypes.DEFAULT_T
 # --- COMANDOS ---
 @error_handler
 async def cmd_start(update, context):
-    await update.message.reply_text("🛡️ <b>Jtzin Administrator V1.3.3</b>", parse_mode=ParseMode.HTML)
+    await update.message.reply_text("🛡️ <b>Jtzin Administrator V1.3.4</b>", parse_mode=ParseMode.HTML)
 
 @error_handler
 async def cmd_id(update, context):
@@ -284,7 +284,7 @@ async def cmd_allban(update, context):
     target_id = get_target(update)
     if not target_id or is_owner(target_id): return
     db.add_global_blacklist(target_id, 'ban')
-    chats = db.all_chats()
+    chats = db.all_chats_detailed()
     for row in chats:
         try: await context.bot.ban_chat_member(row['chat_id'], target_id)
         except: continue
@@ -374,10 +374,20 @@ async def cmd_msg(update, context):
 @error_handler
 async def cmd_chats(update, context):
     if not is_owner(update.effective_user.id): return
-    rows = db.all_chats()
-    lines = ["📡 <b>CHATS:</b>"]
-    for row in rows: lines.append(f"• <code>{row['chat_id']}</code>")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    rows = db.all_chats_detailed()
+    if not rows: return await update.message.reply_text("Nenhum chat registrado.")
+    
+    text = "📡 <b>RELATÓRIO DE CHATS:</b>\n\n"
+    active_count = 0
+    for row in rows:
+        status = "✅" if row['active'] else "❌"
+        ctype = "👥" if "group" in row['chat_type'] else "📣" if row['chat_type'] == "channel" else "👤"
+        title = row['title'] if row['title'] else "Privado"
+        text += f"{status} {ctype} <b>{title}</b>\n└ <code>{row['chat_id']}</code>\n\n"
+        if row['active']: active_count += 1
+    
+    text += f"📊 <b>Total:</b> {len(rows)} | <b>Ativos:</b> {active_count}"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 @error_handler
 async def cmd_adddivulgar(update, context):
@@ -455,7 +465,7 @@ async def post_init(app: Application):
         BotCommand("lock", "Fechar"), BotCommand("unlock", "Abrir"), BotCommand("purge", "Limpar"),
         BotCommand("ban", "Banir"), BotCommand("mute", "Silenciar"), BotCommand("msg", "Transmissão")
     ])
-    logger.info("Jtzin Administrator V1.3.3 ONLINE!")
+    logger.info("Jtzin Administrator V1.3.4 ONLINE!")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
