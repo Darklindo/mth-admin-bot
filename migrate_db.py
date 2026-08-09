@@ -12,51 +12,66 @@ def migrate():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    print("Iniciando migração V3.1 (Nuclear)...")
+    print("Iniciando migração V5.0 (Supremo)...")
 
-    # 1. Tabela Global Blacklist
+    # 1. Tabela Shadow Ban
     try:
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS global_blacklist (
+            CREATE TABLE IF NOT EXISTS shadow_ban (
                 user_id INTEGER PRIMARY KEY,
-                type TEXT NOT NULL,
                 reason TEXT,
                 created_at INTEGER NOT NULL
             )
         """)
-        print("Tabela 'global_blacklist' verificada/criada.")
+        print("Tabela 'shadow_ban' verificada/criada.")
     except Exception as e:
-        print(f"Erro ao criar global_blacklist: {e}")
+        print(f"Erro ao criar shadow_ban: {e}")
 
-    # 2. Coluna 'active' na tabela chats
+    # 2. Tabela Captcha Pending (para controlar quem precisa clicar no botão)
     try:
-        cursor.execute("SELECT active FROM chats LIMIT 1")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS captcha_pending (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                expiry INTEGER NOT NULL,
+                PRIMARY KEY(chat_id, user_id)
+            )
+        """)
+        print("Tabela 'captcha_pending' verificada/criada.")
+    except Exception as e:
+        print(f"Erro ao criar captcha_pending: {e}")
+
+    # 3. Adicionar coluna captcha_enabled em settings
+    try:
+        cursor.execute("SELECT captcha_enabled FROM settings LIMIT 1")
     except sqlite3.OperationalError:
         try:
-            cursor.execute("ALTER TABLE chats ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
-            print("Coluna 'active' adicionada à tabela 'chats'.")
-        except Exception as e:
-            print(f"Erro ao alterar tabela chats: {e}")
+            cursor.execute("ALTER TABLE settings ADD COLUMN captcha_enabled INTEGER NOT NULL DEFAULT 0")
+            print("Coluna 'captcha_enabled' adicionada a 'settings'.")
+        except: pass
 
-    # 3. Colunas de settings
-    columns = [
-        ("night_mode_auto", "INTEGER NOT NULL DEFAULT 0"),
-        ("night_start", "TEXT DEFAULT '23:00'"),
-        ("night_end", "TEXT DEFAULT '07:00'")
+    # 4. Verificar colunas antigas (garantir integridade)
+    columns_to_check = [
+        ("chats", "active", "INTEGER NOT NULL DEFAULT 1"),
+        ("settings", "antispam", "INTEGER NOT NULL DEFAULT 1"),
+        ("settings", "antilink", "INTEGER NOT NULL DEFAULT 0"),
+        ("settings", "antiraid", "INTEGER NOT NULL DEFAULT 1"),
+        ("settings", "night_mode_auto", "INTEGER NOT NULL DEFAULT 0")
     ]
 
-    for col_name, col_type in columns:
+    for table, col, col_type in columns_to_check:
         try:
-            cursor.execute(f"SELECT {col_name} FROM settings LIMIT 1")
+            cursor.execute(f"SELECT {col} FROM {table} LIMIT 1")
         except sqlite3.OperationalError:
             try:
-                cursor.execute(f"ALTER TABLE settings ADD COLUMN {col_name} {col_type}")
-                print(f"Coluna {col_name} adicionada a 'settings'.")
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+                print(f"Coluna {col} restaurada em {table}.")
             except: pass
 
     conn.commit()
     conn.close()
-    print("Migração V3.1 concluída!")
+    print("Migração V5.0 concluída com sucesso!")
 
 if __name__ == "__main__":
     migrate()
