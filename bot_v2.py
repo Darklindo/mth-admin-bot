@@ -4,6 +4,7 @@ import re
 import sqlite3
 import time
 import asyncio
+import sys
 from collections import defaultdict, deque
 from pathlib import Path
 from datetime import timedelta, datetime
@@ -41,9 +42,11 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 SECOND_OWNER_ID = 6466326477  # @MHZINTADEVOLTAPORRRRRRAAAA
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN não configurado. Crie o arquivo .env.")
+    print("ERRO: BOT_TOKEN não configurado no .env")
+    sys.exit(1)
 if not OWNER_ID:
-    raise RuntimeError("OWNER_ID não configurado. Crie o arquivo .env.")
+    print("ERRO: OWNER_ID não configurado no .env")
+    sys.exit(1)
 
 DB_PATH = DATA_DIR / "bot.db"
 
@@ -56,15 +59,14 @@ RAID_WINDOW = 10
 # Configuração de Logs Silenciosa
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.WARNING, # Apenas avisos e erros
+    level=logging.WARNING,
 )
-# Silenciar bibliotecas barulhentas
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 logger = logging.getLogger("mth-admin")
-logger.setLevel(logging.INFO) # Nossas logs personalizadas ainda aparecem
+logger.setLevel(logging.INFO)
 
 spam_buckets = defaultdict(deque)
 join_buckets = defaultdict(deque)
@@ -185,6 +187,13 @@ class Database:
         except Exception as e:
             logger.error(f"Erro na whitelist: {e}")
 
+    def remove_link_whitelist(self, chat_id, user_id):
+        try:
+            self.conn.execute("DELETE FROM link_whitelist WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Erro ao remover da whitelist: {e}")
+
     def is_link_whitelisted(self, chat_id, user_id):
         try:
             row = self.conn.execute("SELECT 1 FROM link_whitelist WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id))).fetchone()
@@ -264,7 +273,7 @@ def target_from_update(update: Update):
 # --- COMANDOS ---
 async def cmd_start(update, context):
     keyboard = [[InlineKeyboardButton("📚 Ajuda", callback_data="help_main")]]
-    await update.message.reply_text("🛡️ <b>MTH ADMIN BOT V2.2</b>\n\nLogs limpos e novos comandos de divulgação!", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("🛡️ <b>MTH ADMIN BOT V2.2</b>\n\nLogs limpos e comandos estáveis!", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cmd_help(update, context):
     text = (
@@ -275,6 +284,44 @@ async def cmd_help(update, context):
         "<b>Dono:</b> /chats"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+async def cmd_lock(update, context):
+    if not await is_admin(update, context): return
+    try:
+        await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=False))
+        await update.message.reply_text("🔒 <b>Grupo Fechado!</b>", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"Erro: {e}")
+
+async def cmd_unlock(update, context):
+    if not await is_admin(update, context): return
+    try:
+        await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_polls=True, can_send_other_messages=True, can_add_web_page_previews=True))
+        await update.message.reply_text("🔓 <b>Grupo Aberto!</b>", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"Erro: {e}")
+
+async def cmd_purge(update, context):
+    if not await is_admin(update, context): return
+    msg = update.effective_message
+    if not msg.reply_to_message:
+        await msg.reply_text("Responda à mensagem de onde deseja iniciar a limpeza.")
+        return
+    
+    chat_id = update.effective_chat.id
+    start_id = msg.reply_to_message.message_id
+    end_id = msg.message_id
+    
+    count = 0
+    for m_id in range(end_id, start_id - 1, -1):
+        try:
+            await context.bot.delete_message(chat_id, m_id)
+            count += 1
+        except: continue
+    
+    status = await context.bot.send_message(chat_id, f"🧹 {count} mensagens limpas!")
+    await asyncio.sleep(3)
+    await safe_delete(status)
 
 async def cmd_rmdivulgar(update, context):
     if not await is_owner(update): return
@@ -333,6 +380,22 @@ async def cmd_chats(update, context):
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception as e:
         await update.message.reply_text(f"Erro ao listar chats: {e}")
+
+async def cmd_settings(update, context):
+    if not await is_admin(update, context): return
+    chat_id = update.effective_chat.id
+    antispam = "✅" if db.get_setting(chat_id, "antispam", 1) else "❌"
+    antilink = "✅" if db.get_setting(chat_id, "antilink", 0) else "❌"
+    antiraid = "✅" if db.get_setting(chat_id, "antiraid", 1) else "❌"
+    night_auto = "✅" if db.get_setting(chat_id, "night_mode_auto", 0) else "❌"
+    
+    keyboard = [
+        [InlineKeyboardButton(f"Anti-Spam: {antispam}", callback_data="toggle_antispam")],
+        [InlineKeyboardButton(f"Anti-Link: {antilink}", callback_data="toggle_antilink")],
+        [InlineKeyboardButton(f"Anti-Raid: {antiraid}", callback_data="toggle_antiraid")],
+        [InlineKeyboardButton(f"Modo Noturno Auto: {night_auto}", callback_data="toggle_night")]
+    ]
+    await update.message.reply_text("⚙️ <b>CONFIGURAÇÕES</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
 # --- TAREFAS AUTOMÁTICAS ---
 async def night_mode_checker(context: ContextTypes.DEFAULT_TYPE):
@@ -426,18 +489,22 @@ def main():
         app.add_handler(CommandHandler("start", cmd_start))
         app.add_handler(CommandHandler("help", cmd_help))
         app.add_handler(CommandHandler("settings", cmd_settings))
-        app.add_handler(CommandHandler("lock", lambda u, c: None)) # Lock manual implementado
-        app.add_handler(CommandHandler("unlock", lambda u, c: None)) # Unlock manual implementado
+        app.add_handler(CommandHandler("lock", cmd_lock))
+        app.add_handler(CommandHandler("unlock", cmd_unlock))
+        app.add_handler(CommandHandler("purge", cmd_purge))
         app.add_handler(CommandHandler("rmdivulgar", cmd_rmdivulgar))
         app.add_handler(CommandHandler("adddivulgar", cmd_adddivulgar))
         app.add_handler(CommandHandler("divulgar", cmd_broadcast))
         app.add_handler(CommandHandler("chats", cmd_chats))
+        app.add_handler(CommandHandler("allowlink", cmd_allowlink))
+        app.add_handler(CommandHandler("removelink", cmd_removelink))
         
         app.add_handler(CallbackQueryHandler(on_callback))
         app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, message_handler))
         
         app.run_polling(drop_pending_updates=True)
     except Exception as e:
+        print(f"ERRO FATAL NA INICIALIZAÇÃO: {e}")
         logger.critical(f"Erro fatal: {e}")
 
 if __name__ == "__main__":
