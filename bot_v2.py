@@ -265,7 +265,7 @@ async def global_security_filter(update: Update, context: ContextTypes.DEFAULT_T
 @error_handler
 async def cmd_start(update, context):
     text = (
-        "🛡️ <b>Jtzin Administrator V1.3.8</b>\n\n"
+        "🛡️ <b>Jtzin Administrator V1.3.9</b>\n\n"
         "O bot de administração definitivo para elevar o nível do seu grupo ou canal. "
         "Segurança avançada, moderação rápida e controle total em suas mãos.\n\n"
         "💎 <b>Equipe Diamond</b> — <i>Excelência em Automação</i>\n\n"
@@ -282,6 +282,31 @@ async def cmd_start(update, context):
         [InlineKeyboardButton("🐞 Feedbacks / Bugs", url="https://t.me/OnlyExaltarei")]
     ]
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+
+@error_handler
+async def cmd_help(update, context):
+    text = (
+        "📖 <b>GUIA DE COMANDOS - Jtzin Admin</b>\n\n"
+        "🛡️ <b>MODERAÇÃO:</b>\n"
+        "• <code>/ban</code> - Bane o usuário (aceita tempo: 1h, 7d).\n"
+        "• <code>/mute</code> - Silencia o usuário (aceita tempo).\n"
+        "• <code>/kick</code> - Expulsa o usuário do grupo.\n"
+        "• <code>/warn</code> - Aplica uma advertência.\n"
+        "• <code>/shadow</code> - Ativa Shadow Ban (mensagens apagadas).\n"
+        "• <code>/unshadow</code> - Remove Shadow Ban.\n\n"
+        "⚙️ <b>CONFIGURAÇÃO DO GRUPO:</b>\n"
+        "• <code>/settings</code> - Menu visual de configurações.\n"
+        "• <code>/lock</code> - Fecha o grupo para membros.\n"
+        "• <code>/unlock</code> - Abre o grupo novamente.\n"
+        "• <code>/purge</code> - Limpa mensagens (ex: /purge 20).\n"
+        "• <code>/allowlink</code> - Autoriza usuário a mandar links.\n"
+        "• <code>/removelink</code> - Remove autorização de links.\n\n"
+        "🛠️ <b>UTILITÁRIOS:</b>\n"
+        "• <code>/id</code> - Mostra seu ID ou de quem você responder.\n"
+        "• <code>/start</code> - Mensagem inicial e botões.\n\n"
+        "<i>Dica: Todos os comandos de moderação funcionam respondendo a uma mensagem!</i>"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 @error_handler
 async def cmd_id(update, context):
@@ -517,16 +542,18 @@ async def on_callback(update, context):
 async def post_init(app: Application):
     cache.load_all(db.conn)
     await app.bot.set_my_commands([
-        BotCommand("start", "Iniciar"), BotCommand("id", "Ver ID"), BotCommand("settings", "Configurações"),
-        BotCommand("lock", "Fechar"), BotCommand("unlock", "Abrir"), BotCommand("purge", "Limpar"),
-        BotCommand("ban", "Banir"), BotCommand("mute", "Silenciar"), BotCommand("msg", "Transmissão")
+        BotCommand("start", "Iniciar"), BotCommand("help", "Ajuda"), BotCommand("id", "Ver ID"), 
+        BotCommand("settings", "Configurações"), BotCommand("lock", "Fechar"), BotCommand("unlock", "Abrir"), 
+        BotCommand("purge", "Limpar"), BotCommand("ban", "Banir"), BotCommand("mute", "Silenciar"), 
+        BotCommand("msg", "Transmissão")
     ])
-    logger.info("Jtzin Administrator V1.3.8 ONLINE!")
+    logger.info("Jtzin Administrator V1.3.9 ONLINE!")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(MessageHandler(filters.ALL, global_security_filter), group=-1)
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("listdn", cmd_listdn))
     app.add_handler(CommandHandler("msg", cmd_msg))
