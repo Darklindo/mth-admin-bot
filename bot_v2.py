@@ -489,24 +489,41 @@ async def cmd_msg(update, context):
 async def cmd_chats(update, context):
     if not is_owner(update.effective_user.id): return
     rows = db.all_chats_detailed()
-    text = "📡 <b>RELATÓRIO DE CHATS</b>\n\n"
-    total = 0
-    ativos = 0
+    
+    grupos = []
+    canais = []
+    privados = []
     
     for r in rows:
-        if r['chat_type'] == 'private':
-            icon = "👤"
-        elif r['chat_type'] in ['group', 'supergroup']:
-            icon = "👥"
-        else:
-            icon = "📣"
-            
         status = "✅" if r['active'] else "❌"
-        text += f"{status} {icon} <b>{r['title']}</b>\n└ <code>{r['chat_id']}</code>\n\n"
-        total += 1
-        if r['active']: ativos += 1
+        chat_info = f"{status} {r['title']} (<code>{r['chat_id']}</code>)"
         
-    text += f"📊 <b>Total:</b> {total} | <b>Ativos:</b> {ativos}"
+        if r['chat_type'] in ['group', 'supergroup']:
+            grupos.append(chat_info)
+        elif r['chat_type'] == 'channel':
+            canais.append(chat_info)
+        elif r['chat_type'] == 'private':
+            user_info = db.get_user_info(r['chat_id'])
+            privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
+
+    text = "📡 <b>RELATÓRIO DE CHATS</b>\n\n"
+    
+    if grupos:
+        text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
+    
+    if canais:
+        text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
+        
+    if privados:
+        text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
+        
+    ativos_msg = sum(1 for r in rows if r['active'] and r['chat_type'] != 'private')
+    
+    text += "📊 <b>RESUMO:</b>\n"
+    text += f"• Grupos/Canais: {len(grupos) + len(canais)}\n"
+    text += f"• Ativos p/ Msg: {ativos_msg}\n"
+    text += f"• Usuários no Privado: {len(privados)}"
+    
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 @error_handler
