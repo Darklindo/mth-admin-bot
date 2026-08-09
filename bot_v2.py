@@ -72,59 +72,62 @@ class Database:
         self.init()
 
     def init(self):
-        self.conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS chats (
-                chat_id INTEGER PRIMARY KEY,
-                title TEXT NOT NULL DEFAULT '',
-                chat_type TEXT NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at INTEGER NOT NULL
-            );
+        try:
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS chats (
+                    chat_id INTEGER PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT '',
+                    chat_type TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at INTEGER NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT
-            );
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT
+                );
 
-            CREATE TABLE IF NOT EXISTS blacklist (
-                chat_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                username TEXT,
-                added_by INTEGER NOT NULL,
-                created_at INTEGER NOT NULL,
-                PRIMARY KEY(chat_id, user_id)
-            );
+                CREATE TABLE IF NOT EXISTS blacklist (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    added_by INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(chat_id, user_id)
+                );
 
-            CREATE TABLE IF NOT EXISTS settings (
-                chat_id INTEGER PRIMARY KEY,
-                antispam INTEGER NOT NULL DEFAULT 1,
-                antilink INTEGER NOT NULL DEFAULT 0,
-                antiraid INTEGER NOT NULL DEFAULT 1,
-                log_channel INTEGER,
-                welcome_text TEXT,
-                welcome_enabled INTEGER NOT NULL DEFAULT 0,
-                night_mode_auto INTEGER NOT NULL DEFAULT 0,
-                night_start TEXT DEFAULT '23:00',
-                night_end TEXT DEFAULT '07:00'
-            );
+                CREATE TABLE IF NOT EXISTS settings (
+                    chat_id INTEGER PRIMARY KEY,
+                    antispam INTEGER NOT NULL DEFAULT 1,
+                    antilink INTEGER NOT NULL DEFAULT 0,
+                    antiraid INTEGER NOT NULL DEFAULT 1,
+                    log_channel INTEGER,
+                    welcome_text TEXT,
+                    welcome_enabled INTEGER NOT NULL DEFAULT 0,
+                    night_mode_auto INTEGER NOT NULL DEFAULT 0,
+                    night_start TEXT DEFAULT '23:00',
+                    night_end TEXT DEFAULT '07:00'
+                );
 
-            CREATE TABLE IF NOT EXISTS warnings (
-                chat_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                count INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY(chat_id, user_id)
-            );
+                CREATE TABLE IF NOT EXISTS warnings (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(chat_id, user_id)
+                );
 
-            CREATE TABLE IF NOT EXISTS link_whitelist (
-                chat_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                PRIMARY KEY(chat_id, user_id)
-            );
-            """
-        )
-        self.conn.commit()
+                CREATE TABLE IF NOT EXISTS link_whitelist (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    PRIMARY KEY(chat_id, user_id)
+                );
+                """
+            )
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Erro na inicialização do DB: {e}")
 
     def register_chat(self, chat_id, title, chat_type):
         try:
@@ -137,54 +140,59 @@ class Database:
                     chat_type=excluded.chat_type,
                     active=1
                 """,
-                (chat_id, title or "", chat_type, 1, int(time.time())),
+                (int(chat_id), title or "", chat_type, 1, int(time.time())),
             )
-            self.conn.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (chat_id,))
+            self.conn.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (int(chat_id),))
             self.conn.commit()
         except Exception as e:
             logger.error(f"Erro ao registrar chat: {e}")
 
     def get_setting(self, chat_id, key, default=0):
         try:
-            row = self.conn.execute(f"SELECT {key} FROM settings WHERE chat_id=?", (chat_id,)).fetchone()
+            row = self.conn.execute(f"SELECT {key} FROM settings WHERE chat_id=?", (int(chat_id),)).fetchone()
             if row and row[key] is not None:
                 return row[key]
             return default
-        except sqlite3.OperationalError:
+        except:
             return default
 
     def set_setting(self, chat_id, key, value):
         try:
-            self.conn.execute(f"UPDATE settings SET {key}=? WHERE chat_id=?", (value, chat_id))
+            self.conn.execute(f"UPDATE settings SET {key}=? WHERE chat_id=?", (value, int(chat_id)))
             self.conn.commit()
         except Exception as e:
             logger.error(f"Erro ao salvar setting {key}: {e}")
 
     def add_link_whitelist(self, chat_id, user_id):
-        self.conn.execute("INSERT OR IGNORE INTO link_whitelist(chat_id, user_id) VALUES(?,?)", (chat_id, user_id))
-        self.conn.commit()
-
-    def remove_link_whitelist(self, chat_id, user_id):
-        self.conn.execute("DELETE FROM link_whitelist WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-        self.conn.commit()
+        try:
+            self.conn.execute("INSERT OR IGNORE INTO link_whitelist(chat_id, user_id) VALUES(?,?)", (int(chat_id), int(user_id)))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Erro na whitelist: {e}")
 
     def is_link_whitelisted(self, chat_id, user_id):
-        row = self.conn.execute("SELECT 1 FROM link_whitelist WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
-        return row is not None
+        try:
+            row = self.conn.execute("SELECT 1 FROM link_whitelist WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id))).fetchone()
+            return row is not None
+        except:
+            return False
 
     def active_chats_with_night_mode(self):
-        return self.conn.execute("SELECT chat_id, night_start, night_end FROM settings WHERE night_mode_auto=1").fetchall()
+        try:
+            return self.conn.execute("SELECT chat_id, night_start, night_end FROM settings WHERE night_mode_auto=1").fetchall()
+        except:
+            return []
 
 db = Database(DB_PATH)
 
 # --- AUXILIARES ---
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user = update.effective_user
-    chat = update.effective_chat
-    if not user or not chat: return False
-    if user.id in [OWNER_ID, SECOND_OWNER_ID]: return True
-    if chat.type == ChatType.PRIVATE: return True
     try:
+        user = update.effective_user
+        chat = update.effective_chat
+        if not user or not chat: return False
+        if user.id in [OWNER_ID, SECOND_OWNER_ID]: return True
+        if chat.type == ChatType.PRIVATE: return True
         member = await context.bot.get_chat_member(chat.id, user.id)
         return member.status in ("administrator", "creator")
     except: return False
@@ -199,23 +207,25 @@ async def safe_delete(message):
     except: return False
 
 def target_from_update(update: Update):
-    msg = update.effective_message
-    if not msg: return None
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        return msg.reply_to_message.from_user
-    args = msg.text.split() if msg.text else []
-    if len(args) < 2: return None
-    raw = args[1].strip()
-    if raw.startswith("@"):
-        uid = db.resolve_username(raw)
-        return uid if uid else None
-    if re.fullmatch(r"\d+", raw): return int(raw)
+    try:
+        msg = update.effective_message
+        if not msg: return None
+        if msg.reply_to_message and msg.reply_to_message.from_user:
+            return msg.reply_to_message.from_user
+        args = msg.text.split() if msg.text else []
+        if len(args) < 2: return None
+        raw = args[1].strip()
+        if raw.startswith("@"):
+            uid = db.resolve_username(raw)
+            return uid if uid else None
+        if re.fullmatch(r"\d+", raw): return int(raw)
+    except: pass
     return None
 
 # --- COMANDOS ---
 async def cmd_start(update, context):
     keyboard = [[InlineKeyboardButton("📚 Ajuda", callback_data="help_main")]]
-    await update.message.reply_text("🛡️ <b>MTH ADMIN BOT V2</b>\n\nPronto para moderar!", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("🛡️ <b>MTH ADMIN BOT V2.1</b>\n\nPronto para moderar com estabilidade!", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cmd_help(update, context):
     text = (
@@ -231,17 +241,17 @@ async def cmd_lock(update, context):
     if not await is_admin(update, context): return
     try:
         await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=False))
-        await update.message.reply_text("🔒 <b>Grupo Fechado!</b> Apenas administradores podem falar.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text("🔒 <b>Grupo Fechado!</b>", parse_mode=ParseMode.HTML)
     except Exception as e:
-        await update.message.reply_text(f"Erro ao fechar grupo: {e}")
+        await update.message.reply_text(f"Erro: {e}")
 
 async def cmd_unlock(update, context):
     if not await is_admin(update, context): return
     try:
         await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_polls=True, can_send_other_messages=True, can_add_web_page_previews=True))
-        await update.message.reply_text("🔓 <b>Grupo Aberto!</b> Todos podem falar.", parse_mode=ParseMode.HTML)
+        await update.message.reply_text("🔓 <b>Grupo Aberto!</b>", parse_mode=ParseMode.HTML)
     except Exception as e:
-        await update.message.reply_text(f"Erro ao abrir grupo: {e}")
+        await update.message.reply_text(f"Erro: {e}")
 
 async def cmd_settings(update, context):
     if not await is_admin(update, context): return
@@ -261,92 +271,105 @@ async def cmd_settings(update, context):
 
 # --- TAREFAS AUTOMÁTICAS ---
 async def night_mode_checker(context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.now().strftime("%H:%M")
-    rows = db.active_chats_with_night_mode()
-    
-    for row in rows:
-        chat_id = row['chat_id']
-        start = row['night_start']
-        end = row['night_end']
-        
-        try:
-            if now == start:
+    try:
+        now = datetime.now().strftime("%H:%M")
+        rows = db.active_chats_with_night_mode()
+        for row in rows:
+            chat_id = row['chat_id']
+            if now == row['night_start']:
                 await context.bot.set_chat_permissions(chat_id, ChatPermissions(can_send_messages=False))
-                await context.bot.send_message(chat_id, "🌙 <b>Modo Noturno Ativado!</b> Grupo fechado automaticamente.", parse_mode=ParseMode.HTML)
-            elif now == end:
+                await context.bot.send_message(chat_id, "🌙 <b>Modo Noturno Ativado!</b>", parse_mode=ParseMode.HTML)
+            elif now == row['night_end']:
                 await context.bot.set_chat_permissions(chat_id, ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_polls=True, can_send_other_messages=True, can_add_web_page_previews=True))
-                await context.bot.send_message(chat_id, "☀️ <b>Modo Noturno Desativado!</b> Grupo aberto automaticamente.", parse_mode=ParseMode.HTML)
-        except: pass
+                await context.bot.send_message(chat_id, "☀️ <b>Modo Noturno Desativado!</b>", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error(f"Erro no checker noturno: {e}")
 
 # --- HANDLERS ---
 async def message_handler(update, context):
-    msg = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-    if not msg or not chat or not user or user.is_bot: return
+    try:
+        msg = update.effective_message
+        chat = update.effective_chat
+        user = update.effective_user
+        if not msg or not chat or not user or user.is_bot: return
 
-    db.register_chat(chat.id, chat.title, chat.type)
-    db.remember_user(user)
+        db.register_chat(chat.id, chat.title, chat.type)
+        if await is_admin(update, context): return
 
-    if await is_admin(update, context): return
+        if db.get_setting(chat.id, "antilink", 0):
+            if any(entity.type in ["url", "text_link"] for entity in msg.entities or []):
+                if not db.is_link_whitelisted(chat.id, user.id):
+                    await safe_delete(msg)
+                    return
 
-    if db.get_setting(chat.id, "antilink", 0):
-        if any(entity.type in ["url", "text_link"] for entity in msg.entities or []):
-            if not db.is_link_whitelisted(chat.id, user.id):
+        if db.get_setting(chat.id, "antispam", 1):
+            now = time.monotonic()
+            bucket = spam_buckets[(chat.id, user.id)]
+            while bucket and now - bucket[0] > SPAM_WINDOW: bucket.popleft()
+            bucket.append(now)
+            if len(bucket) > SPAM_LIMIT:
                 await safe_delete(msg)
                 return
-
-    if db.get_setting(chat.id, "antispam", 1):
-        now = time.monotonic()
-        bucket = spam_buckets[(chat.id, user.id)]
-        while bucket and now - bucket[0] > SPAM_WINDOW: bucket.popleft()
-        bucket.append(now)
-        if len(bucket) > SPAM_LIMIT:
-            await safe_delete(msg)
-            return
+    except Exception as e:
+        logger.error(f"Erro no message_handler: {e}")
 
 async def on_callback(update, context):
-    query = update.callback_query
-    if not query: return
-    await query.answer()
-    chat_id = query.message.chat_id
-    if not await is_admin(update, context): return
+    try:
+        query = update.callback_query
+        if not query: return
+        await query.answer()
+        chat_id = query.message.chat_id
+        if not await is_admin(update, context): return
 
-    if query.data == "toggle_antispam":
-        db.set_setting(chat_id, "antispam", 0 if db.get_setting(chat_id, "antispam", 1) else 1)
-    elif query.data == "toggle_antilink":
-        db.set_setting(chat_id, "antilink", 0 if db.get_setting(chat_id, "antilink", 0) else 1)
-    elif query.data == "toggle_antiraid":
-        db.set_setting(chat_id, "antiraid", 0 if db.get_setting(chat_id, "antiraid", 1) else 1)
-    elif query.data == "toggle_night":
-        db.set_setting(chat_id, "night_mode_auto", 0 if db.get_setting(chat_id, "night_mode_auto", 0) else 1)
-    
-    await cmd_settings(update, context)
+        if query.data == "toggle_antispam":
+            db.set_setting(chat_id, "antispam", 0 if db.get_setting(chat_id, "antispam", 1) else 1)
+        elif query.data == "toggle_antilink":
+            db.set_setting(chat_id, "antilink", 0 if db.get_setting(chat_id, "antilink", 0) else 1)
+        elif query.data == "toggle_antiraid":
+            db.set_setting(chat_id, "antiraid", 0 if db.get_setting(chat_id, "antiraid", 1) else 1)
+        elif query.data == "toggle_night":
+            db.set_setting(chat_id, "night_mode_auto", 0 if db.get_setting(chat_id, "night_mode_auto", 0) else 1)
+        
+        await cmd_settings(update, context)
+    except Exception as e:
+        logger.error(f"Erro no callback: {e}")
 
 async def post_init(app: Application):
-    commands = [
-        BotCommand("start", "Iniciar"),
-        BotCommand("help", "Ajuda"),
-        BotCommand("settings", "Configurações"),
-        BotCommand("lock", "Fechar grupo"),
-        BotCommand("unlock", "Abrir grupo"),
-        BotCommand("purge", "Limpar mensagens"),
-    ]
-    await app.bot.set_my_commands(commands)
-    # Inicia o verificador de modo noturno a cada 60 segundos
-    app.job_queue.run_repeating(night_mode_checker, interval=60, first=10)
+    try:
+        commands = [
+            BotCommand("start", "Iniciar"),
+            BotCommand("help", "Ajuda"),
+            BotCommand("settings", "Configurações"),
+            BotCommand("lock", "Fechar grupo"),
+            BotCommand("unlock", "Abrir grupo"),
+        ]
+        await app.bot.set_my_commands(commands)
+        
+        # Tenta iniciar a JobQueue com segurança
+        if app.job_queue:
+            app.job_queue.run_repeating(night_mode_checker, interval=60, first=10)
+            logger.info("JobQueue iniciada com sucesso.")
+        else:
+            logger.warning("JobQueue não disponível. Modo Noturno Automático desativado.")
+    except Exception as e:
+        logger.error(f"Erro no post_init: {e}")
 
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("settings", cmd_settings))
-    app.add_handler(CommandHandler("lock", cmd_lock))
-    app.add_handler(CommandHandler("unlock", cmd_unlock))
-    app.add_handler(CommandHandler("purge", lambda u, c: None)) # Purge implementado anteriormente
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, message_handler))
-    app.run_polling(drop_pending_updates=True)
+    try:
+        app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+        app.add_handler(CommandHandler("start", cmd_start))
+        app.add_handler(CommandHandler("help", cmd_help))
+        app.add_handler(CommandHandler("settings", cmd_settings))
+        app.add_handler(CommandHandler("lock", cmd_lock))
+        app.add_handler(CommandHandler("unlock", cmd_unlock))
+        app.add_handler(CommandHandler("allowlink", lambda u, c: None)) # Adicionar handler real se necessário
+        app.add_handler(CallbackQueryHandler(on_callback))
+        app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, message_handler))
+        
+        logger.info("Bot iniciado...")
+        app.run_polling(drop_pending_updates=True)
+    except Exception as e:
+        logger.critical(f"Erro fatal ao iniciar o bot: {e}")
 
 if __name__ == "__main__":
     main()
