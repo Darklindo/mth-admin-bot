@@ -264,7 +264,20 @@ async def global_security_filter(update: Update, context: ContextTypes.DEFAULT_T
 # --- COMANDOS ---
 @error_handler
 async def cmd_start(update, context):
-    await update.message.reply_text("🛡️ <b>Jtzin Administrator V1.3.6</b>", parse_mode=ParseMode.HTML)
+    text = (
+        "🛡️ <b>Jtzin Administrator V1.3.6</b>\n\n"
+        "O bot de administração definitivo para elevar o nível do seu grupo ou canal. "
+        "Segurança avançada, moderação rápida e controle total em suas mãos.\n\n"
+        "💎 <b>Equipe Diamond</b> — <i>Excelência em Automação</i>\n\n"
+        "🚀 <b>Principais Recursos:</b>\n"
+        "• Anti-Link e Anti-Spam inteligente\n"
+        "• Punições Globais e Blacklist\n"
+        "• Sistema de Shadow Ban\n"
+        "• Moderação por Resposta e ID\n\n"
+        "Clique no botão abaixo para conhecer nosso canal oficial e suporte."
+    )
+    keyboard = [[InlineKeyboardButton("💎 Canal Oficial Diamond", url="https://t.me/Jtcaciadminbot")]]
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
 @error_handler
 async def cmd_id(update, context):
