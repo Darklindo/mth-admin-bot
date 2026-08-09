@@ -93,6 +93,7 @@ class Cache:
                 self.settings[row[0]] = {
                     "antispam": row[1], "antilink": row[2], "captcha_enabled": row[3]
                 }
+            logger.info("Cache carregado com sucesso.")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -298,7 +299,7 @@ async def global_security_filter(update: Update, context: ContextTypes.DEFAULT_T
 @error_handler
 async def cmd_start(update, context):
     text = (
-        "🛡️ <b>Jtzin Administrator V1.4.1</b>\n\n"
+        "🛡️ <b>Jtzin Administrator V1.4.2</b>\n\n"
         "O bot de administração definitivo para elevar o nível do seu grupo ou canal.\n\n"
         "💎 <b>Equipe Diamond</b> — <i>Excelência em Automação</i>\n\n"
         "🚀 <b>Recursos de Elite:</b>\n"
@@ -380,6 +381,14 @@ async def cmd_allblack(update, context):
     await update.message.reply_text(f"☢️ {target_id} em BLACKLIST GLOBAL.")
 
 @error_handler
+async def cmd_unblacklist(update, context):
+    if not is_owner(update.effective_user.id): return
+    target_id = get_target(update)
+    if not target_id: return
+    db.remove_global_blacklist(target_id)
+    await update.message.reply_text(f"✅ {target_id} removido da blacklist global.")
+
+@error_handler
 async def cmd_listdn(update, context):
     if not is_owner(update.effective_user.id): return
     shadow, glob = db.get_all_banned_list_detailed()
@@ -404,6 +413,22 @@ async def cmd_mute(update, context):
     if not target_id or is_owner(target_id): return
     await context.bot.restrict_chat_member(update.effective_chat.id, target_id, permissions=ChatPermissions(can_send_messages=False))
     await update.message.reply_text("🔇 Mutado.")
+
+@error_handler
+async def cmd_shadow(update, context):
+    if not await is_admin(update, context): return
+    target_id = get_target(update)
+    if not target_id or is_owner(target_id): return
+    db.add_shadow_ban(target_id, get_reason(update))
+    await update.message.reply_text("🌑 Shadow Ban ativado.")
+
+@error_handler
+async def cmd_unshadow(update, context):
+    if not await is_admin(update, context): return
+    target_id = get_target(update)
+    if not target_id: return
+    db.remove_shadow_ban(target_id)
+    await update.message.reply_text("✅ Shadow Ban removido.")
 
 @error_handler
 async def cmd_purge(update, context):
@@ -447,6 +472,51 @@ async def cmd_chats(update, context):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 @error_handler
+async def cmd_adddivulgar(update, context):
+    if not is_owner(update.effective_user.id): return
+    target = context.args[0] if context.args else None
+    if not target: return
+    db.set_chat_active(target, 1)
+    await update.message.reply_text(f"✅ Chat {target} ativo.")
+
+@error_handler
+async def cmd_rmdivulgar(update, context):
+    if not is_owner(update.effective_user.id): return
+    target = context.args[0] if context.args else None
+    if not target: return
+    db.set_chat_active(target, 0)
+    await update.message.reply_text(f"❌ Chat {target} inativo.")
+
+@error_handler
+async def cmd_allowlink(update, context):
+    if not await is_admin(update, context): return
+    target_id = get_target(update)
+    if not target_id: return
+    db.add_link_whitelist(update.effective_chat.id, target_id)
+    await update.message.reply_text(f"✅ {target_id} autorizado.")
+
+@error_handler
+async def cmd_removelink(update, context):
+    if not await is_admin(update, context): return
+    target_id = get_target(update)
+    if not target_id: return
+    db.remove_link_whitelist(update.effective_chat.id, target_id)
+    await update.message.reply_text(f"❌ {target_id} desautorizado.")
+
+@error_handler
+async def cmd_lock(update, context):
+    if not await is_admin(update, context): return
+    await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=False))
+    await update.message.reply_text("🔒 Grupo Fechado.")
+
+@error_handler
+async def cmd_unlock(update, context):
+    if not await is_admin(update, context): return
+    perms = ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True, can_send_photos=True, can_send_videos=True, can_send_other_messages=True, can_add_web_page_previews=True)
+    await context.bot.set_chat_permissions(update.effective_chat.id, perms)
+    await update.message.reply_text("🔓 Grupo Aberto.")
+
+@error_handler
 async def cmd_settings(update, context):
     if not await is_admin(update, context): return
     cid = update.effective_chat.id
@@ -473,7 +543,7 @@ async def post_init(app: Application):
         BotCommand("settings", "Configurações"), BotCommand("lock", "Fechar"), BotCommand("unlock", "Abrir"), 
         BotCommand("purge", "Limpar"), BotCommand("ban", "Banir"), BotCommand("mute", "Silenciar")
     ])
-    logger.info("Jtzin Administrator V1.4.1 ONLINE!")
+    logger.info("Jtzin Administrator V1.4.2 ONLINE!")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
@@ -485,13 +555,20 @@ def main():
     app.add_handler(CommandHandler("blacklist", cmd_blacklist))
     app.add_handler(CommandHandler("allban", cmd_allban))
     app.add_handler(CommandHandler("allblack", cmd_allblack))
+    app.add_handler(CommandHandler("unblacklist", cmd_unblacklist))
     app.add_handler(CommandHandler("listdn", cmd_listdn))
     app.add_handler(CommandHandler("msg", cmd_msg))
     app.add_handler(CommandHandler("chats", cmd_chats))
+    app.add_handler(CommandHandler("adddivulgar", cmd_adddivulgar))
+    app.add_handler(CommandHandler("rmdivulgar", cmd_rmdivulgar))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("purge", cmd_purge))
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("mute", cmd_mute))
+    app.add_handler(CommandHandler("shadow", cmd_shadow))
+    app.add_handler(CommandHandler("unshadow", cmd_unshadow))
+    app.add_handler(CommandHandler("allowlink", cmd_allowlink))
+    app.add_handler(CommandHandler("removelink", cmd_removelink))
     app.add_handler(CommandHandler("lock", cmd_lock))
     app.add_handler(CommandHandler("unlock", cmd_unlock))
     app.add_handler(CallbackQueryHandler(on_callback))
