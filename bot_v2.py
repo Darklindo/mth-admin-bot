@@ -40,7 +40,7 @@ load_dotenv(BASE_DIR / ".env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "6822870889"))
-SECOND_OWNER_ID = 6466326477
+SECOND_OWNER_ID = 6466326477 # @MHZINTADEVOLTAPORRRRRRAAAA
 
 if not BOT_TOKEN:
     print("ERRO: BOT_TOKEN não configurado no .env")
@@ -166,11 +166,14 @@ class Database:
 db = Database(DB_PATH)
 
 # --- AUXILIARES ---
+def is_owner(user_id: int) -> bool:
+    return user_id in [OWNER_ID, SECOND_OWNER_ID]
+
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     chat = update.effective_chat
     if not user or not chat: return False
-    if user.id in [OWNER_ID, SECOND_OWNER_ID]: return True
+    if is_owner(user.id): return True
     if chat.type == ChatType.PRIVATE: return True
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
@@ -178,7 +181,7 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     except: return False
 
 def is_immune(user_id: int) -> bool:
-    return user_id in [OWNER_ID, SECOND_OWNER_ID]
+    return is_owner(user_id)
 
 async def safe_delete(message):
     try: await message.delete(); return True
@@ -187,10 +190,8 @@ async def safe_delete(message):
 def get_target(update: Update):
     msg = update.effective_message
     if not msg: return None
-    # Prioridade 1: Resposta
     if msg.reply_to_message and msg.reply_to_message.from_user:
         return msg.reply_to_message.from_user.id
-    # Prioridade 2: Argumentos (ID ou @Username)
     args = msg.text.split()
     if len(args) > 1:
         raw = args[1].strip()
@@ -211,23 +212,20 @@ async def cmd_id(update, context):
 
 @error_handler
 async def cmd_listdn(update, context):
-    if update.effective_user.id != OWNER_ID: return
+    if not is_owner(update.effective_user.id): return
     shadow, glob = db.get_all_banned_list()
     text = "📋 <b>LISTA DE PUNIÇÕES</b>\n\n"
-    
     text += "🌑 <b>Shadow Ban:</b>\n"
     if not shadow: text += "<i>Nenhum</i>\n"
     for r in shadow: text += f"• {db.get_user_info(r['user_id'])} (<code>{r['user_id']}</code>)\n"
-    
     text += "\n🌎 <b>Global Blacklist:</b>\n"
     if not glob: text += "<i>Nenhum</i>\n"
     for r in glob: text += f"• {db.get_user_info(r['user_id'])} (<code>{r['user_id']}</code>) [{r['type'].upper()}]\n"
-    
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 @error_handler
 async def cmd_allban(update, context):
-    if update.effective_user.id != OWNER_ID: return
+    if not is_owner(update.effective_user.id): return
     target_id = get_target(update)
     if not target_id or is_immune(target_id): return
     db.add_global_blacklist(target_id, 'ban')
@@ -238,7 +236,7 @@ async def cmd_allban(update, context):
 
 @error_handler
 async def cmd_allblack(update, context):
-    if update.effective_user.id != OWNER_ID: return
+    if not is_owner(update.effective_user.id): return
     target_id = get_target(update)
     if not target_id or is_immune(target_id): return
     db.add_global_blacklist(target_id, 'black')
@@ -246,7 +244,7 @@ async def cmd_allblack(update, context):
 
 @error_handler
 async def cmd_unblacklist(update, context):
-    if update.effective_user.id != OWNER_ID: return
+    if not is_owner(update.effective_user.id): return
     target_id = get_target(update)
     if not target_id: return
     db.remove_global_blacklist(target_id)
@@ -286,7 +284,7 @@ async def cmd_unshadow(update, context):
 
 @error_handler
 async def cmd_msg(update, context):
-    if update.effective_user.id != OWNER_ID: return
+    if not is_owner(update.effective_user.id): return
     msg = update.effective_message
     target_chats = db.active_chats()
     sent = 0
@@ -328,6 +326,16 @@ async def cmd_purge(update, context):
     for i in range(amount):
         try: await context.bot.delete_message(msg.chat_id, msg.message_id - i - 1)
         except: continue
+
+@error_handler
+async def cmd_chats(update, context):
+    if not is_owner(update.effective_user.id): return
+    rows = db.all_chats()
+    if not rows: return await update.message.reply_text("Nenhum chat registrado.")
+    lines = ["📡 <b>CHATS:</b>"]
+    for row in rows:
+        lines.append(f"• <code>{row['chat_id']}</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 @error_handler
 async def cmd_settings(update, context):
@@ -416,6 +424,7 @@ def main():
     app.add_handler(CommandHandler("unblacklist", cmd_unblacklist))
     app.add_handler(CommandHandler("shadow", cmd_shadow))
     app.add_handler(CommandHandler("unshadow", cmd_unshadow))
+    app.add_handler(CommandHandler("chats", cmd_chats))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, join_handler))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, message_handler))
