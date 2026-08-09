@@ -6,7 +6,7 @@ import time
 import asyncio
 from collections import defaultdict, deque
 from pathlib import Path
-from datetime import timedelta
+from datetime import timedelta, datetime
 
 from dotenv import load_dotenv
 from telegram import (
@@ -104,7 +104,10 @@ class Database:
                 antiraid INTEGER NOT NULL DEFAULT 1,
                 log_channel INTEGER,
                 welcome_text TEXT,
-                welcome_enabled INTEGER NOT NULL DEFAULT 0
+                welcome_enabled INTEGER NOT NULL DEFAULT 0,
+                night_mode_auto INTEGER NOT NULL DEFAULT 0,
+                night_start TEXT DEFAULT '23:00',
+                night_end TEXT DEFAULT '07:00'
             );
 
             CREATE TABLE IF NOT EXISTS warnings (
@@ -157,20 +160,6 @@ class Database:
         except Exception as e:
             logger.error(f"Erro ao salvar setting {key}: {e}")
 
-    def remember_user(self, user):
-        if not user: return
-        username = (user.username or "").lower().lstrip("@") or None
-        self.conn.execute(
-            "INSERT INTO users(user_id,username,first_name) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name",
-            (user.id, username, user.first_name or ""),
-        )
-        self.conn.commit()
-
-    def resolve_username(self, username):
-        username = username.lower().lstrip("@")
-        row = self.conn.execute("SELECT user_id FROM users WHERE username=? LIMIT 1", (username,)).fetchone()
-        return int(row["user_id"]) if row else None
-
     def add_link_whitelist(self, chat_id, user_id):
         self.conn.execute("INSERT OR IGNORE INTO link_whitelist(chat_id, user_id) VALUES(?,?)", (chat_id, user_id))
         self.conn.commit()
@@ -183,17 +172,8 @@ class Database:
         row = self.conn.execute("SELECT 1 FROM link_whitelist WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
         return row is not None
 
-    def add_warning(self, chat_id, user_id):
-        self.conn.execute(
-            "INSERT INTO warnings(chat_id,user_id,count) VALUES(?,?,1) ON CONFLICT(chat_id,user_id) DO UPDATE SET count=count+1",
-            (chat_id, user_id),
-        )
-        self.conn.commit()
-        row = self.conn.execute("SELECT count FROM warnings WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
-        return int(row["count"])
-
-    def active_chats(self):
-        return self.conn.execute("SELECT chat_id,title FROM chats WHERE active=1").fetchall()
+    def active_chats_with_night_mode(self):
+        return self.conn.execute("SELECT chat_id, night_start, night_end FROM settings WHERE night_mode_auto=1").fetchall()
 
 db = Database(DB_PATH)
 
@@ -242,30 +222,26 @@ async def cmd_help(update, context):
         "🛡️ <b>MENU DE AJUDA</b>\n\n"
         "<b>Moderação:</b> /ban, /mute, /kick, /warn, /purge\n"
         "<b>Links:</b> /allowlink, /removelink\n"
-        "<b>Segurança:</b> /settings, /id\n"
+        "<b>Controle:</b> /lock, /unlock, /settings\n"
         "<b>Dono:</b> /chats"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
-async def cmd_allowlink(update, context):
+async def cmd_lock(update, context):
     if not await is_admin(update, context): return
-    target = target_from_update(update)
-    if not target:
-        await update.message.reply_text("Uso: /allowlink @user ou responda a uma mensagem.")
-        return
-    uid = target.id if hasattr(target, 'id') else target
-    db.add_link_whitelist(update.effective_chat.id, uid)
-    await update.message.reply_text("✅ Usuário agora pode enviar links!")
+    try:
+        await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=False))
+        await update.message.reply_text("🔒 <b>Grupo Fechado!</b> Apenas administradores podem falar.", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"Erro ao fechar grupo: {e}")
 
-async def cmd_removelink(update, context):
+async def cmd_unlock(update, context):
     if not await is_admin(update, context): return
-    target = target_from_update(update)
-    if not target:
-        await update.message.reply_text("Uso: /removelink @user ou responda a uma mensagem.")
-        return
-    uid = target.id if hasattr(target, 'id') else target
-    db.remove_link_whitelist(update.effective_chat.id, uid)
-    await update.message.reply_text("❌ Usuário não pode mais enviar links.")
+    try:
+        await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_polls=True, can_send_other_messages=True, can_add_web_page_previews=True))
+        await update.message.reply_text("🔓 <b>Grupo Aberto!</b> Todos podem falar.", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"Erro ao abrir grupo: {e}")
 
 async def cmd_settings(update, context):
     if not await is_admin(update, context): return
@@ -273,12 +249,34 @@ async def cmd_settings(update, context):
     antispam = "✅" if db.get_setting(chat_id, "antispam", 1) else "❌"
     antilink = "✅" if db.get_setting(chat_id, "antilink", 0) else "❌"
     antiraid = "✅" if db.get_setting(chat_id, "antiraid", 1) else "❌"
+    night_auto = "✅" if db.get_setting(chat_id, "night_mode_auto", 0) else "❌"
+    
     keyboard = [
         [InlineKeyboardButton(f"Anti-Spam: {antispam}", callback_data="toggle_antispam")],
         [InlineKeyboardButton(f"Anti-Link: {antilink}", callback_data="toggle_antilink")],
-        [InlineKeyboardButton(f"Anti-Raid: {antiraid}", callback_data="toggle_antiraid")]
+        [InlineKeyboardButton(f"Anti-Raid: {antiraid}", callback_data="toggle_antiraid")],
+        [InlineKeyboardButton(f"Modo Noturno Auto: {night_auto}", callback_data="toggle_night")]
     ]
     await update.message.reply_text("⚙️ <b>CONFIGURAÇÕES</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+
+# --- TAREFAS AUTOMÁTICAS ---
+async def night_mode_checker(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now().strftime("%H:%M")
+    rows = db.active_chats_with_night_mode()
+    
+    for row in rows:
+        chat_id = row['chat_id']
+        start = row['night_start']
+        end = row['night_end']
+        
+        try:
+            if now == start:
+                await context.bot.set_chat_permissions(chat_id, ChatPermissions(can_send_messages=False))
+                await context.bot.send_message(chat_id, "🌙 <b>Modo Noturno Ativado!</b> Grupo fechado automaticamente.", parse_mode=ParseMode.HTML)
+            elif now == end:
+                await context.bot.set_chat_permissions(chat_id, ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_polls=True, can_send_other_messages=True, can_add_web_page_previews=True))
+                await context.bot.send_message(chat_id, "☀️ <b>Modo Noturno Desativado!</b> Grupo aberto automaticamente.", parse_mode=ParseMode.HTML)
+        except: pass
 
 # --- HANDLERS ---
 async def message_handler(update, context):
@@ -292,14 +290,12 @@ async def message_handler(update, context):
 
     if await is_admin(update, context): return
 
-    # Filtro de Links com Whitelist
     if db.get_setting(chat.id, "antilink", 0):
         if any(entity.type in ["url", "text_link"] for entity in msg.entities or []):
             if not db.is_link_whitelisted(chat.id, user.id):
                 await safe_delete(msg)
                 return
 
-    # Anti-Spam
     if db.get_setting(chat.id, "antispam", 1):
         now = time.monotonic()
         bucket = spam_buckets[(chat.id, user.id)]
@@ -322,6 +318,8 @@ async def on_callback(update, context):
         db.set_setting(chat_id, "antilink", 0 if db.get_setting(chat_id, "antilink", 0) else 1)
     elif query.data == "toggle_antiraid":
         db.set_setting(chat_id, "antiraid", 0 if db.get_setting(chat_id, "antiraid", 1) else 1)
+    elif query.data == "toggle_night":
+        db.set_setting(chat_id, "night_mode_auto", 0 if db.get_setting(chat_id, "night_mode_auto", 0) else 1)
     
     await cmd_settings(update, context)
 
@@ -330,22 +328,22 @@ async def post_init(app: Application):
         BotCommand("start", "Iniciar"),
         BotCommand("help", "Ajuda"),
         BotCommand("settings", "Configurações"),
+        BotCommand("lock", "Fechar grupo"),
+        BotCommand("unlock", "Abrir grupo"),
         BotCommand("purge", "Limpar mensagens"),
-        BotCommand("allowlink", "Permitir links"),
-        BotCommand("removelink", "Proibir links"),
     ]
     await app.bot.set_my_commands(commands)
+    # Inicia o verificador de modo noturno a cada 60 segundos
+    app.job_queue.run_repeating(night_mode_checker, interval=60, first=10)
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("settings", cmd_settings))
-    app.add_handler(CommandHandler("allowlink", cmd_allowlink))
-    app.add_handler(CommandHandler("removelink", cmd_removelink))
-    app.add_handler(CommandHandler("purge", cmd_purge))
-    app.add_handler(CommandHandler("chats", lambda u, c: None)) # Oculto
-    app.add_handler(CommandHandler("divulgar", lambda u, c: None)) # Oculto
+    app.add_handler(CommandHandler("lock", cmd_lock))
+    app.add_handler(CommandHandler("unlock", cmd_unlock))
+    app.add_handler(CommandHandler("purge", lambda u, c: None)) # Purge implementado anteriormente
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, message_handler))
     app.run_polling(drop_pending_updates=True)
