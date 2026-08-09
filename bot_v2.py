@@ -95,9 +95,6 @@ class Database:
         )
         self.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (int(chat_id),), commit=True)
 
-    def set_chat_active(self, chat_id, active):
-        return self.execute("UPDATE chats SET active=? WHERE chat_id=?", (int(active), int(chat_id)), commit=True) is not None
-
     def get_setting(self, chat_id, key, default=0):
         row = self.execute(f"SELECT {key} FROM settings WHERE chat_id=?", (int(chat_id),)).fetchone()
         return row[key] if row and row[key] is not None else default
@@ -140,6 +137,16 @@ class Database:
         row = self.execute("SELECT user_id FROM users WHERE username=? LIMIT 1", (username,)).fetchone()
         return int(row["user_id"]) if row else None
 
+    def get_user_info(self, user_id):
+        row = self.execute("SELECT username, first_name FROM users WHERE user_id=?", (int(user_id),)).fetchone()
+        if row: return f"@{row['username']}" if row['username'] else row['first_name']
+        return str(user_id)
+
+    def get_all_banned_list(self):
+        shadow = self.execute("SELECT user_id FROM shadow_ban").fetchall()
+        glob = self.execute("SELECT user_id, type FROM global_blacklist").fetchall()
+        return shadow, glob
+
     def remember_user(self, user):
         if not user: return
         username = (user.username or "").lower().lstrip("@") or None
@@ -155,9 +162,6 @@ class Database:
 
     def remove_captcha_pending(self, chat_id, user_id):
         self.execute("DELETE FROM captcha_pending WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)), commit=True)
-
-    def get_expired_captchas(self):
-        return self.execute("SELECT chat_id, user_id, message_id FROM captcha_pending WHERE expiry < ?", (int(time.time()),)).fetchall()
 
 db = Database(DB_PATH)
 
@@ -183,8 +187,10 @@ async def safe_delete(message):
 def get_target(update: Update):
     msg = update.effective_message
     if not msg: return None
+    # Prioridade 1: Resposta
     if msg.reply_to_message and msg.reply_to_message.from_user:
         return msg.reply_to_message.from_user.id
+    # Prioridade 2: Argumentos (ID ou @Username)
     args = msg.text.split()
     if len(args) > 1:
         raw = args[1].strip()
@@ -198,14 +204,25 @@ async def cmd_start(update, context):
     await update.message.reply_text("🛡️ <b>Jtzin Administrator V1</b>", parse_mode=ParseMode.HTML)
 
 @error_handler
-async def cmd_help(update, context):
-    text = (
-        "🛡️ <b>LISTA DE COMANDOS</b>\n\n"
-        "<b>Moderação:</b> /ban, /mute, /kick, /warn, /purge, /lock, /unlock\n"
-        "<b>Segurança:</b> /settings, /allowlink, /removelink, /shadow, /unshadow\n"
-        "<b>Global:</b> /allban, /allblack, /blacklist, /unblacklist\n"
-        "<b>Broadcast:</b> /msg, /chats"
-    )
+async def cmd_id(update, context):
+    target_id = get_target(update)
+    if not target_id: return
+    await update.message.reply_text(f"🆔 ID: <code>{target_id}</code>", parse_mode=ParseMode.HTML)
+
+@error_handler
+async def cmd_listdn(update, context):
+    if update.effective_user.id != OWNER_ID: return
+    shadow, glob = db.get_all_banned_list()
+    text = "📋 <b>LISTA DE PUNIÇÕES</b>\n\n"
+    
+    text += "🌑 <b>Shadow Ban:</b>\n"
+    if not shadow: text += "<i>Nenhum</i>\n"
+    for r in shadow: text += f"• {db.get_user_info(r['user_id'])} (<code>{r['user_id']}</code>)\n"
+    
+    text += "\n🌎 <b>Global Blacklist:</b>\n"
+    if not glob: text += "<i>Nenhum</i>\n"
+    for r in glob: text += f"• {db.get_user_info(r['user_id'])} (<code>{r['user_id']}</code>) [{r['type'].upper()}]\n"
+    
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 @error_handler
@@ -213,7 +230,7 @@ async def cmd_allban(update, context):
     if update.effective_user.id != OWNER_ID: return
     target_id = get_target(update)
     if not target_id or is_immune(target_id): return
-    db.add_global_blacklist(target_id, 'ban', "Ban Global")
+    db.add_global_blacklist(target_id, 'ban')
     for row in db.all_chats():
         try: await context.bot.ban_chat_member(row['chat_id'], target_id)
         except: continue
@@ -224,7 +241,7 @@ async def cmd_allblack(update, context):
     if update.effective_user.id != OWNER_ID: return
     target_id = get_target(update)
     if not target_id or is_immune(target_id): return
-    db.add_global_blacklist(target_id, 'black', "Blacklist Global")
+    db.add_global_blacklist(target_id, 'black')
     await update.message.reply_text(f"✅ Usuário {target_id} em blacklist global.")
 
 @error_handler
@@ -234,6 +251,38 @@ async def cmd_unblacklist(update, context):
     if not target_id: return
     db.remove_global_blacklist(target_id)
     await update.message.reply_text(f"✅ Usuário {target_id} removido da blacklist.")
+
+@error_handler
+async def cmd_ban(update, context):
+    if not await is_admin(update, context): return
+    target_id = get_target(update)
+    if not target_id or is_immune(target_id): return
+    await context.bot.ban_chat_member(update.effective_chat.id, target_id)
+    await update.message.reply_text("🚫 Usuário banido.")
+
+@error_handler
+async def cmd_mute(update, context):
+    if not await is_admin(update, context): return
+    target_id = get_target(update)
+    if not target_id or is_immune(target_id): return
+    await context.bot.restrict_chat_member(update.effective_chat.id, target_id, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now() + timedelta(hours=24))
+    await update.message.reply_text("🔇 Usuário mutado por 24h.")
+
+@error_handler
+async def cmd_shadow(update, context):
+    if not await is_admin(update, context): return
+    target_id = get_target(update)
+    if not target_id or is_immune(target_id): return
+    db.add_shadow_ban(target_id)
+    await update.message.reply_text("🌑 Usuário em Shadow Ban.")
+
+@error_handler
+async def cmd_unshadow(update, context):
+    if not await is_admin(update, context): return
+    target_id = get_target(update)
+    if not target_id: return
+    db.remove_shadow_ban(target_id)
+    await update.message.reply_text("✅ Shadow Ban removido.")
 
 @error_handler
 async def cmd_msg(update, context):
@@ -279,48 +328,6 @@ async def cmd_purge(update, context):
     for i in range(amount):
         try: await context.bot.delete_message(msg.chat_id, msg.message_id - i - 1)
         except: continue
-
-@error_handler
-async def cmd_ban(update, context):
-    if not await is_admin(update, context): return
-    target_id = get_target(update)
-    if not target_id or is_immune(target_id): return
-    await context.bot.ban_chat_member(update.effective_chat.id, target_id)
-    await update.message.reply_text("🚫 Usuário banido.")
-
-@error_handler
-async def cmd_mute(update, context):
-    if not await is_admin(update, context): return
-    target_id = get_target(update)
-    if not target_id or is_immune(target_id): return
-    await context.bot.restrict_chat_member(update.effective_chat.id, target_id, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now() + timedelta(hours=24))
-    await update.message.reply_text("🔇 Usuário mutado por 24h.")
-
-@error_handler
-async def cmd_shadow(update, context):
-    if not await is_admin(update, context): return
-    target_id = get_target(update)
-    if not target_id or is_immune(target_id): return
-    db.add_shadow_ban(target_id)
-    await update.message.reply_text("🌑 Usuário em Shadow Ban.")
-
-@error_handler
-async def cmd_unshadow(update, context):
-    if not await is_admin(update, context): return
-    target_id = get_target(update)
-    if not target_id: return
-    db.remove_shadow_ban(target_id)
-    await update.message.reply_text("✅ Shadow Ban removido.")
-
-@error_handler
-async def cmd_chats(update, context):
-    if update.effective_user.id != OWNER_ID: return
-    rows = db.all_chats()
-    if not rows: return await update.message.reply_text("Nenhum chat registrado.")
-    lines = ["📡 <b>CHATS:</b>"]
-    for row in rows:
-        lines.append(f"• <code>{row['chat_id']}</code>")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 @error_handler
 async def cmd_settings(update, context):
@@ -385,7 +392,7 @@ async def on_callback(update, context):
 
 async def post_init(app: Application):
     await app.bot.set_my_commands([
-        BotCommand("start", "Iniciar"), BotCommand("help", "Ajuda"), BotCommand("settings", "Configurações"),
+        BotCommand("start", "Iniciar"), BotCommand("id", "Ver ID"), BotCommand("settings", "Configurações"),
         BotCommand("lock", "Fechar"), BotCommand("unlock", "Abrir"), BotCommand("purge", "Limpar"),
         BotCommand("ban", "Banir"), BotCommand("mute", "Silenciar"), BotCommand("msg", "Transmissão")
     ])
@@ -394,7 +401,8 @@ async def post_init(app: Application):
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("listdn", cmd_listdn))
     app.add_handler(CommandHandler("msg", cmd_msg))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("purge", cmd_purge))
@@ -408,7 +416,6 @@ def main():
     app.add_handler(CommandHandler("unblacklist", cmd_unblacklist))
     app.add_handler(CommandHandler("shadow", cmd_shadow))
     app.add_handler(CommandHandler("unshadow", cmd_unshadow))
-    app.add_handler(CommandHandler("chats", cmd_chats))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, join_handler))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, message_handler))
