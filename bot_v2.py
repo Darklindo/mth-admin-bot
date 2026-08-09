@@ -283,11 +283,14 @@ async def global_security_filter(update: Update, context: ContextTypes.DEFAULT_T
     if is_banned_global or is_shadow or is_local_black or is_local_banperm:
         try:
             await msg.delete()
-            # Se for ban global ou banperm local, tenta banir se ainda não estiver
             if is_banned_global or is_local_banperm:
                 await context.bot.ban_chat_member(msg.chat_id, user.id)
         except: pass
-        raise ApplicationHandlerStop() # Impede que comandos e outros handlers rodem
+        raise ApplicationHandlerStop()
+
+    # Se for um comando, deixa passar para os CommandHandlers
+    if msg.text and msg.text.startswith("/"):
+        return
 
     # Anti-Link (Bloqueia comandos com link também)
     if db.get_setting(msg.chat_id, "antilink") and any(e.type in ["url", "text_link"] for e in msg.entities or []):
@@ -643,10 +646,10 @@ async def post_init(app: Application):
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     
-    # Filtro de Segurança em primeiro lugar no grupo 0 para bloquear tudo de banned
-    app.add_handler(MessageHandler(filters.ALL, global_security_filter), group=0)
+    # Filtro de Segurança (Roda para TUDO antes de qualquer comando)
+    app.add_handler(MessageHandler(filters.ALL, global_security_filter), group=-1)
     
-    # Comandos em seguida (ainda no grupo 0)
+    # Comandos (Grupo 0)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
