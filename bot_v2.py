@@ -265,7 +265,7 @@ async def global_security_filter(update: Update, context: ContextTypes.DEFAULT_T
 @error_handler
 async def cmd_start(update, context):
     text = (
-        "🛡️ <b>Jtzin Administrator V1.3.9</b>\n\n"
+        "🛡️ <b>Jtzin Administrator V1.4.0</b>\n\n"
         "O bot de administração definitivo para elevar o nível do seu grupo ou canal. "
         "Segurança avançada, moderação rápida e controle total em suas mãos.\n\n"
         "💎 <b>Equipe Diamond</b> — <i>Excelência em Automação</i>\n\n"
@@ -350,7 +350,7 @@ async def cmd_allban(update, context):
         if row['chat_type'] == 'private': continue
         try: await context.bot.ban_chat_member(row['chat_id'], target_id)
         except: continue
-    await update.message.reply_text(f"✅ {target_id} banido globalmente.")
+    await update.message.reply_text(f"✅ {target_id} banido globalmente (BanPerm).")
 
 @error_handler
 async def cmd_allblack(update, context):
@@ -547,7 +547,7 @@ async def post_init(app: Application):
         BotCommand("purge", "Limpar"), BotCommand("ban", "Banir"), BotCommand("mute", "Silenciar"), 
         BotCommand("msg", "Transmissão")
     ])
-    logger.info("Jtzin Administrator V1.3.9 ONLINE!")
+    logger.info("Jtzin Administrator V1.4.0 ONLINE!")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
@@ -565,8 +565,9 @@ def main():
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("mute", cmd_mute))
     app.add_handler(CommandHandler("allban", cmd_allban))
+    app.add_handler(CommandHandler("banperm", cmd_allban)) # Alias para banperm
     app.add_handler(CommandHandler("allblack", cmd_allblack))
-    app.add_handler(CommandHandler("blacklist", cmd_allblack))
+    app.add_handler(CommandHandler("blacklist", cmd_allblack)) # Alias para blacklist
     app.add_handler(CommandHandler("unblacklist", cmd_unblacklist))
     app.add_handler(CommandHandler("shadow", cmd_shadow))
     app.add_handler(CommandHandler("unshadow", cmd_unshadow))
