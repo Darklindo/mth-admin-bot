@@ -6,7 +6,7 @@ import time
 import asyncio
 import sys
 import functools
-from collections import defaultdict, deque
+from collections import defaultdict
 from pathlib import Path
 from datetime import timedelta, datetime
 
@@ -237,32 +237,27 @@ async def global_security_filter(update: Update, context: ContextTypes.DEFAULT_T
     user = update.effective_user
     if not msg or not user or user.is_bot: return
     
-    # Registrar chat e usuário
     db.register_chat(msg.chat_id, msg.chat.title, msg.chat.type)
     db.remember_user(user)
 
-    # Ignorar Donos
     if is_owner(user.id): return
 
-    # Verificação de Blacklist e Shadow Ban (Cache)
     if user.id in cache.global_blacklist or user.id in cache.shadow_ban:
         try: await msg.delete()
         except: pass
-        return True # Interceptado
+        return True
 
-    # Anti-Link (Cache)
     if db.get_setting(msg.chat_id, "antilink") and any(e.type in ["url", "text_link"] for e in msg.entities or []):
         if user.id not in cache.link_whitelist[msg.chat_id]:
             try: await msg.delete()
             except: pass
             return True
-            
     return False
 
 # --- COMANDOS ---
 @error_handler
 async def cmd_start(update, context):
-    await update.message.reply_text("🛡️ <b>Jtzin Administrator V1.3.2</b>", parse_mode=ParseMode.HTML)
+    await update.message.reply_text("🛡️ <b>Jtzin Administrator V1.3.3</b>", parse_mode=ParseMode.HTML)
 
 @error_handler
 async def cmd_id(update, context):
@@ -385,6 +380,51 @@ async def cmd_chats(update, context):
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 @error_handler
+async def cmd_adddivulgar(update, context):
+    if not is_owner(update.effective_user.id): return
+    target = context.args[0] if context.args else None
+    if not target: return
+    db.set_chat_active(target, 1)
+    await update.message.reply_text(f"✅ Chat {target} ativo.")
+
+@error_handler
+async def cmd_rmdivulgar(update, context):
+    if not is_owner(update.effective_user.id): return
+    target = context.args[0] if context.args else None
+    if not target: return
+    db.set_chat_active(target, 0)
+    await update.message.reply_text(f"❌ Chat {target} inativo.")
+
+@error_handler
+async def cmd_allowlink(update, context):
+    if not await is_admin(update, context): return
+    target_id = get_target(update)
+    if not target_id: return
+    db.add_link_whitelist(update.effective_chat.id, target_id)
+    await update.message.reply_text(f"✅ {target_id} autorizado.")
+
+@error_handler
+async def cmd_removelink(update, context):
+    if not await is_admin(update, context): return
+    target_id = get_target(update)
+    if not target_id: return
+    db.remove_link_whitelist(update.effective_chat.id, target_id)
+    await update.message.reply_text(f"❌ {target_id} desautorizado.")
+
+@error_handler
+async def cmd_lock(update, context):
+    if not await is_admin(update, context): return
+    await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=False))
+    await update.message.reply_text("🔒 Grupo Fechado.")
+
+@error_handler
+async def cmd_unlock(update, context):
+    if not await is_admin(update, context): return
+    perms = ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True, can_send_photos=True, can_send_videos=True, can_send_other_messages=True, can_add_web_page_previews=True)
+    await context.bot.set_chat_permissions(update.effective_chat.id, perms)
+    await update.message.reply_text("🔓 Grupo Aberto.")
+
+@error_handler
 async def cmd_settings(update, context):
     if not await is_admin(update, context): return
     cid = update.effective_chat.id
@@ -415,20 +455,18 @@ async def post_init(app: Application):
         BotCommand("lock", "Fechar"), BotCommand("unlock", "Abrir"), BotCommand("purge", "Limpar"),
         BotCommand("ban", "Banir"), BotCommand("mute", "Silenciar"), BotCommand("msg", "Transmissão")
     ])
-    logger.info("Jtzin Administrator V1.3.2 ONLINE!")
+    logger.info("Jtzin Administrator V1.3.3 ONLINE!")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
-    
-    # Ordem Crucial: Segurança primeiro (Captura TUDO)
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, global_security_filter), group=-1)
-    app.add_handler(MessageHandler(filters.COMMAND, global_security_filter), group=-1)
-
+    app.add_handler(MessageHandler(filters.ALL, global_security_filter), group=-1)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("listdn", cmd_listdn))
     app.add_handler(CommandHandler("msg", cmd_msg))
     app.add_handler(CommandHandler("chats", cmd_chats))
+    app.add_handler(CommandHandler("adddivulgar", cmd_adddivulgar))
+    app.add_handler(CommandHandler("rmdivulgar", cmd_rmdivulgar))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("purge", cmd_purge))
     app.add_handler(CommandHandler("ban", cmd_ban))
@@ -439,10 +477,11 @@ def main():
     app.add_handler(CommandHandler("unblacklist", cmd_unblacklist))
     app.add_handler(CommandHandler("shadow", cmd_shadow))
     app.add_handler(CommandHandler("unshadow", cmd_unshadow))
+    app.add_handler(CommandHandler("allowlink", cmd_allowlink))
+    app.add_handler(CommandHandler("removelink", cmd_removelink))
     app.add_handler(CommandHandler("lock", cmd_lock))
     app.add_handler(CommandHandler("unlock", cmd_unlock))
     app.add_handler(CallbackQueryHandler(on_callback))
-    
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
