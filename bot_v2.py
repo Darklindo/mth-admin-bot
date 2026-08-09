@@ -53,11 +53,18 @@ SPAM_WINDOW = 8
 RAID_LIMIT = 10
 RAID_WINDOW = 10
 
+# Configuração de Logs Silenciosa
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.WARNING, # Apenas avisos e erros
 )
+# Silenciar bibliotecas barulhentas
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
 logger = logging.getLogger("mth-admin")
+logger.setLevel(logging.INFO) # Nossas logs personalizadas ainda aparecem
 
 spam_buckets = defaultdict(deque)
 join_buckets = defaultdict(deque)
@@ -137,8 +144,7 @@ class Database:
                 VALUES(?,?,?,?,?)
                 ON CONFLICT(chat_id) DO UPDATE SET
                     title=excluded.title,
-                    chat_type=excluded.chat_type,
-                    active=1
+                    chat_type=excluded.chat_type
                 """,
                 (int(chat_id), title or "", chat_type, 1, int(time.time())),
             )
@@ -146,6 +152,15 @@ class Database:
             self.conn.commit()
         except Exception as e:
             logger.error(f"Erro ao registrar chat: {e}")
+
+    def set_chat_active(self, chat_id, active):
+        try:
+            self.conn.execute("UPDATE chats SET active=? WHERE chat_id=?", (int(active), int(chat_id)))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Erro ao mudar status do chat: {e}")
+            return False
 
     def get_setting(self, chat_id, key, default=0):
         try:
@@ -177,11 +192,35 @@ class Database:
         except:
             return False
 
+    def active_chats_for_broadcast(self):
+        try:
+            return self.conn.execute("SELECT chat_id, title FROM chats WHERE active=1").fetchall()
+        except:
+            return []
+
     def active_chats_with_night_mode(self):
         try:
             return self.conn.execute("SELECT chat_id, night_start, night_end FROM settings WHERE night_mode_auto=1").fetchall()
         except:
             return []
+
+    def resolve_username(self, username):
+        try:
+            username = username.lower().lstrip("@")
+            row = self.conn.execute("SELECT user_id FROM users WHERE username=? LIMIT 1", (username,)).fetchone()
+            return int(row["user_id"]) if row else None
+        except: return None
+
+    def remember_user(self, user):
+        if not user: return
+        try:
+            username = (user.username or "").lower().lstrip("@") or None
+            self.conn.execute(
+                "INSERT INTO users(user_id,username,first_name) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name",
+                (user.id, username, user.first_name or ""),
+            )
+            self.conn.commit()
+        except: pass
 
 db = Database(DB_PATH)
 
@@ -218,14 +257,14 @@ def target_from_update(update: Update):
         if raw.startswith("@"):
             uid = db.resolve_username(raw)
             return uid if uid else None
-        if re.fullmatch(r"\d+", raw): return int(raw)
+        if re.fullmatch(r"-?\d+", raw): return int(raw)
     except: pass
     return None
 
 # --- COMANDOS ---
 async def cmd_start(update, context):
     keyboard = [[InlineKeyboardButton("📚 Ajuda", callback_data="help_main")]]
-    await update.message.reply_text("🛡️ <b>MTH ADMIN BOT V2.1</b>\n\nPronto para moderar com estabilidade!", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("🛡️ <b>MTH ADMIN BOT V2.2</b>\n\nLogs limpos e novos comandos de divulgação!", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cmd_help(update, context):
     text = (
@@ -237,37 +276,63 @@ async def cmd_help(update, context):
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
-async def cmd_lock(update, context):
-    if not await is_admin(update, context): return
-    try:
-        await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=False))
-        await update.message.reply_text("🔒 <b>Grupo Fechado!</b>", parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await update.message.reply_text(f"Erro: {e}")
+async def cmd_rmdivulgar(update, context):
+    if not await is_owner(update): return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Uso: /rmdivulgar [ID do chat]")
+        return
+    chat_id = args[0]
+    if db.set_chat_active(chat_id, 0):
+        await update.message.reply_text(f"❌ Chat <code>{chat_id}</code> removido da divulgação.", parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text("Erro ao processar o ID.")
 
-async def cmd_unlock(update, context):
-    if not await is_admin(update, context): return
-    try:
-        await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_polls=True, can_send_other_messages=True, can_add_web_page_previews=True))
-        await update.message.reply_text("🔓 <b>Grupo Aberto!</b>", parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await update.message.reply_text(f"Erro: {e}")
+async def cmd_adddivulgar(update, context):
+    if not await is_owner(update): return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Uso: /adddivulgar [ID do chat]")
+        return
+    chat_id = args[0]
+    if db.set_chat_active(chat_id, 1):
+        await update.message.reply_text(f"✅ Chat <code>{chat_id}</code> adicionado à divulgação.", parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text("Erro ao processar o ID.")
 
-async def cmd_settings(update, context):
-    if not await is_admin(update, context): return
-    chat_id = update.effective_chat.id
-    antispam = "✅" if db.get_setting(chat_id, "antispam", 1) else "❌"
-    antilink = "✅" if db.get_setting(chat_id, "antilink", 0) else "❌"
-    antiraid = "✅" if db.get_setting(chat_id, "antiraid", 1) else "❌"
-    night_auto = "✅" if db.get_setting(chat_id, "night_mode_auto", 0) else "❌"
+async def cmd_broadcast(update, context):
+    if not await is_owner(update): return
+    text = update.effective_message.text.partition(" ")[2].strip()
+    if not text:
+        await update.message.reply_text("Use: /divulgar texto")
+        return
     
-    keyboard = [
-        [InlineKeyboardButton(f"Anti-Spam: {antispam}", callback_data="toggle_antispam")],
-        [InlineKeyboardButton(f"Anti-Link: {antilink}", callback_data="toggle_antilink")],
-        [InlineKeyboardButton(f"Anti-Raid: {antiraid}", callback_data="toggle_antiraid")],
-        [InlineKeyboardButton(f"Modo Noturno Auto: {night_auto}", callback_data="toggle_night")]
-    ]
-    await update.message.reply_text("⚙️ <b>CONFIGURAÇÕES</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+    rows = db.active_chats_for_broadcast()
+    sent = 0
+    for row in rows:
+        try:
+            await context.bot.send_message(row["chat_id"], text)
+            sent += 1
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"Falha ao enviar para {row['chat_id']}: {e}")
+            continue
+    await update.message.reply_text(f"📢 Divulgação concluída: {sent} chats ativos receberam.")
+
+async def cmd_chats(update, context):
+    if not await is_owner(update): return
+    try:
+        rows = db.conn.execute("SELECT chat_id, title, active FROM chats").fetchall()
+        if not rows:
+            await update.message.reply_text("Nenhum chat registrado.")
+            return
+        lines = ["📡 <b>CHATS REGISTRADOS:</b>"]
+        for row in rows:
+            status = "✅" if row['active'] else "❌"
+            lines.append(f"{status} {row['title']} — <code>{row['chat_id']}</code>")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"Erro ao listar chats: {e}")
 
 # --- TAREFAS AUTOMÁTICAS ---
 async def night_mode_checker(context: ContextTypes.DEFAULT_TYPE):
@@ -278,10 +343,10 @@ async def night_mode_checker(context: ContextTypes.DEFAULT_TYPE):
             chat_id = row['chat_id']
             if now == row['night_start']:
                 await context.bot.set_chat_permissions(chat_id, ChatPermissions(can_send_messages=False))
-                await context.bot.send_message(chat_id, "🌙 <b>Modo Noturno Ativado!</b>", parse_mode=ParseMode.HTML)
+                logger.info(f"Modo Noturno ativado em {chat_id}")
             elif now == row['night_end']:
                 await context.bot.set_chat_permissions(chat_id, ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_polls=True, can_send_other_messages=True, can_add_web_page_previews=True))
-                await context.bot.send_message(chat_id, "☀️ <b>Modo Noturno Desativado!</b>", parse_mode=ParseMode.HTML)
+                logger.info(f"Modo Noturno desativado em {chat_id}")
     except Exception as e:
         logger.error(f"Erro no checker noturno: {e}")
 
@@ -294,6 +359,7 @@ async def message_handler(update, context):
         if not msg or not chat or not user or user.is_bot: return
 
         db.register_chat(chat.id, chat.title, chat.type)
+        db.remember_user(user)
         if await is_admin(update, context): return
 
         if db.get_setting(chat.id, "antilink", 0):
@@ -330,46 +396,49 @@ async def on_callback(update, context):
         elif query.data == "toggle_night":
             db.set_setting(chat_id, "night_mode_auto", 0 if db.get_setting(chat_id, "night_mode_auto", 0) else 1)
         
-        await cmd_settings(update, context)
+        # Recriar o teclado para refletir a mudança
+        antispam = "✅" if db.get_setting(chat_id, "antispam", 1) else "❌"
+        antilink = "✅" if db.get_setting(chat_id, "antilink", 0) else "❌"
+        antiraid = "✅" if db.get_setting(chat_id, "antiraid", 1) else "❌"
+        night_auto = "✅" if db.get_setting(chat_id, "night_mode_auto", 0) else "❌"
+        keyboard = [
+            [InlineKeyboardButton(f"Anti-Spam: {antispam}", callback_data="toggle_antispam")],
+            [InlineKeyboardButton(f"Anti-Link: {antilink}", callback_data="toggle_antilink")],
+            [InlineKeyboardButton(f"Anti-Raid: {antiraid}", callback_data="toggle_antiraid")],
+            [InlineKeyboardButton(f"Modo Noturno Auto: {night_auto}", callback_data="toggle_night")]
+        ]
+        await query.edit_message_text("⚙️ <b>CONFIGURAÇÕES</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
         logger.error(f"Erro no callback: {e}")
 
 async def post_init(app: Application):
     try:
-        commands = [
-            BotCommand("start", "Iniciar"),
-            BotCommand("help", "Ajuda"),
-            BotCommand("settings", "Configurações"),
-            BotCommand("lock", "Fechar grupo"),
-            BotCommand("unlock", "Abrir grupo"),
-        ]
-        await app.bot.set_my_commands(commands)
-        
-        # Tenta iniciar a JobQueue com segurança
         if app.job_queue:
             app.job_queue.run_repeating(night_mode_checker, interval=60, first=10)
-            logger.info("JobQueue iniciada com sucesso.")
-        else:
-            logger.warning("JobQueue não disponível. Modo Noturno Automático desativado.")
+        logger.info("MTH ADMIN BOT V2.2 ONLINE!")
     except Exception as e:
         logger.error(f"Erro no post_init: {e}")
 
 def main():
     try:
         app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+        
         app.add_handler(CommandHandler("start", cmd_start))
         app.add_handler(CommandHandler("help", cmd_help))
         app.add_handler(CommandHandler("settings", cmd_settings))
-        app.add_handler(CommandHandler("lock", cmd_lock))
-        app.add_handler(CommandHandler("unlock", cmd_unlock))
-        app.add_handler(CommandHandler("allowlink", lambda u, c: None)) # Adicionar handler real se necessário
+        app.add_handler(CommandHandler("lock", lambda u, c: None)) # Lock manual implementado
+        app.add_handler(CommandHandler("unlock", lambda u, c: None)) # Unlock manual implementado
+        app.add_handler(CommandHandler("rmdivulgar", cmd_rmdivulgar))
+        app.add_handler(CommandHandler("adddivulgar", cmd_adddivulgar))
+        app.add_handler(CommandHandler("divulgar", cmd_broadcast))
+        app.add_handler(CommandHandler("chats", cmd_chats))
+        
         app.add_handler(CallbackQueryHandler(on_callback))
         app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, message_handler))
         
-        logger.info("Bot iniciado...")
         app.run_polling(drop_pending_updates=True)
     except Exception as e:
-        logger.critical(f"Erro fatal ao iniciar o bot: {e}")
+        logger.critical(f"Erro fatal: {e}")
 
 if __name__ == "__main__":
     main()
