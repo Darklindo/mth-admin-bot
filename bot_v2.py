@@ -27,6 +27,7 @@ from telegram.ext import (
     ContextTypes,
     MessageHandler,
     CallbackQueryHandler,
+    ApplicationHandlerStop,
     filters,
 )
 
@@ -47,15 +48,15 @@ if not BOT_TOKEN:
 
 DB_PATH = DATA_DIR / "bot.db"
 
-# Configuração de Logs
+# Configuração de Logs - Reduzido para focar em erros e uso importante
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.WARNING,
 )
-logger = logging.getLogger("Jtzin-Admin")
+logger = logging.getLogger("mth-admin")
 logger.setLevel(logging.INFO)
 
-# --- CACHE EM MEMÓRIA (ALTA PERFORMANCE) ---
+# --- CACHE EM MEMÓRIA ---
 class Cache:
     def __init__(self):
         self.global_blacklist = set()
@@ -90,7 +91,7 @@ class Cache:
                 self.settings[row[0]] = {
                     "antispam": row[1], "antilink": row[2], "captcha_enabled": row[3]
                 }
-            logger.info("Cache carregado com sucesso.")
+            logger.info("Cache de performance carregado.")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -113,13 +114,13 @@ class Database:
             if commit: self.conn.commit()
             return cursor
         except Exception as e:
-            logger.error(f"DB Error: {e}")
+            logger.error(f"DB Error: {e} | Query: {query}")
             return None
 
     def register_chat(self, chat_id, title, chat_type):
         self.execute(
             "INSERT INTO chats(chat_id,title,chat_type,active,created_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, chat_type=excluded.chat_type",
-            (int(chat_id), title or "", chat_type, 1, int(time.time())),
+            (int(chat_id), title or "", str(chat_type), 1, int(time.time())),
             commit=True
         )
         if int(chat_id) not in cache.settings:
@@ -216,9 +217,13 @@ def error_handler(func):
     @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         try: return await func(update, context, *args, **kwargs)
+        except ApplicationHandlerStop: raise
         except Exception as e:
             if "Message is not modified" in str(e): return
             logger.error(f"Erro em {func.__name__}: {e}")
+            if update.effective_message:
+                try: await update.effective_message.reply_text(f"❌ Erro interno: {str(e)[:100]}")
+                except: pass
     return wrapper
 
 def is_owner(user_id: int) -> bool:
@@ -257,7 +262,7 @@ def get_reason(update: Update):
 def format_date(timestamp):
     return datetime.fromtimestamp(timestamp).strftime('%d/%m/%Y %H:%M')
 
-# --- FILTRO DE SEGURANÇA ---
+# --- FILTRO DE SEGURANÇA (BLOQUEIO TOTAL DE BANNED) ---
 @error_handler
 async def global_security_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -269,27 +274,30 @@ async def global_security_filter(update: Update, context: ContextTypes.DEFAULT_T
 
     if is_owner(user.id): return
 
-    is_banned = (
-        user.id in cache.global_blacklist or 
-        user.id in cache.shadow_ban or 
-        user.id in cache.local_blacklist[msg.chat_id] or
-        user.id in cache.local_banperm[msg.chat_id]
-    )
+    # Verificação de Punições
+    is_banned_global = user.id in cache.global_blacklist
+    is_shadow = user.id in cache.shadow_ban
+    is_local_black = user.id in cache.local_blacklist[msg.chat_id]
+    is_local_banperm = user.id in cache.local_banperm[msg.chat_id]
 
-    if is_banned:
+    if is_banned_global or is_shadow or is_local_black or is_local_banperm:
         try:
             await msg.delete()
-            if user.id in cache.global_blacklist or user.id in cache.local_banperm[msg.chat_id]:
+            # Se for ban global ou banperm local, tenta banir se ainda não estiver
+            if is_banned_global or is_local_banperm:
                 await context.bot.ban_chat_member(msg.chat_id, user.id)
         except: pass
-        return True
+        raise ApplicationHandlerStop() # Impede que comandos e outros handlers rodem
 
+    # Anti-Link (Bloqueia comandos com link também)
     if db.get_setting(msg.chat_id, "antilink") and any(e.type in ["url", "text_link"] for e in msg.entities or []):
         if user.id not in cache.link_whitelist[msg.chat_id]:
-            try: await msg.delete()
-            except: pass
-            return True
-    return False
+            if not await is_admin(update, context):
+                try: await msg.delete()
+                except: pass
+                raise ApplicationHandlerStop()
+    
+    return
 
 # --- COMANDOS ---
 @error_handler
@@ -414,16 +422,22 @@ async def cmd_ban(update, context):
     if not await is_admin(update, context): return
     target_id = get_target(update)
     if not target_id or is_owner(target_id): return
-    await context.bot.ban_chat_member(update.effective_chat.id, target_id)
-    await update.message.reply_text("🚫 Banido.")
+    try:
+        await context.bot.ban_chat_member(update.effective_chat.id, target_id)
+        await update.message.reply_text("🚫 Usuário banido.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erro ao banir: {e}")
 
 @error_handler
 async def cmd_mute(update, context):
     if not await is_admin(update, context): return
     target_id = get_target(update)
     if not target_id or is_owner(target_id): return
-    await context.bot.restrict_chat_member(update.effective_chat.id, target_id, permissions=ChatPermissions(can_send_messages=False))
-    await update.message.reply_text("🔇 Mutado.")
+    try:
+        await context.bot.restrict_chat_member(update.effective_chat.id, target_id, permissions=ChatPermissions(can_send_messages=False))
+        await update.message.reply_text("🔇 Usuário mutado.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erro ao mutar: {e}")
 
 @error_handler
 async def cmd_shadow(update, context):
@@ -469,7 +483,7 @@ async def cmd_msg(update, context):
             sent += 1
             await asyncio.sleep(0.1)
         except: continue
-    await msg.reply_text(f"📢 Transmissão: {sent} chats.")
+    await msg.reply_text(f"📢 Transmissão concluída: {sent} chats.")
 
 @error_handler
 async def cmd_chats(update, context):
@@ -482,13 +496,10 @@ async def cmd_chats(update, context):
     for r in rows:
         if r['chat_type'] == 'private':
             icon = "👤"
-            type_label = "Privado"
         elif r['chat_type'] in ['group', 'supergroup']:
             icon = "👥"
-            type_label = "Grupo"
         else:
             icon = "📣"
-            type_label = "Canal"
             
         status = "✅" if r['active'] else "❌"
         text += f"{status} {icon} <b>{r['title']}</b>\n└ <code>{r['chat_id']}</code>\n\n"
@@ -504,7 +515,7 @@ async def cmd_adddivulgar(update, context):
     target = context.args[0] if context.args else None
     if not target: return
     db.set_chat_active(target, 1)
-    await update.message.reply_text(f"✅ Chat {target} ativo.")
+    await update.message.reply_text(f"✅ Chat {target} ativado para divulgação.")
 
 @error_handler
 async def cmd_rmdivulgar(update, context):
@@ -512,7 +523,7 @@ async def cmd_rmdivulgar(update, context):
     target = context.args[0] if context.args else None
     if not target: return
     db.set_chat_active(target, 0)
-    await update.message.reply_text(f"❌ Chat {target} inativo.")
+    await update.message.reply_text(f"❌ Chat {target} removido da divulgação.")
 
 @error_handler
 async def cmd_allowlink(update, context):
@@ -520,7 +531,7 @@ async def cmd_allowlink(update, context):
     target_id = get_target(update)
     if not target_id: return
     db.add_link_whitelist(update.effective_chat.id, target_id)
-    await update.message.reply_text(f"✅ {target_id} autorizado.")
+    await update.message.reply_text(f"✅ {target_id} autorizado a enviar links.")
 
 @error_handler
 async def cmd_removelink(update, context):
@@ -528,20 +539,34 @@ async def cmd_removelink(update, context):
     target_id = get_target(update)
     if not target_id: return
     db.remove_link_whitelist(update.effective_chat.id, target_id)
-    await update.message.reply_text(f"❌ {target_id} desautorizado.")
+    await update.message.reply_text(f"❌ {target_id} desautorizado a enviar links.")
 
 @error_handler
 async def cmd_lock(update, context):
     if not await is_admin(update, context): return
-    await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=False))
-    await update.message.reply_text("🔒 Grupo Fechado.")
+    try:
+        await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=False))
+        await update.message.reply_text("🔒 Grupo Fechado.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erro ao fechar: {e}")
 
 @error_handler
 async def cmd_unlock(update, context):
     if not await is_admin(update, context): return
-    perms = ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True, can_send_photos=True, can_send_videos=True, can_send_other_messages=True, can_add_web_page_previews=True)
-    await context.bot.set_chat_permissions(update.effective_chat.id, perms)
-    await update.message.reply_text("🔓 Grupo Aberto.")
+    try:
+        perms = ChatPermissions(
+            can_send_messages=True, 
+            can_send_audios=True, 
+            can_send_documents=True, 
+            can_send_photos=True, 
+            can_send_videos=True, 
+            can_send_other_messages=True, 
+            can_add_web_page_previews=True
+        )
+        await context.bot.set_chat_permissions(update.effective_chat.id, perms)
+        await update.message.reply_text("🔓 Grupo Aberto.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erro ao abrir: {e}")
 
 @error_handler
 async def cmd_settings(update, context):
@@ -551,17 +576,30 @@ async def cmd_settings(update, context):
         [InlineKeyboardButton(f"Anti-Spam: {'✅' if db.get_setting(cid, 'antispam', 1) else '❌'}", callback_data="toggle_antispam")],
         [InlineKeyboardButton(f"Anti-Link: {'✅' if db.get_setting(cid, 'antilink', 0) else '❌'}", callback_data="toggle_antilink")]
     ]
-    await update.message.reply_text("⚙️ <b>CONFIGURAÇÕES</b>", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("⚙️ <b>CONFIGURAÇÕES DO CHAT</b>", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
 
 @error_handler
 async def on_callback(update, context):
     query = update.callback_query
+    if not await is_admin(update, context):
+        await query.answer("Apenas administradores!", show_alert=True)
+        return
+    
     await query.answer()
-    if not await is_admin(update, context): return
     cid = query.message.chat_id
-    if query.data == "toggle_antispam": db.set_setting(cid, "antispam", 1 - db.get_setting(cid, "antispam", 1))
-    elif query.data == "toggle_antilink": db.set_setting(cid, "antilink", 1 - db.get_setting(cid, "antilink", 0))
-    await cmd_settings(update, context)
+    if query.data == "toggle_antispam":
+        new_val = 1 - db.get_setting(cid, "antispam", 1)
+        db.set_setting(cid, "antispam", new_val)
+    elif query.data == "toggle_antilink":
+        new_val = 1 - db.get_setting(cid, "antilink", 0)
+        db.set_setting(cid, "antilink", new_val)
+    
+    # Atualiza o menu
+    keyboard = [
+        [InlineKeyboardButton(f"Anti-Spam: {'✅' if db.get_setting(cid, 'antispam', 1) else '❌'}", callback_data="toggle_antispam")],
+        [InlineKeyboardButton(f"Anti-Link: {'✅' if db.get_setting(cid, 'antilink', 0) else '❌'}", callback_data="toggle_antilink")]
+    ]
+    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def post_init(app: Application):
     cache.load_all(db.conn)
@@ -583,11 +621,15 @@ async def post_init(app: Application):
         BotCommand("removelink", "Remover link"),
         BotCommand("listdn", "Listar punições")
     ])
-    logger.info("Jtzin Administrator V1 ONLINE!")
+    logger.info("MTH ADMIN BOT V1.4.4 ONLINE!")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
-    app.add_handler(MessageHandler(filters.ALL, global_security_filter), group=-1)
+    
+    # Filtro de Segurança em primeiro lugar no grupo 0 para bloquear tudo de banned
+    app.add_handler(MessageHandler(filters.ALL, global_security_filter), group=0)
+    
+    # Comandos em seguida (ainda no grupo 0)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
@@ -611,7 +653,9 @@ def main():
     app.add_handler(CommandHandler("removelink", cmd_removelink))
     app.add_handler(CommandHandler("lock", cmd_lock))
     app.add_handler(CommandHandler("unlock", cmd_unlock))
+    
     app.add_handler(CallbackQueryHandler(on_callback))
+    
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
