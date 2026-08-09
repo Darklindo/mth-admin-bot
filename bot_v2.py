@@ -132,16 +132,16 @@ class Database:
         if int(chat_id) in cache.link_whitelist:
             cache.link_whitelist[int(chat_id)].discard(int(user_id))
 
-    def add_global_blacklist(self, user_id, type_name="ban"):
-        self.execute("INSERT OR REPLACE INTO global_blacklist(user_id, type, created_at) VALUES(?,?,?)", (int(user_id), type_name, int(time.time())), commit=True)
+    def add_global_blacklist(self, user_id, type_name="ban", reason=None):
+        self.execute("INSERT OR REPLACE INTO global_blacklist(user_id, type, reason, created_at) VALUES(?,?,?,?)", (int(user_id), type_name, reason, int(time.time())), commit=True)
         cache.global_blacklist.add(int(user_id))
 
     def remove_global_blacklist(self, user_id):
         self.execute("DELETE FROM global_blacklist WHERE user_id=?", (int(user_id),), commit=True)
         cache.global_blacklist.discard(int(user_id))
 
-    def add_shadow_ban(self, user_id):
-        self.execute("INSERT OR REPLACE INTO shadow_ban(user_id, created_at) VALUES(?,?)", (int(user_id), int(time.time())), commit=True)
+    def add_shadow_ban(self, user_id, reason=None):
+        self.execute("INSERT OR REPLACE INTO shadow_ban(user_id, reason, created_at) VALUES(?,?,?)", (int(user_id), reason, int(time.time())), commit=True)
         cache.shadow_ban.add(int(user_id))
 
     def remove_shadow_ban(self, user_id):
@@ -158,9 +158,9 @@ class Database:
         if row: return f"@{row['username']}" if row['username'] else row['first_name']
         return str(user_id)
 
-    def get_all_banned_list(self):
-        shadow = self.execute("SELECT user_id FROM shadow_ban").fetchall()
-        glob = self.execute("SELECT user_id, type FROM global_blacklist").fetchall()
+    def get_all_banned_list_detailed(self):
+        shadow = self.execute("SELECT user_id, reason, created_at FROM shadow_ban ORDER BY created_at DESC").fetchall()
+        glob = self.execute("SELECT user_id, type, reason, created_at FROM global_blacklist ORDER BY created_at DESC").fetchall()
         return shadow, glob
 
     def active_chats(self):
@@ -230,6 +230,13 @@ def get_target(update: Update):
         if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()): return int(raw)
     return None
 
+def get_reason(update: Update):
+    msg = update.effective_message
+    args = msg.text.split()
+    if msg.reply_to_message:
+        return " ".join(args[1:]) if len(args) > 1 else None
+    return " ".join(args[2:]) if len(args) > 2 else None
+
 # --- FILTRO DE SEGURANÇA (PRIORIDADE MÁXIMA) ---
 @error_handler
 async def global_security_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -257,7 +264,7 @@ async def global_security_filter(update: Update, context: ContextTypes.DEFAULT_T
 # --- COMANDOS ---
 @error_handler
 async def cmd_start(update, context):
-    await update.message.reply_text("🛡️ <b>Jtzin Administrator V1.3.4</b>", parse_mode=ParseMode.HTML)
+    await update.message.reply_text("🛡️ <b>Jtzin Administrator V1.3.5</b>", parse_mode=ParseMode.HTML)
 
 @error_handler
 async def cmd_id(update, context):
@@ -268,22 +275,34 @@ async def cmd_id(update, context):
 @error_handler
 async def cmd_listdn(update, context):
     if not is_owner(update.effective_user.id): return
-    shadow, glob = db.get_all_banned_list()
-    text = "📋 <b>LISTA DE PUNIÇÕES</b>\n\n"
+    shadow, glob = db.get_all_banned_list_detailed()
+    text = "📋 <b>RELATÓRIO DE PUNIÇÕES:</b>\n\n"
+    
     text += "🌑 <b>Shadow Ban:</b>\n"
     if not shadow: text += "<i>Nenhum</i>\n"
-    for r in shadow: text += f"• {db.get_user_info(r['user_id'])} (<code>{r['user_id']}</code>)\n"
-    text += "\n🌎 <b>Global Blacklist:</b>\n"
+    for r in shadow:
+        dt = datetime.fromtimestamp(r['created_at']).strftime('%d/%m %H:%M')
+        reason = f" | Motivo: {r['reason']}" if r['reason'] else ""
+        text += f"• {db.get_user_info(r['user_id'])} (<code>{r['user_id']}</code>)\n  └ 📅 {dt}{reason}\n\n"
+    
+    text += "🌎 <b>Global Blacklist:</b>\n"
     if not glob: text += "<i>Nenhum</i>\n"
-    for r in glob: text += f"• {db.get_user_info(r['user_id'])} (<code>{r['user_id']}</code>) [{r['type'].upper()}]\n"
+    for r in glob:
+        dt = datetime.fromtimestamp(r['created_at']).strftime('%d/%m %H:%M')
+        reason = f" | Motivo: {r['reason']}" if r['reason'] else ""
+        type_icon = "🚫" if r['type'] == 'ban' else "🌑"
+        text += f"• {db.get_user_info(r['user_id'])} (<code>{r['user_id']}</code>) [{r['type'].upper()}]\n  └ {type_icon} {dt}{reason}\n\n"
+    
+    text += f"📊 <b>Total Neutralizados:</b> {len(shadow) + len(glob)}"
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 @error_handler
 async def cmd_allban(update, context):
     if not is_owner(update.effective_user.id): return
     target_id = get_target(update)
+    reason = get_reason(update)
     if not target_id or is_owner(target_id): return
-    db.add_global_blacklist(target_id, 'ban')
+    db.add_global_blacklist(target_id, 'ban', reason)
     chats = db.all_chats_detailed()
     for row in chats:
         try: await context.bot.ban_chat_member(row['chat_id'], target_id)
@@ -294,8 +313,9 @@ async def cmd_allban(update, context):
 async def cmd_allblack(update, context):
     if not is_owner(update.effective_user.id): return
     target_id = get_target(update)
+    reason = get_reason(update)
     if not target_id or is_owner(target_id): return
-    db.add_global_blacklist(target_id, 'black')
+    db.add_global_blacklist(target_id, 'black', reason)
     await update.message.reply_text(f"✅ {target_id} em blacklist global.")
 
 @error_handler
@@ -328,8 +348,9 @@ async def cmd_mute(update, context):
 async def cmd_shadow(update, context):
     if not await is_admin(update, context): return
     target_id = get_target(update)
+    reason = get_reason(update)
     if not target_id or is_owner(target_id): return
-    db.add_shadow_ban(target_id)
+    db.add_shadow_ban(target_id, reason)
     await update.message.reply_text("🌑 Shadow Ban ativado.")
 
 @error_handler
@@ -465,7 +486,7 @@ async def post_init(app: Application):
         BotCommand("lock", "Fechar"), BotCommand("unlock", "Abrir"), BotCommand("purge", "Limpar"),
         BotCommand("ban", "Banir"), BotCommand("mute", "Silenciar"), BotCommand("msg", "Transmissão")
     ])
-    logger.info("Jtzin Administrator V1.3.4 ONLINE!")
+    logger.info("Jtzin Administrator V1.3.5 ONLINE!")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
