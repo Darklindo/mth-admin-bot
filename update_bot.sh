@@ -1,28 +1,26 @@
 #!/bin/bash
 
-echo "[+] Iniciando atualização para MTH Admin Bot V2..."
+echo "🚀 Iniciando Atualização MTH ADMIN BOT V3.0 (Versão Blindada)..."
 
-# 1. Ativar ambiente virtual
-if [ -d ".venv" ]; then
-    source .venv/bin/activate
-else
-    echo "[!] Ambiente virtual não encontrado. Criando..."
+# Puxar atualizações do Git
+git pull origin master
+
+# Garantir que o ambiente virtual existe
+if [ ! -d ".venv" ]; then
+    echo "📦 Criando ambiente virtual..."
     python -m venv .venv
-    source .venv/bin/activate
 fi
 
-# 2. Instalar novas dependências (se houver)
-pip install python-telegram-bot==22.8 python-dotenv
+# Instalar dependências
+source .venv/bin/activate
+pip install -r requirements.txt
 
-# 3. Rodar migração do banco de dados
-echo "[+] Migrando banco de dados..."
+# Rodar migração
 python migrate_db.py
 
-# 4. Substituir o bot antigo pelo novo (opcional, mantendo backup)
-if [ -f "bot.py" ]; then
-    mv bot.py bot_v1_backup.py
-fi
-cp bot_v2.py bot.py
+# Dar permissão ao watchdog
+chmod +x watchdog.sh
 
-echo "[+] Atualização concluída com sucesso!"
-echo "[+] Agora você pode rodar o bot normalmente com: python bot.py"
+echo "✅ Atualização concluída com sucesso!"
+echo "🛡️ Para iniciar o bot com AUTO-RESTART no tmux, use:"
+echo "tmux kill-session -t mthadmin 2>/dev/null; tmux new-session -d -s mthadmin './watchdog.sh'"
