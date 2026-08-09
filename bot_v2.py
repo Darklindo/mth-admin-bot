@@ -47,11 +47,9 @@ if not OWNER_ID:
 
 DB_PATH = DATA_DIR / "bot.db"
 
-# Anti-spam: 7 mensagens em 8 segundos
+# Anti-spam e Anti-Raid
 SPAM_LIMIT = 7
 SPAM_WINDOW = 8
-
-# Anti-Raid: 10 entradas em 10 segundos
 RAID_LIMIT = 10
 RAID_WINDOW = 10
 
@@ -120,44 +118,45 @@ class Database:
         self.conn.commit()
 
     def register_chat(self, chat_id, title, chat_type):
-        self.conn.execute(
-            """
-            INSERT INTO chats(chat_id,title,chat_type,active,created_at)
-            VALUES(?,?,?,?,?)
-            ON CONFLICT(chat_id) DO UPDATE SET
-                title=excluded.title,
-                chat_type=excluded.chat_type,
-                active=1
-            """,
-            (chat_id, title or "", chat_type, 1, int(time.time())),
-        )
-        self.conn.execute(
-            "INSERT OR IGNORE INTO settings(chat_id) VALUES(?)",
-            (chat_id,),
-        )
-        self.conn.commit()
+        try:
+            self.conn.execute(
+                """
+                INSERT INTO chats(chat_id,title,chat_type,active,created_at)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    title=excluded.title,
+                    chat_type=excluded.chat_type,
+                    active=1
+                """,
+                (chat_id, title or "", chat_type, 1, int(time.time())),
+            )
+            self.conn.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (chat_id,))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Erro ao registrar chat: {e}")
 
-    def get_setting(self, chat_id, key, default=None):
-        row = self.conn.execute(f"SELECT {key} FROM settings WHERE chat_id=?", (chat_id,)).fetchone()
-        return row[key] if row and row[key] is not None else default
+    def get_setting(self, chat_id, key, default=0):
+        try:
+            row = self.conn.execute(f"SELECT {key} FROM settings WHERE chat_id=?", (chat_id,)).fetchone()
+            if row and row[key] is not None:
+                return row[key]
+            return default
+        except sqlite3.OperationalError:
+            logger.warning(f"Coluna {key} não encontrada no banco. Rode migrate_db.py")
+            return default
 
     def set_setting(self, chat_id, key, value):
-        self.conn.execute(
-            f"UPDATE settings SET {key}=? WHERE chat_id=?", (value, chat_id)
-        )
-        self.conn.commit()
+        try:
+            self.conn.execute(f"UPDATE settings SET {key}=? WHERE chat_id=?", (value, chat_id))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Erro ao salvar setting {key}: {e}")
 
     def remember_user(self, user):
         if not user: return
         username = (user.username or "").lower().lstrip("@") or None
         self.conn.execute(
-            """
-            INSERT INTO users(user_id,username,first_name)
-            VALUES(?,?,?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username=excluded.username,
-                first_name=excluded.first_name
-            """,
+            "INSERT INTO users(user_id,username,first_name) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name",
             (user.id, username, user.first_name or ""),
         )
         self.conn.commit()
@@ -194,7 +193,7 @@ db = Database(DB_PATH)
 
 # --- AUXILIARES ---
 async def send_log(chat_id, text, context):
-    log_channel = db.get_setting(chat_id, "log_channel")
+    log_channel = db.get_setting(chat_id, "log_channel", None)
     if log_channel:
         try:
             await context.bot.send_message(log_channel, f"📝 <b>LOG:</b>\n{text}", parse_mode=ParseMode.HTML)
@@ -252,7 +251,7 @@ async def cmd_help(update, context):
         "🛡️ <b>MENU DE AJUDA</b>\n\n"
         "<b>Moderação:</b> /ban, /mute, /kick, /warn, /purge\n"
         "<b>Segurança:</b> /antispam, /antilink, /antiraid\n"
-        "<b>Config:</b> /setwelcome, /setlogs\n"
+        "<b>Config:</b> /settings, /id\n"
         "<b>Dono:</b> /chats"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -303,9 +302,9 @@ async def cmd_settings(update, context):
     if not await is_admin(update, context): return
     chat_id = update.effective_chat.id
     
-    antispam = "✅" if db.get_setting(chat_id, "antispam") else "❌"
-    antilink = "✅" if db.get_setting(chat_id, "antilink") else "❌"
-    antiraid = "✅" if db.get_setting(chat_id, "antiraid") else "❌"
+    antispam = "✅" if db.get_setting(chat_id, "antispam", 1) else "❌"
+    antilink = "✅" if db.get_setting(chat_id, "antilink", 0) else "❌"
+    antiraid = "✅" if db.get_setting(chat_id, "antiraid", 1) else "❌"
     
     keyboard = [
         [InlineKeyboardButton(f"Anti-Spam: {antispam}", callback_data="toggle_antispam")],
@@ -346,6 +345,8 @@ async def cmd_broadcast(update, context):
 # --- HANDLERS DE EVENTOS ---
 async def on_callback(update, context):
     query = update.callback_query
+    if not query: return
+    
     await query.answer()
     chat_id = query.message.chat_id
     data = query.data
@@ -358,15 +359,15 @@ async def on_callback(update, context):
     elif data == "my_id":
         await query.message.reply_text(f"🆔 Seu ID: <code>{query.from_user.id}</code>", parse_mode=ParseMode.HTML)
     elif data == "toggle_antispam":
-        current = db.get_setting(chat_id, "antispam")
+        current = db.get_setting(chat_id, "antispam", 1)
         db.set_setting(chat_id, "antispam", 0 if current else 1)
         await cmd_settings(update, context)
     elif data == "toggle_antilink":
-        current = db.get_setting(chat_id, "antilink")
+        current = db.get_setting(chat_id, "antilink", 0)
         db.set_setting(chat_id, "antilink", 0 if current else 1)
         await cmd_settings(update, context)
     elif data == "toggle_antiraid":
-        current = db.get_setting(chat_id, "antiraid")
+        current = db.get_setting(chat_id, "antiraid", 1)
         db.set_setting(chat_id, "antiraid", 0 if current else 1)
         await cmd_settings(update, context)
 
@@ -381,12 +382,14 @@ async def message_handler(update, context):
 
     if await is_admin(update, context): return
 
-    if db.get_setting(chat.id, "antilink"):
+    # 1. Anti-Link
+    if db.get_setting(chat.id, "antilink", 0):
         if any(entity.type in ["url", "text_link"] for entity in msg.entities or []):
             await safe_delete(msg)
             return
 
-    if db.get_setting(chat.id, "antispam"):
+    # 2. Anti-Spam
+    if db.get_setting(chat.id, "antispam", 1):
         now = time.monotonic()
         bucket = spam_buckets[(chat.id, user.id)]
         while bucket and now - bucket[0] > SPAM_WINDOW: bucket.popleft()
@@ -397,9 +400,11 @@ async def message_handler(update, context):
 
 async def on_join(update, context):
     chat = update.effective_chat
+    if not update.message or not update.message.new_chat_members: return
+    
     for user in update.message.new_chat_members:
         if user.is_bot: continue
-        if db.get_setting(chat.id, "antiraid"):
+        if db.get_setting(chat.id, "antiraid", 1):
             now = time.monotonic()
             bucket = join_buckets[chat.id]
             while bucket and now - bucket[0] > RAID_WINDOW: bucket.popleft()
@@ -408,9 +413,10 @@ async def on_join(update, context):
                 try: await context.bot.ban_chat_member(chat.id, user.id)
                 except: pass
                 continue
-        if db.get_setting(chat.id, "welcome_enabled"):
+        if db.get_setting(chat.id, "welcome_enabled", 0):
             text = db.get_setting(chat.id, "welcome_text", "Bem-vindo ao grupo!")
-            await chat.send_message(text.replace("{name}", user.first_name))
+            try: await chat.send_message(text.replace("{name}", user.first_name))
+            except: pass
 
 # --- MAIN ---
 async def post_init(app: Application):
@@ -436,12 +442,14 @@ def main():
     app.add_handler(CommandHandler("mute", cmd_mute))
     app.add_handler(CommandHandler("chats", cmd_chats))
     app.add_handler(CommandHandler("divulgar", cmd_broadcast))
+    app.add_handler(CommandHandler("id", lambda u, c: u.message.reply_text(f"🆔 Seu ID: {u.effective_user.id}")))
+    
     app.add_handler(CallbackQueryHandler(on_callback))
     
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.NEW_CHAT_MEMBERS, on_join))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, message_handler))
 
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
