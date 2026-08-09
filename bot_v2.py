@@ -64,28 +64,31 @@ class Cache:
         self.settings = {}
 
     def load_all(self, db_conn):
-        # Carregar Blacklist Global
-        cursor = db_conn.execute("SELECT user_id FROM global_blacklist")
-        self.global_blacklist = {row[0] for row in cursor.fetchall()}
-        
-        # Carregar Shadow Ban
-        cursor = db_conn.execute("SELECT user_id FROM shadow_ban")
-        self.shadow_ban = {row[0] for row in cursor.fetchall()}
-        
-        # Carregar Whitelist de Links
-        cursor = db_conn.execute("SELECT chat_id, user_id FROM link_whitelist")
-        for row in cursor.fetchall():
-            self.link_whitelist[row[0]].add(row[1])
+        try:
+            # Carregar Blacklist Global
+            cursor = db_conn.execute("SELECT user_id FROM global_blacklist")
+            self.global_blacklist = {row[0] for row in cursor.fetchall()}
             
-        # Carregar Settings
-        cursor = db_conn.execute("SELECT chat_id, antispam, antilink, captcha_enabled FROM settings")
-        for row in cursor.fetchall():
-            self.settings[row[0]] = {
-                "antispam": row[1],
-                "antilink": row[2],
-                "captcha_enabled": row[3]
-            }
-        logger.info(f"Cache carregado: {len(self.global_blacklist)} bans, {len(self.shadow_ban)} shadows.")
+            # Carregar Shadow Ban
+            cursor = db_conn.execute("SELECT user_id FROM shadow_ban")
+            self.shadow_ban = {row[0] for row in cursor.fetchall()}
+            
+            # Carregar Whitelist de Links
+            cursor = db_conn.execute("SELECT chat_id, user_id FROM link_whitelist")
+            for row in cursor.fetchall():
+                self.link_whitelist[row[0]].add(row[1])
+                
+            # Carregar Settings
+            cursor = db_conn.execute("SELECT chat_id, antispam, antilink, captcha_enabled FROM settings")
+            for row in cursor.fetchall():
+                self.settings[row[0]] = {
+                    "antispam": row[1],
+                    "antilink": row[2],
+                    "captcha_enabled": row[3]
+                }
+            logger.info(f"Cache carregado: {len(self.global_blacklist)} bans, {len(self.shadow_ban)} shadows.")
+        except Exception as e:
+            logger.error(f"Erro ao carregar cache: {e}")
 
 cache = Cache()
 
@@ -159,6 +162,25 @@ class Database:
         row = self.execute("SELECT user_id FROM users WHERE username=? LIMIT 1", (username,)).fetchone()
         return int(row["user_id"]) if row else None
 
+    def get_user_info(self, user_id):
+        row = self.execute("SELECT username, first_name FROM users WHERE user_id=?", (int(user_id),)).fetchone()
+        if row: return f"@{row['username']}" if row['username'] else row['first_name']
+        return str(user_id)
+
+    def get_all_banned_list(self):
+        shadow = self.execute("SELECT user_id FROM shadow_ban").fetchall()
+        glob = self.execute("SELECT user_id, type FROM global_blacklist").fetchall()
+        return shadow, glob
+
+    def active_chats(self):
+        return self.execute("SELECT chat_id FROM chats WHERE active=1").fetchall()
+
+    def all_chats(self):
+        return self.execute("SELECT chat_id FROM chats").fetchall()
+
+    def set_chat_active(self, chat_id, status):
+        self.execute("UPDATE chats SET active=? WHERE chat_id=?", (status, int(chat_id)), commit=True)
+
     def remember_user(self, user):
         if not user: return
         username = (user.username or "").lower().lstrip("@") or None
@@ -220,13 +242,26 @@ def get_target(update: Update):
 # --- COMANDOS ---
 @error_handler
 async def cmd_start(update, context):
-    await update.message.reply_text("🛡️ <b>Jtzin Administrator V1.3</b>\n<i>Performance Extrema Ativada.</i>", parse_mode=ParseMode.HTML)
+    await update.message.reply_text("🛡️ <b>Jtzin Administrator V1.3.1</b>", parse_mode=ParseMode.HTML)
 
 @error_handler
 async def cmd_id(update, context):
     target_id = get_target(update)
     if not target_id: target_id = update.effective_user.id
     await update.message.reply_text(f"🆔 ID: <code>{target_id}</code>", parse_mode=ParseMode.HTML)
+
+@error_handler
+async def cmd_listdn(update, context):
+    if not is_owner(update.effective_user.id): return
+    shadow, glob = db.get_all_banned_list()
+    text = "📋 <b>LISTA DE PUNIÇÕES</b>\n\n"
+    text += "🌑 <b>Shadow Ban:</b>\n"
+    if not shadow: text += "<i>Nenhum</i>\n"
+    for r in shadow: text += f"• {db.get_user_info(r['user_id'])} (<code>{r['user_id']}</code>)\n"
+    text += "\n🌎 <b>Global Blacklist:</b>\n"
+    if not glob: text += "<i>Nenhum</i>\n"
+    for r in glob: text += f"• {db.get_user_info(r['user_id'])} (<code>{r['user_id']}</code>) [{r['type'].upper()}]\n"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 @error_handler
 async def cmd_allban(update, context):
@@ -238,7 +273,7 @@ async def cmd_allban(update, context):
     for row in chats:
         try: await context.bot.ban_chat_member(row['chat_id'], target_id)
         except: continue
-    await update.message.reply_text(f"✅ {target_id} banido de todos os grupos.")
+    await update.message.reply_text(f"✅ {target_id} banido globalmente.")
 
 @error_handler
 async def cmd_allblack(update, context):
@@ -280,7 +315,7 @@ async def cmd_shadow(update, context):
     target_id = get_target(update)
     if not target_id or is_owner(target_id): return
     db.add_shadow_ban(target_id)
-    await update.message.reply_text("🌑 Shadow Ban Ativado.")
+    await update.message.reply_text("🌑 Shadow Ban ativado.")
 
 @error_handler
 async def cmd_unshadow(update, context):
@@ -288,7 +323,7 @@ async def cmd_unshadow(update, context):
     target_id = get_target(update)
     if not target_id: return
     db.remove_shadow_ban(target_id)
-    await update.message.reply_text("✅ Shadow Ban Removido.")
+    await update.message.reply_text("✅ Shadow Ban removido.")
 
 @error_handler
 async def cmd_purge(update, context):
@@ -322,6 +357,60 @@ async def cmd_msg(update, context):
     await msg.reply_text(f"📢 Transmissão: {sent} chats.")
 
 @error_handler
+async def cmd_chats(update, context):
+    if not is_owner(update.effective_user.id): return
+    rows = db.all_chats()
+    if not rows: return await update.message.reply_text("Nenhum chat registrado.")
+    lines = ["📡 <b>CHATS:</b>"]
+    for row in rows: lines.append(f"• <code>{row['chat_id']}</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+@error_handler
+async def cmd_adddivulgar(update, context):
+    if not is_owner(update.effective_user.id): return
+    target = context.args[0] if context.args else None
+    if not target: return
+    db.set_chat_active(target, 1)
+    await update.message.reply_text(f"✅ Chat {target} adicionado à divulgação.")
+
+@error_handler
+async def cmd_rmdivulgar(update, context):
+    if not is_owner(update.effective_user.id): return
+    target = context.args[0] if context.args else None
+    if not target: return
+    db.set_chat_active(target, 0)
+    await update.message.reply_text(f"❌ Chat {target} removido da divulgação.")
+
+@error_handler
+async def cmd_allowlink(update, context):
+    if not await is_admin(update, context): return
+    target_id = get_target(update)
+    if not target_id: return
+    db.add_link_whitelist(update.effective_chat.id, target_id)
+    await update.message.reply_text(f"✅ {target_id} autorizado a mandar links.")
+
+@error_handler
+async def cmd_removelink(update, context):
+    if not await is_admin(update, context): return
+    target_id = get_target(update)
+    if not target_id: return
+    db.remove_link_whitelist(update.effective_chat.id, target_id)
+    await update.message.reply_text(f"❌ {target_id} desautorizado a mandar links.")
+
+@error_handler
+async def cmd_lock(update, context):
+    if not await is_admin(update, context): return
+    await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=False))
+    await update.message.reply_text("🔒 Grupo Fechado.")
+
+@error_handler
+async def cmd_unlock(update, context):
+    if not await is_admin(update, context): return
+    perms = ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True, can_send_photos=True, can_send_videos=True, can_send_other_messages=True, can_add_web_page_previews=True)
+    await context.bot.set_chat_permissions(update.effective_chat.id, perms)
+    await update.message.reply_text("🔓 Grupo Aberto.")
+
+@error_handler
 async def cmd_settings(update, context):
     if not await is_admin(update, context): return
     cid = update.effective_chat.id
@@ -338,19 +427,13 @@ async def message_handler(update, context):
     msg = update.effective_message
     user = update.effective_user
     if not msg or not user or user.is_bot: return
-
-    # Cache Check (Velocidade de Luz)
     if user.id in cache.global_blacklist or user.id in cache.shadow_ban:
         try: await msg.delete()
         except: pass
         return
-
     db.register_chat(msg.chat_id, msg.chat.title, msg.chat.type)
     db.remember_user(user)
-
     if is_owner(user.id): return
-    
-    # Anti-Link (Cache Check)
     if db.get_setting(msg.chat_id, "antilink") and any(e.type in ["url", "text_link"] for e in msg.entities or []):
         if user.id not in cache.link_whitelist[msg.chat_id]:
             try: await msg.delete()
@@ -375,13 +458,17 @@ async def post_init(app: Application):
         BotCommand("lock", "Fechar"), BotCommand("unlock", "Abrir"), BotCommand("purge", "Limpar"),
         BotCommand("ban", "Banir"), BotCommand("mute", "Silenciar"), BotCommand("msg", "Transmissão")
     ])
-    logger.info("Jtzin Administrator V1.3 ONLINE!")
+    logger.info("Jtzin Administrator V1.3.1 ONLINE!")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("listdn", cmd_listdn))
     app.add_handler(CommandHandler("msg", cmd_msg))
+    app.add_handler(CommandHandler("chats", cmd_chats))
+    app.add_handler(CommandHandler("adddivulgar", cmd_adddivulgar))
+    app.add_handler(CommandHandler("rmdivulgar", cmd_rmdivulgar))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("purge", cmd_purge))
     app.add_handler(CommandHandler("ban", cmd_ban))
@@ -392,6 +479,10 @@ def main():
     app.add_handler(CommandHandler("unblacklist", cmd_unblacklist))
     app.add_handler(CommandHandler("shadow", cmd_shadow))
     app.add_handler(CommandHandler("unshadow", cmd_unshadow))
+    app.add_handler(CommandHandler("allowlink", cmd_allowlink))
+    app.add_handler(CommandHandler("removelink", cmd_removelink))
+    app.add_handler(CommandHandler("lock", cmd_lock))
+    app.add_handler(CommandHandler("unlock", cmd_unlock))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, message_handler))
     app.run_polling(drop_pending_updates=True)
