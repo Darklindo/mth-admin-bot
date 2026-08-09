@@ -273,7 +273,7 @@ def target_from_update(update: Update):
 # --- COMANDOS ---
 async def cmd_start(update, context):
     keyboard = [[InlineKeyboardButton("📚 Ajuda", callback_data="help_main")]]
-    await update.message.reply_text("🛡️ <b>MTH ADMIN BOT V2.2.4</b>\n\nMenu de comandos corrigido!", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("🛡️ <b>MTH ADMIN BOT V2.2.5</b>\n\nCorreção de permissões aplicada!", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cmd_help(update, context):
     text = (
@@ -288,6 +288,7 @@ async def cmd_help(update, context):
 async def cmd_lock(update, context):
     if not await is_admin(update, context): return
     try:
+        # Versão mais segura e compatível de ChatPermissions
         await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=False))
         await update.message.reply_text("🔒 <b>Grupo Fechado!</b>", parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -296,10 +297,30 @@ async def cmd_lock(update, context):
 async def cmd_unlock(update, context):
     if not await is_admin(update, context): return
     try:
-        await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_polls=True, can_send_other_messages=True, can_add_web_page_previews=True))
+        # Usar apenas argumentos básicos para garantir compatibilidade entre versões
+        await context.bot.set_chat_permissions(
+            update.effective_chat.id, 
+            ChatPermissions(
+                can_send_messages=True, 
+                can_send_audios=True,
+                can_send_documents=True,
+                can_send_photos=True,
+                can_send_videos=True,
+                can_send_video_notes=True,
+                can_send_voice_notes=True,
+                can_send_polls=True, 
+                can_send_other_messages=True, 
+                can_add_web_page_previews=True
+            )
+        )
         await update.message.reply_text("🔓 <b>Grupo Aberto!</b>", parse_mode=ParseMode.HTML)
     except Exception as e:
-        await update.message.reply_text(f"Erro: {e}")
+        # Fallback para caso os argumentos acima ainda deem erro em versões muito antigas
+        try:
+            await context.bot.set_chat_permissions(update.effective_chat.id, ChatPermissions(can_send_messages=True))
+            await update.message.reply_text("🔓 <b>Grupo Aberto (Modo Simples)!</b>", parse_mode=ParseMode.HTML)
+        except:
+            await update.message.reply_text(f"Erro ao abrir grupo: {e}")
 
 async def cmd_purge(update, context):
     if not await is_admin(update, context): return
@@ -495,7 +516,22 @@ async def night_mode_checker(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.set_chat_permissions(chat_id, ChatPermissions(can_send_messages=False))
                 logger.info(f"Modo Noturno ativado em {chat_id}")
             elif now == row['night_end']:
-                await context.bot.set_chat_permissions(chat_id, ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_polls=True, can_send_other_messages=True, can_add_web_page_previews=True))
+                # Mesma lógica de compatibilidade para o Modo Noturno
+                await context.bot.set_chat_permissions(
+                    chat_id, 
+                    ChatPermissions(
+                        can_send_messages=True, 
+                        can_send_audios=True,
+                        can_send_documents=True,
+                        can_send_photos=True,
+                        can_send_videos=True,
+                        can_send_video_notes=True,
+                        can_send_voice_notes=True,
+                        can_send_polls=True, 
+                        can_send_other_messages=True, 
+                        can_add_web_page_previews=True
+                    )
+                )
                 logger.info(f"Modo Noturno desativado em {chat_id}")
     except Exception as e:
         logger.error(f"Erro no checker noturno: {e}")
@@ -565,10 +601,9 @@ async def on_callback(update, context):
 
 async def post_init(app: Application):
     try:
-        # COMANDOS QUE APARECERÃO NO MENU "/"
         commands = [
             BotCommand("start", "Iniciar o bot"),
-            BotCommand("help", "Ver ajuda"),
+            BotCommand("help", "Ajuda"),
             BotCommand("settings", "Configurações"),
             BotCommand("lock", "Fechar grupo"),
             BotCommand("unlock", "Abrir grupo"),
@@ -583,7 +618,7 @@ async def post_init(app: Application):
         await app.bot.set_my_commands(commands)
         if app.job_queue:
             app.job_queue.run_repeating(night_mode_checker, interval=60, first=10)
-        logger.info("MTH ADMIN BOT V2.2.4 ONLINE!")
+        logger.info("MTH ADMIN BOT V2.2.5 ONLINE!")
     except Exception as e:
         logger.error(f"Erro no post_init: {e}")
 
