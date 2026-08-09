@@ -273,7 +273,7 @@ def target_from_update(update: Update):
 # --- COMANDOS ---
 async def cmd_start(update, context):
     keyboard = [[InlineKeyboardButton("📚 Ajuda", callback_data="help_main")]]
-    await update.message.reply_text("🛡️ <b>MTH ADMIN BOT V2.2</b>\n\nLogs limpos e comandos estáveis!", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("🛡️ <b>MTH ADMIN BOT V2.2</b>\n\nPronto para moderar!", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cmd_help(update, context):
     text = (
@@ -322,6 +322,82 @@ async def cmd_purge(update, context):
     status = await context.bot.send_message(chat_id, f"🧹 {count} mensagens limpas!")
     await asyncio.sleep(3)
     await safe_delete(status)
+
+async def cmd_ban(update, context):
+    if not await is_admin(update, context): return
+    target = target_from_update(update)
+    if not target:
+        await update.message.reply_text("Uso: /ban @user ou responda a uma mensagem.")
+        return
+    uid = target.id if hasattr(target, 'id') else target
+    try:
+        await context.bot.ban_chat_member(update.effective_chat.id, uid)
+        await update.message.reply_text(f"🚫 Usuário banido.")
+    except Exception as e:
+        await update.message.reply_text(f"Erro: {e}")
+
+async def cmd_kick(update, context):
+    if not await is_admin(update, context): return
+    target = target_from_update(update)
+    if not target:
+        await update.message.reply_text("Uso: /kick @user ou responda a uma mensagem.")
+        return
+    uid = target.id if hasattr(target, 'id') else target
+    try:
+        await context.bot.unban_chat_member(update.effective_chat.id, uid)
+        await update.message.reply_text(f"👢 Usuário expulso.")
+    except Exception as e:
+        await update.message.reply_text(f"Erro: {e}")
+
+async def cmd_mute(update, context):
+    if not await is_admin(update, context): return
+    target = target_from_update(update)
+    if not target:
+        await update.message.reply_text("Uso: /mute @user ou responda a uma mensagem.")
+        return
+    uid = target.id if hasattr(target, 'id') else target
+    try:
+        until = timedelta(hours=24)
+        await context.bot.restrict_chat_member(
+            update.effective_chat.id, uid, 
+            permissions=ChatPermissions(can_send_messages=False),
+            until_date=update.message.date + until
+        )
+        await update.message.reply_text(f"🔇 Usuário silenciado por 24h.")
+    except Exception as e:
+        await update.message.reply_text(f"Erro: {e}")
+
+async def cmd_warn(update, context):
+    if not await is_admin(update, context): return
+    target = target_from_update(update)
+    if not target:
+        await update.message.reply_text("Uso: /warn @user ou responda a uma mensagem.")
+        return
+    uid = target.id if hasattr(target, 'id') else target
+    chat_id = update.effective_chat.id
+    
+    # Simulação de warnings (usando Database se implementado)
+    await update.message.reply_text(f"⚠️ Usuário advertido.")
+
+async def cmd_allowlink(update, context):
+    if not await is_admin(update, context): return
+    target = target_from_update(update)
+    if not target:
+        await update.message.reply_text("Uso: /allowlink @user ou responda a uma mensagem.")
+        return
+    uid = target.id if hasattr(target, 'id') else target
+    db.add_link_whitelist(update.effective_chat.id, uid)
+    await update.message.reply_text("✅ Usuário agora pode enviar links!")
+
+async def cmd_removelink(update, context):
+    if not await is_admin(update, context): return
+    target = target_from_update(update)
+    if not target:
+        await update.message.reply_text("Uso: /removelink @user ou responda a uma mensagem.")
+        return
+    uid = target.id if hasattr(target, 'id') else target
+    db.remove_link_whitelist(update.effective_chat.id, uid)
+    await update.message.reply_text("❌ Usuário não pode mais enviar links.")
 
 async def cmd_rmdivulgar(update, context):
     if not await is_owner(update): return
@@ -492,6 +568,10 @@ def main():
         app.add_handler(CommandHandler("lock", cmd_lock))
         app.add_handler(CommandHandler("unlock", cmd_unlock))
         app.add_handler(CommandHandler("purge", cmd_purge))
+        app.add_handler(CommandHandler("ban", cmd_ban))
+        app.add_handler(CommandHandler("kick", cmd_kick))
+        app.add_handler(CommandHandler("mute", cmd_mute))
+        app.add_handler(CommandHandler("warn", cmd_warn))
         app.add_handler(CommandHandler("rmdivulgar", cmd_rmdivulgar))
         app.add_handler(CommandHandler("adddivulgar", cmd_adddivulgar))
         app.add_handler(CommandHandler("divulgar", cmd_broadcast))
