@@ -304,24 +304,43 @@ async def cmd_unlock(update, context):
 async def cmd_purge(update, context):
     if not await is_admin(update, context): return
     msg = update.effective_message
-    if not msg.reply_to_message:
-        await msg.reply_text("Responda à mensagem de onde deseja iniciar a limpeza.")
-        return
-    
     chat_id = update.effective_chat.id
-    start_id = msg.reply_to_message.message_id
-    end_id = msg.message_id
     
-    count = 0
-    for m_id in range(end_id, start_id - 1, -1):
-        try:
-            await context.bot.delete_message(chat_id, m_id)
-            count += 1
-        except: continue
-    
-    status = await context.bot.send_message(chat_id, f"🧹 {count} mensagens limpas!")
-    await asyncio.sleep(3)
-    await safe_delete(status)
+    # Caso 1: Por quantidade (/purge 20)
+    if context.args and context.args[0].isdigit():
+        amount = int(context.args[0])
+        if amount > 100: amount = 100
+        
+        await safe_delete(msg)
+        count = 0
+        current_id = msg.message_id
+        for i in range(amount):
+            try:
+                await context.bot.delete_message(chat_id, current_id - i - 1)
+                count += 1
+            except: continue
+        
+        status = await context.bot.send_message(chat_id, f"🧹 {count} mensagens limpas!")
+        await asyncio.sleep(3)
+        await safe_delete(status)
+        return
+
+    # Caso 2: Por resposta (Range)
+    if msg.reply_to_message:
+        start_id = msg.reply_to_message.message_id
+        end_id = msg.message_id
+        count = 0
+        for m_id in range(end_id, start_id - 1, -1):
+            try:
+                await context.bot.delete_message(chat_id, m_id)
+                count += 1
+            except: continue
+        status = await context.bot.send_message(chat_id, f"🧹 {count} mensagens limpas!")
+        await asyncio.sleep(3)
+        await safe_delete(status)
+        return
+
+    await msg.reply_text("Uso: /purge [quantidade] ou responda a uma mensagem.")
 
 async def cmd_ban(update, context):
     if not await is_admin(update, context): return
@@ -374,9 +393,6 @@ async def cmd_warn(update, context):
         await update.message.reply_text("Uso: /warn @user ou responda a uma mensagem.")
         return
     uid = target.id if hasattr(target, 'id') else target
-    chat_id = update.effective_chat.id
-    
-    # Simulação de warnings (usando Database se implementado)
     await update.message.reply_text(f"⚠️ Usuário advertido.")
 
 async def cmd_allowlink(update, context):
@@ -546,12 +562,25 @@ async def on_callback(update, context):
             [InlineKeyboardButton(f"Anti-Raid: {antiraid}", callback_data="toggle_antiraid")],
             [InlineKeyboardButton(f"Modo Noturno Auto: {night_auto}", callback_data="toggle_night")]
         ]
-        await query.edit_message_text("⚙️ <b>CONFIGURAÇÕES</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+        try:
+            await query.edit_message_text("⚙️ <b>CONFIGURAÇÕES</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+        except BadRequest as e:
+            if "Message is not modified" not in str(e):
+                raise e
     except Exception as e:
         logger.error(f"Erro no callback: {e}")
 
 async def post_init(app: Application):
     try:
+        commands = [
+            BotCommand("start", "Iniciar"),
+            BotCommand("help", "Ajuda"),
+            BotCommand("settings", "Configurações"),
+            BotCommand("lock", "Fechar grupo"),
+            BotCommand("unlock", "Abrir grupo"),
+            BotCommand("purge", "Limpar mensagens"),
+        ]
+        await app.bot.set_my_commands(commands)
         if app.job_queue:
             app.job_queue.run_repeating(night_mode_checker, interval=60, first=10)
         logger.info("MTH ADMIN BOT V2.2 ONLINE!")
