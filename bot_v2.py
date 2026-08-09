@@ -265,18 +265,22 @@ async def global_security_filter(update: Update, context: ContextTypes.DEFAULT_T
 @error_handler
 async def cmd_start(update, context):
     text = (
-        "🛡️ <b>Jtzin Administrator V1.3.6</b>\n\n"
+        "🛡️ <b>Jtzin Administrator V1.3.8</b>\n\n"
         "O bot de administração definitivo para elevar o nível do seu grupo ou canal. "
         "Segurança avançada, moderação rápida e controle total em suas mãos.\n\n"
         "💎 <b>Equipe Diamond</b> — <i>Excelência em Automação</i>\n\n"
-        "🚀 <b>Principais Recursos:</b>\n"
+        "🚀 <b>Recursos de Elite:</b>\n"
         "• Anti-Link e Anti-Spam inteligente\n"
         "• Punições Globais e Blacklist\n"
         "• Sistema de Shadow Ban\n"
         "• Moderação por Resposta e ID\n\n"
-        "Clique no botão abaixo para conhecer nosso canal oficial e suporte."
+        "Use os botões abaixo para navegar e configurar seu bot."
     )
-    keyboard = [[InlineKeyboardButton("💎 Canal Oficial Diamond", url="https://t.me/Jtcaciadminbot")]]
+    keyboard = [
+        [InlineKeyboardButton("💎 Canal Oficial Diamond", url="https://t.me/upadatesproxymodmenu")],
+        [InlineKeyboardButton("🛡️ Coloque o bot no seu Canal ou Grupo!", url="https://t.me/Jtcaciadminbot?startgroup=true")],
+        [InlineKeyboardButton("🐞 Feedbacks / Bugs", url="https://t.me/OnlyExaltarei")]
+    ]
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
 @error_handler
@@ -517,7 +521,7 @@ async def post_init(app: Application):
         BotCommand("lock", "Fechar"), BotCommand("unlock", "Abrir"), BotCommand("purge", "Limpar"),
         BotCommand("ban", "Banir"), BotCommand("mute", "Silenciar"), BotCommand("msg", "Transmissão")
     ])
-    logger.info("Jtzin Administrator V1.3.6 ONLINE!")
+    logger.info("Jtzin Administrator V1.3.8 ONLINE!")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
