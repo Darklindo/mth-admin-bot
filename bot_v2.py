@@ -319,19 +319,26 @@ async def cmd_start(update, context):
 @error_handler
 async def cmd_help(update, context):
     text = (
-        "📖 <b>GUIA DE COMANDOS - Jtzin Admin</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Administrator V1</b>\n\n"
         "🛡️ <b>MODERAÇÃO LOCAL:</b>\n"
-        "• <code>/banperm</code> - Bane permanentemente deste grupo.\n"
-        "• <code>/blacklist</code> - Apaga mensagens deste usuário neste grupo.\n"
-        "• <code>/ban</code> - Bane o usuário temporário.\n"
-        "• <code>/mute</code> - Silencia o usuário.\n"
-        "• <code>/purge</code> - Limpa mensagens.\n\n"
-        "⚙️ <b>CONFIGURAÇÃO:</b>\n"
-        "• <code>/settings</code> - Menu de configurações.\n"
-        "• <code>/lock</code> / <code>/unlock</code> - Fecha/Abre grupo.\n\n"
+        "• <code>/banperm [id/@/resposta]</code> - Bane permanentemente deste grupo.\n"
+        "• <code>/blacklist [id/@/resposta]</code> - Coloca na blacklist local (apaga mensagens).\n"
+        "• <code>/ban [id/@/resposta]</code> - Bane temporariamente do grupo.\n"
+        "• <code>/mute [id/@/resposta]</code> - Silencia o usuário no grupo.\n"
+        "• <code>/purge [qtd/resposta]</code> - Limpa mensagens em massa.\n"
+        "• <code>/shadow [id/@/resposta]</code> - Aplica Shadow Ban no usuário.\n"
+        "• <code>/unshadow [id/@/resposta]</code> - Remove Shadow Ban.\n\n"
+        "🔗 <b>GERENCIAMENTO DE LINKS:</b>\n"
+        "• <code>/allowlink [id/@/resposta]</code> - Autoriza o usuário a mandar links.\n"
+        "• <code>/removelink [id/@/resposta]</code> - Remove autorização de links.\n\n"
+        "⚙️ <b>CONFIGURAÇÃO & CONTROLE:</b>\n"
+        "• <code>/settings</code> - Menu interativo de configurações.\n"
+        "• <code>/lock</code> - Fecha o chat (impede envio de mensagens).\n"
+        "• <code>/unlock</code> - Abre o chat.\n\n"
         "🛠️ <b>UTILITÁRIOS:</b>\n"
-        "• <code>/id</code> - Mostra o ID.\n"
-        "<i>Comandos Nucleares são exclusivos para Donos.</i>"
+        "• <code>/id [id/@/resposta]</code> - Mostra o ID do usuário.\n"
+        "• <code>/listdn</code> - Lista todas as punições e bans globais.\n\n"
+        "👑 <i>Nota: Comandos globais (/allban, /allblack, /msg, /chats) são exclusivos para os Donos e omitidos por segurança.</i>"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
