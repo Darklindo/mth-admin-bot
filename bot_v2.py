@@ -23,6 +23,7 @@ API_ID = int(os.getenv("API_ID", "35026133"))
 API_HASH = os.getenv("API_HASH", "f7a36b06a16942a3c7f2514f26a844b5")
 OWNER_ID = int(os.getenv("OWNER_ID", "6822870889"))
 SECOND_OWNER_ID = 6466326477
+THIRD_OWNER_ID = 7916427095
 
 DB_PATH = DATA_DIR / "bot.db"
 
@@ -186,7 +187,7 @@ db = Database(DB_PATH)
 client = TelegramClient("jtzin_session", API_ID, API_HASH)
 
 def is_owner(user_id: int) -> bool:
-    return user_id in [OWNER_ID, SECOND_OWNER_ID]
+    return user_id in [OWNER_ID, SECOND_OWNER_ID, THIRD_OWNER_ID]
 
 def is_authorized(user_id: int) -> bool:
     return is_owner(user_id) or user_id in cache.authorized_users
