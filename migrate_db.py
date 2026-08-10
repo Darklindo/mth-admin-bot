@@ -81,6 +81,13 @@ def migrate():
         PRIMARY KEY (chat_id, user_id)
     )""")
 
+    # Usuários Autorizados (Userbot)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS authorized_users (
+        user_id INTEGER PRIMARY KEY,
+        created_at INTEGER
+    )""")
+
     # Índices para performance
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_local_blacklist_chat ON local_blacklist(chat_id)")
