@@ -284,6 +284,12 @@ async def global_security_filter(client: Client, message: Message):
 
 # --- COMANDOS DO USERBOT ---
 
+async def reply_or_edit(message: Message, text: str, parse_mode=ParseMode.HTML):
+    if message.from_user and message.from_user.is_self:
+        try: return await message.edit_text(text, parse_mode=parse_mode)
+        except: pass
+    return await message.reply_text(text, parse_mode=parse_mode)
+
 @app.on_message(filters.command("start") & (filters.me | filters.user(list(cache.authorized_users))))
 async def cmd_start(client: Client, message: Message):
     text = (
@@ -291,16 +297,17 @@ async def cmd_start(client: Client, message: Message):
         "Userbot de administração avançado operando diretamente na sua conta.\n"
         "Equipe Diamond — Segurança máxima."
     )
-    await message.reply_text(text, parse_mode=ParseMode.HTML)
+    await reply_or_edit(message, text)
 
 @app.on_message(filters.command("autorizar") & (filters.me | filters.user([OWNER_ID, SECOND_OWNER_ID])))
 async def cmd_autorizar(client: Client, message: Message):
     target_id = await get_target(client, message)
     if not target_id:
-        await message.reply_text("❌ Especifique o usuário (respondendo ou ID/Username).")
+        await reply_or_edit(message, "❌ Especifique o usuário (respondendo ou ID/Username).")
         return
     db.add_authorized(target_id)
-    await message.reply_text(f"✅ Usuário <code>{target_id}</code> autorizado a usar o Userbot.")
+    user_info = db.get_user_info(target_id)
+    await reply_or_edit(message, f"✅ Usuário {user_info} (<code>{target_id}</code>) autorizado a usar o Userbot.")
 
 @app.on_message(filters.command("help") & (filters.me | filters.user(list(cache.authorized_users) + [OWNER_ID, SECOND_OWNER_ID])))
 async def cmd_help(client: Client, message: Message):
@@ -319,12 +326,12 @@ async def cmd_help(client: Client, message: Message):
         "• <code>/msg</code> - Transmissão global (Donos).\n"
         "• <code>/chats</code> - Relatório de chats (Donos)."
     )
-    await message.reply_text(text, parse_mode=ParseMode.HTML)
+    await reply_or_edit(message, text)
 
 @app.on_message(filters.command("id") & (filters.me | filters.user(list(cache.authorized_users))))
 async def cmd_id(client: Client, message: Message):
     target_id = await get_target(client, message) or message.from_user.id
-    await message.reply_text(f"🆔 ID: <code>{target_id}</code>", parse_mode=ParseMode.HTML)
+    await reply_or_edit(message, f"🆔 ID: <code>{target_id}</code>")
 
 @app.on_message(filters.command("banperm") & (filters.me | filters.user(list(cache.authorized_users))))
 async def cmd_banperm(client: Client, message: Message):
@@ -333,14 +340,16 @@ async def cmd_banperm(client: Client, message: Message):
     db.add_local_banperm(message.chat.id, target_id, get_reason(message))
     try: await client.ban_chat_member(message.chat.id, target_id)
     except: pass
-    await message.reply_text(f"✅ {target_id} banido permanentemente deste grupo.")
+    user_info = db.get_user_info(target_id)
+    await reply_or_edit(message, f"✅ {user_info} (<code>{target_id}</code>) banido permanentemente deste grupo.")
 
 @app.on_message(filters.command("blacklist") & (filters.me | filters.user(list(cache.authorized_users))))
 async def cmd_blacklist(client: Client, message: Message):
     target_id = await get_target(client, message)
     if not target_id or is_owner(target_id): return
     db.add_local_blacklist(message.chat.id, target_id, get_reason(message))
-    await message.reply_text(f"✅ {target_id} em blacklist local.")
+    user_info = db.get_user_info(target_id)
+    await reply_or_edit(message, f"✅ {user_info} (<code>{target_id}</code>) em blacklist local.")
 
 @app.on_message(filters.command("allban") & filters.user([OWNER_ID, SECOND_OWNER_ID]))
 async def cmd_allban(client: Client, message: Message):
@@ -354,14 +363,16 @@ async def cmd_allban(client: Client, message: Message):
                 await client.ban_chat_member(chat['chat_id'], target_id)
                 await asyncio.sleep(0.1)
             except: continue
-    await message.reply_text(f"☢️ {target_id} BANIDO GLOBALMENTE.")
+    user_info = db.get_user_info(target_id)
+    await reply_or_edit(message, f"☢️ {user_info} (<code>{target_id}</code>) BANIDO GLOBALMENTE.")
 
 @app.on_message(filters.command("allblack") & filters.user([OWNER_ID, SECOND_OWNER_ID]))
 async def cmd_allblack(client: Client, message: Message):
     target_id = await get_target(client, message)
     if not target_id or is_owner(target_id): return
     db.add_global_blacklist(target_id, 'black', get_reason(message))
-    await message.reply_text(f"✅ {target_id} em blacklist global.")
+    user_info = db.get_user_info(target_id)
+    await reply_or_edit(message, f"✅ {user_info} (<code>{target_id}</code>) em blacklist global.")
 
 @app.on_message(filters.command("listdn") & filters.user([OWNER_ID, SECOND_OWNER_ID]))
 async def cmd_listdn(client: Client, message: Message):
@@ -386,7 +397,7 @@ async def cmd_listdn(client: Client, message: Message):
     if not shadow and not glob:
         text += "Nenhuma punição global registrada."
         
-    await message.reply_text(text, parse_mode=ParseMode.HTML)
+    await reply_or_edit(message, text)
 
 @app.on_message(filters.command("chats") & filters.user([OWNER_ID, SECOND_OWNER_ID]))
 async def cmd_chats(client: Client, message: Message):
@@ -412,7 +423,7 @@ async def cmd_chats(client: Client, message: Message):
     text += f"• Grupos/Canais: {len(grupos) + len(canais)}\n"
     text += f"• Ativos p/ Msg: {ativos_msg}\n"
     text += f"• Usuários no Privado: {len(privados)}"
-    await message.reply_text(text, parse_mode=ParseMode.HTML)
+    await reply_or_edit(message, text)
 
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
