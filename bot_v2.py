@@ -3,17 +3,14 @@ import os
 import sqlite3
 import time
 import asyncio
-import sys
-import functools
 from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
 
 from dotenv import load_dotenv
-from pyrogram import Client, filters
-from pyrogram.types import Message, ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.enums import ChatType, ParseMode
-from pyrogram.errors import RPCError
+from telethon import TelegramClient, events
+from telethon.tl.types import ChatAdminRights, ChannelParticipantsAdmins
+from telethon.errors import RPCError
 
 # --- CONFIGURAÇÕES INICIAIS ---
 BASE_DIR = Path(__file__).resolve().parent
@@ -33,7 +30,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("jtzin-userbot")
+logger = logging.getLogger("jtzin-telethon")
 
 # --- CACHE EM MEMÓRIA ---
 class Cache:
@@ -74,7 +71,7 @@ class Cache:
                 self.settings[row[0]] = {
                     "antispam": row[1], "antilink": row[2], "captcha_enabled": row[3]
                 }
-            logger.info("Cache de performance do Userbot carregado com sucesso.")
+            logger.info("Cache carregado com sucesso (Telethon).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -122,17 +119,9 @@ class Database:
         self.execute("INSERT OR REPLACE INTO local_banperm(chat_id, user_id, reason, created_at) VALUES(?,?,?,?)", (int(chat_id), int(user_id), reason, int(time.time())), commit=True)
         cache.local_banperm[int(chat_id)].add(int(user_id))
 
-    def remove_local_banperm(self, chat_id, user_id):
-        self.execute("DELETE FROM local_banperm WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)), commit=True)
-        if int(chat_id) in cache.local_banperm: cache.local_banperm[int(chat_id)].discard(int(user_id))
-
     def add_local_blacklist(self, chat_id, user_id, reason=None):
         self.execute("INSERT OR REPLACE INTO local_blacklist(chat_id, user_id, reason, created_at) VALUES(?,?,?,?)", (int(chat_id), int(user_id), reason, int(time.time())), commit=True)
         cache.local_blacklist[int(chat_id)].add(int(user_id))
-
-    def remove_local_blacklist(self, chat_id, user_id):
-        self.execute("DELETE FROM local_blacklist WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)), commit=True)
-        if int(chat_id) in cache.local_blacklist: cache.local_blacklist[int(chat_id)].discard(int(user_id))
 
     def add_global_blacklist(self, user_id, type_name="ban", reason=None):
         self.execute("INSERT OR REPLACE INTO global_blacklist(user_id, type, reason, created_at) VALUES(?,?,?,?)", (int(user_id), type_name, reason, int(time.time())), commit=True)
@@ -164,10 +153,6 @@ class Database:
         self.execute("INSERT OR IGNORE INTO link_whitelist(chat_id, user_id) VALUES(?,?)", (int(chat_id), int(user_id)), commit=True)
         cache.link_whitelist[int(chat_id)].add(int(user_id))
 
-    def remove_link_whitelist(self, chat_id, user_id):
-        self.execute("DELETE FROM link_whitelist WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)), commit=True)
-        if int(chat_id) in cache.link_whitelist: cache.link_whitelist[int(chat_id)].discard(int(user_id))
-
     def resolve_username(self, username):
         username = username.lower().lstrip("@")
         row = self.execute("SELECT user_id FROM users WHERE username=? LIMIT 1", (username,)).fetchone()
@@ -183,50 +168,43 @@ class Database:
         glob = self.execute("SELECT user_id, type, reason, created_at FROM global_blacklist ORDER BY created_at DESC").fetchall()
         return shadow, glob
 
-    def active_chats(self):
-        return self.execute("SELECT chat_id FROM chats WHERE active=1 AND chat_type != 'private'").fetchall()
-
     def all_chats_detailed(self):
         return self.execute("SELECT chat_id, title, chat_type, active FROM chats").fetchall()
 
     def set_chat_active(self, chat_id, status):
         self.execute("UPDATE chats SET active=? WHERE chat_id=?", (status, int(chat_id)), commit=True)
 
-    def remember_user(self, user):
-        if not user: return
-        username = (user.username or "").lower().lstrip("@") or None
+    def remember_user(self, user_id, username, first_name):
+        if not user_id: return
+        username = (username or "").lower().lstrip("@") or None
         self.execute(
             "INSERT INTO users(user_id,username,first_name) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name",
-            (user.id, username, user.first_name or ""),
+            (int(user_id), username, first_name or ""),
             commit=True
         )
 
 db = Database(DB_PATH)
 
-# --- INICIALIZAÇÃO DO USERBOT ---
-app = Client(
-    "jtzin_userbot",
-    api_id=API_ID,
-    api_hash=API_HASH
-)
+# --- CLIENTE TELETHON ---
+client = TelegramClient("jtzin_session", API_ID, API_HASH)
 
-# --- AUXILIARES ---
 def is_owner(user_id: int) -> bool:
     return user_id in [OWNER_ID, SECOND_OWNER_ID]
 
 def is_authorized(user_id: int) -> bool:
     return is_owner(user_id) or user_id in cache.authorized_users
 
-async def get_target(client: Client, message: Message):
-    if not message: return None
-    if message.reply_to_message and message.reply_to_message.from_user:
-        return message.reply_to_message.from_user.id
-    args = message.command
+async def get_target_from_event(event):
+    reply = await event.get_reply_message()
+    if reply and reply.sender_id:
+        return reply.sender_id
+    
+    args = event.raw_text.split()
     if len(args) > 1:
         raw = args[1].strip()
         if raw.startswith("@"):
             try:
-                user = await client.get_users(raw)
+                user = await client.get_entity(raw)
                 return user.id
             except:
                 return db.resolve_username(raw)
@@ -234,24 +212,33 @@ async def get_target(client: Client, message: Message):
             return int(raw)
     return None
 
-def get_reason(message: Message):
-    args = message.command
-    if message.reply_to_message:
+def get_reason_from_event(event):
+    args = event.raw_text.split()
+    if event.is_reply:
         return " ".join(args[1:]) if len(args) > 1 else None
     return " ".join(args[2:]) if len(args) > 2 else None
 
-def format_date(timestamp):
-    return datetime.fromtimestamp(timestamp).strftime('%d/%m/%Y %H:%M')
+async def reply_or_edit(event, text):
+    try:
+        if event.out:
+            return await event.edit(text, parse_mode='html')
+    except:
+        pass
+    return await event.reply(text, parse_mode='html')
 
 # --- FILTRO DE SEGURANÇA GLOBAL ---
-@app.on_message(~filters.me & filters.group, group=-1)
-async def global_security_filter(client: Client, message: Message):
-    if not message.from_user: return
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-
-    db.register_chat(chat_id, message.chat.title, message.chat.type.value)
-    db.remember_user(message.from_user)
+@client.on(events.NewMessage(incoming=True))
+async def global_security_filter(event):
+    if not event.is_group and not event.is_channel: return
+    sender = await event.get_sender()
+    if not sender or sender.bot: return
+    
+    user_id = sender.id
+    chat_id = event.chat_id
+    
+    chat = await event.get_chat()
+    db.register_chat(chat_id, getattr(chat, 'title', 'Chat'), chat.__class__.__name__)
+    db.remember_user(user_id, getattr(sender, 'username', None), getattr(sender, 'first_name', ''))
 
     if is_owner(user_id): return
 
@@ -262,57 +249,53 @@ async def global_security_filter(client: Client, message: Message):
 
     if is_banned_global or is_shadow or is_local_black or is_local_banperm:
         try:
-            await message.delete()
+            await event.delete()
             if is_banned_global or is_local_banperm:
-                await client.ban_chat_member(chat_id, user_id)
+                await client.edit_permissions(chat_id, user_id, view_messages=False)
         except: pass
-        message.stop_propagation()
+        raise events.StopPropagation
 
     # Anti-Link
-    if db.get_setting(chat_id, "antilink") and message.entities:
-        has_link = any(e.type.name in ["URL", "TEXT_LINK"] for e in message.entities)
-        if has_link and user_id not in cache.link_whitelist[chat_id]:
-            # Verificar se é admin
-            try:
-                member = await client.get_chat_member(chat_id, user_id)
-                if member.status.name not in ["ADMINISTRATOR", "CREATOR"]:
-                    await message.delete()
-                    message.stop_propagation()
-            except:
-                await message.delete()
-                message.stop_propagation()
+    if db.get_setting(chat_id, "antilink") and event.text:
+        if "http://" in event.text or "https://" in event.text or "t.me/" in event.text:
+            if user_id not in cache.link_whitelist[chat_id]:
+                try:
+                    perms = await client.get_permissions(chat_id, user_id)
+                    if not perms.is_admin and not perms.is_creator:
+                        await event.delete()
+                        raise events.StopPropagation
+                except:
+                    await event.delete()
+                    raise events.StopPropagation
 
-# --- COMANDOS DO USERBOT ---
+# --- COMANDOS DO TELETHON ---
 
-async def reply_or_edit(message: Message, text: str, parse_mode=ParseMode.HTML):
-    if message.from_user and message.from_user.is_self:
-        try: return await message.edit_text(text, parse_mode=parse_mode)
-        except: pass
-    return await message.reply_text(text, parse_mode=parse_mode)
-
-@app.on_message(filters.command("start") & (filters.me | filters.user(list(cache.authorized_users))))
-async def cmd_start(client: Client, message: Message):
+@client.on(events.NewMessage(pattern=r'/start'))
+async def cmd_start(event):
+    if not is_authorized(event.sender_id): return
     text = (
-        "🛡️ <b>Jtzin Userbot V1</b>\n\n"
-        "Userbot de administração avançado operando diretamente na sua conta.\n"
-        "Equipe Diamond — Segurança máxima."
+        "🛡️ <b>Jtzin Userbot V2.3 (Telethon)</b>\n\n"
+        "Userbot de administração avançado operando com estabilidade máxima.\n"
+        "Equipe Diamond — Segurança total."
     )
-    await reply_or_edit(message, text)
+    await reply_or_edit(event, text)
 
-@app.on_message(filters.command("autorizar") & (filters.me | filters.user([OWNER_ID, SECOND_OWNER_ID])))
-async def cmd_autorizar(client: Client, message: Message):
-    target_id = await get_target(client, message)
+@client.on(events.NewMessage(pattern=r'/autorizar'))
+async def cmd_autorizar(event):
+    if not is_owner(event.sender_id): return
+    target_id = await get_target_from_event(event)
     if not target_id:
-        await reply_or_edit(message, "❌ Especifique o usuário (respondendo ou ID/Username).")
+        await reply_or_edit(event, "❌ Especifique o usuário (respondendo ou ID/Username).")
         return
     db.add_authorized(target_id)
     user_info = db.get_user_info(target_id)
-    await reply_or_edit(message, f"✅ Usuário {user_info} (<code>{target_id}</code>) autorizado a usar o Userbot.")
+    await reply_or_edit(event, f"✅ Usuário {user_info} (<code>{target_id}</code>) autorizado a usar o Userbot.")
 
-@app.on_message(filters.command("help") & (filters.me | filters.user(list(cache.authorized_users) + [OWNER_ID, SECOND_OWNER_ID])))
-async def cmd_help(client: Client, message: Message):
+@client.on(events.NewMessage(pattern=r'/help'))
+async def cmd_help(event):
+    if not is_authorized(event.sender_id): return
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V1</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V2.3</b>\n\n"
         "🛡️ <b>MODERAÇÃO:</b>\n"
         "• <code>/banperm</code> - Bane permanentemente do grupo.\n"
         "• <code>/blacklist</code> - Apaga mensagens do usuário no grupo.\n"
@@ -326,56 +309,62 @@ async def cmd_help(client: Client, message: Message):
         "• <code>/msg</code> - Transmissão global (Donos).\n"
         "• <code>/chats</code> - Relatório de chats (Donos)."
     )
-    await reply_or_edit(message, text)
+    await reply_or_edit(event, text)
 
-@app.on_message(filters.command("id") & (filters.me | filters.user(list(cache.authorized_users))))
-async def cmd_id(client: Client, message: Message):
-    target_id = await get_target(client, message) or message.from_user.id
-    await reply_or_edit(message, f"🆔 ID: <code>{target_id}</code>")
+@client.on(events.NewMessage(pattern=r'/id'))
+async def cmd_id(event):
+    if not is_authorized(event.sender_id): return
+    target_id = await get_target_from_event(event) or event.sender_id
+    await reply_or_edit(event, f"🆔 ID: <code>{target_id}</code>")
 
-@app.on_message(filters.command("banperm") & (filters.me | filters.user(list(cache.authorized_users))))
-async def cmd_banperm(client: Client, message: Message):
-    target_id = await get_target(client, message)
+@client.on(events.NewMessage(pattern=r'/banperm'))
+async def cmd_banperm(event):
+    if not is_authorized(event.sender_id): return
+    target_id = await get_target_from_event(event)
     if not target_id or is_owner(target_id): return
-    db.add_local_banperm(message.chat.id, target_id, get_reason(message))
-    try: await client.ban_chat_member(message.chat.id, target_id)
+    db.add_local_banperm(event.chat_id, target_id, get_reason_from_event(event))
+    try: await client.edit_permissions(event.chat_id, target_id, view_messages=False)
     except: pass
     user_info = db.get_user_info(target_id)
-    await reply_or_edit(message, f"✅ {user_info} (<code>{target_id}</code>) banido permanentemente deste grupo.")
+    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) banido permanentemente deste grupo.")
 
-@app.on_message(filters.command("blacklist") & (filters.me | filters.user(list(cache.authorized_users))))
-async def cmd_blacklist(client: Client, message: Message):
-    target_id = await get_target(client, message)
+@client.on(events.NewMessage(pattern=r'/blacklist'))
+async def cmd_blacklist(event):
+    if not is_authorized(event.sender_id): return
+    target_id = await get_target_from_event(event)
     if not target_id or is_owner(target_id): return
-    db.add_local_blacklist(message.chat.id, target_id, get_reason(message))
+    db.add_local_blacklist(event.chat_id, target_id, get_reason_from_event(event))
     user_info = db.get_user_info(target_id)
-    await reply_or_edit(message, f"✅ {user_info} (<code>{target_id}</code>) em blacklist local.")
+    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist local.")
 
-@app.on_message(filters.command("allban") & filters.user([OWNER_ID, SECOND_OWNER_ID]))
-async def cmd_allban(client: Client, message: Message):
-    target_id = await get_target(client, message)
+@client.on(events.NewMessage(pattern=r'/allban'))
+async def cmd_allban(event):
+    if not is_owner(event.sender_id): return
+    target_id = await get_target_from_event(event)
     if not target_id or is_owner(target_id): return
-    db.add_global_blacklist(target_id, 'ban', get_reason(message))
+    db.add_global_blacklist(target_id, 'ban', get_reason_from_event(event))
     chats = db.all_chats_detailed()
     for chat in chats:
         if chat['chat_type'] != 'private':
             try:
-                await client.ban_chat_member(chat['chat_id'], target_id)
+                await client.edit_permissions(chat['chat_id'], target_id, view_messages=False)
                 await asyncio.sleep(0.1)
             except: continue
     user_info = db.get_user_info(target_id)
-    await reply_or_edit(message, f"☢️ {user_info} (<code>{target_id}</code>) BANIDO GLOBALMENTE.")
+    await reply_or_edit(event, f"☢️ {user_info} (<code>{target_id}</code>) BANIDO GLOBALMENTE.")
 
-@app.on_message(filters.command("allblack") & filters.user([OWNER_ID, SECOND_OWNER_ID]))
-async def cmd_allblack(client: Client, message: Message):
-    target_id = await get_target(client, message)
+@client.on(events.NewMessage(pattern=r'/allblack'))
+async def cmd_allblack(event):
+    if not is_owner(event.sender_id): return
+    target_id = await get_target_from_event(event)
     if not target_id or is_owner(target_id): return
-    db.add_global_blacklist(target_id, 'black', get_reason(message))
+    db.add_global_blacklist(target_id, 'black', get_reason_from_event(event))
     user_info = db.get_user_info(target_id)
-    await reply_or_edit(message, f"✅ {user_info} (<code>{target_id}</code>) em blacklist global.")
+    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist global.")
 
-@app.on_message(filters.command("listdn") & filters.user([OWNER_ID, SECOND_OWNER_ID]))
-async def cmd_listdn(client: Client, message: Message):
+@client.on(events.NewMessage(pattern=r'/listdn'))
+async def cmd_listdn(event):
+    if not is_owner(event.sender_id): return
     shadow, glob = db.get_all_banned_list_detailed()
     text = "📋 <b>LISTA DE PUNIÇÕES GLOBAIS</b>\n\n"
     
@@ -384,7 +373,7 @@ async def cmd_listdn(client: Client, message: Message):
         for r in shadow:
             info = db.get_user_info(r['user_id'])
             reason = f" | Motivo: {r['reason']}" if r['reason'] else ""
-            text += f"• {info} (<code>{r['user_id']}</code>){reason}\n└ 📅 {format_date(r['created_at'])}\n"
+            text += f"• {info} (<code>{r['user_id']}</code>){reason}\n└ 📅 {datetime.fromtimestamp(r['created_at']).strftime('%d/%m/%Y %H:%M')}\n"
         text += "\n"
 
     if glob:
@@ -392,24 +381,25 @@ async def cmd_listdn(client: Client, message: Message):
         for r in glob:
             info = db.get_user_info(r['user_id'])
             reason = f" | Motivo: {r['reason']}" if r['reason'] else ""
-            text += f"• {info} (<code>{r['user_id']}</code>) [{r['type'].upper()}]{reason}\n└ 📅 {format_date(r['created_at'])}\n"
+            text += f"• {info} (<code>{r['user_id']}</code>) [{r['type'].upper()}]{reason}\n└ 📅 {datetime.fromtimestamp(r['created_at']).strftime('%d/%m/%Y %H:%M')}\n"
     
     if not shadow and not glob:
         text += "Nenhuma punição global registrada."
         
-    await reply_or_edit(message, text)
+    await reply_or_edit(event, text)
 
-@app.on_message(filters.command("chats") & filters.user([OWNER_ID, SECOND_OWNER_ID]))
-async def cmd_chats(client: Client, message: Message):
+@client.on(events.NewMessage(pattern=r'/chats'))
+async def cmd_chats(event):
+    if not is_owner(event.sender_id): return
     rows = db.all_chats_detailed()
     grupos, canais, privados = [], [], []
     
     for r in rows:
         status = "✅" if r['active'] else "❌"
         chat_info = f"{status} {r['title']} (<code>{r['chat_id']}</code>)"
-        if r['chat_type'] in ['group', 'supergroup']: grupos.append(chat_info)
-        elif r['chat_type'] == 'channel': canais.append(chat_info)
-        elif r['chat_type'] == 'private':
+        if r['chat_type'] in ['group', 'supergroup', 'Chat']: grupos.append(chat_info)
+        elif r['chat_type'] in ['channel', 'Channel']: canais.append(chat_info)
+        elif r['chat_type'] in ['private', 'User']:
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
 
@@ -418,33 +408,17 @@ async def cmd_chats(client: Client, message: Message):
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
     
-    ativos_msg = sum(1 for r in rows if r['active'] and r['chat_type'] != 'private')
+    ativos_msg = sum(1 for r in rows if r['active'] and r['chat_type'] not in ['private', 'User'])
     text += "📊 <b>RESUMO:</b>\n"
     text += f"• Grupos/Canais: {len(grupos) + len(canais)}\n"
     text += f"• Ativos p/ Msg: {ativos_msg}\n"
     text += f"• Usuários no Privado: {len(privados)}"
-    await reply_or_edit(message, text)
+    await reply_or_edit(event, text)
 
 # --- INICIALIZAÇÃO ---
-async def start_userbot():
-    cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V2.2 INICIANDO (Compatibilidade Python 3.14)...")
-    await app.start()
-    logger.info("USERBOT ONLINE! Aguardando mensagens...")
-    from pyrogram import idle
-    await idle()
-    await app.stop()
-
 if __name__ == "__main__":
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    
-    try:
-        loop.run_until_complete(start_userbot())
-    except KeyboardInterrupt:
-        pass
-    except Exception as e:
-        logger.error(f"Erro fatal na execução: {e}")
+    cache.load_all(db.conn)
+    logger.info("JTZIN USERBOT V2.3 (TELETHON) INICIANDO...")
+    client.start()
+    logger.info("USERBOT TELETHON ONLINE E OPERACIONAL!")
+    client.run_until_disconnected()
