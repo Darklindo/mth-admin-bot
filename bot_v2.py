@@ -426,7 +426,25 @@ async def cmd_chats(client: Client, message: Message):
     await reply_or_edit(message, text)
 
 # --- INICIALIZAÇÃO ---
-if __name__ == "__main__":
+async def start_userbot():
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V1 INICIANDO...")
-    app.run()
+    logger.info("JTZIN USERBOT V2.2 INICIANDO (Compatibilidade Python 3.14)...")
+    await app.start()
+    logger.info("USERBOT ONLINE! Aguardando mensagens...")
+    from pyrogram import idle
+    await idle()
+    await app.stop()
+
+if __name__ == "__main__":
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    try:
+        loop.run_until_complete(start_userbot())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        logger.error(f"Erro fatal na execução: {e}")
