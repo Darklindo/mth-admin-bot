@@ -72,7 +72,7 @@ class Cache:
                 self.settings[row[0]] = {
                     "antispam": row[1], "antilink": row[2], "captcha_enabled": row[3]
                 }
-            logger.info("Cache carregado com sucesso (V2.7).")
+            logger.info("Cache carregado com sucesso (V2.9).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -232,9 +232,11 @@ async def reply_or_edit(event, text):
 # --- FILTRO DE SEGURANÇA GLOBAL ---
 @client.on(events.NewMessage(incoming=True))
 async def global_security_filter(event):
+    # Ignorar comandos (mensagens que começam com ponto) para não interferir
+    if event.raw_text.startswith("."): return
+    
     if not event.is_group and not event.is_channel: return
     
-    sender = await event.get_sender()
     user_id = event.sender_id
     if not user_id: return
     
@@ -242,6 +244,7 @@ async def global_security_filter(event):
     try:
         chat = await event.get_chat()
         db.register_chat(event.chat_id, getattr(chat, 'title', 'Chat'), chat.__class__.__name__)
+        sender = await event.get_sender()
         if sender:
             db.remember_user(user_id, getattr(sender, 'username', None), getattr(sender, 'first_name', ''))
     except: pass
@@ -276,20 +279,18 @@ async def global_security_filter(event):
 
 # --- COMANDOS DO TELETHON ---
 
-@client.on(events.NewMessage(pattern=r'^\.start', incoming=True, outgoing=True))
+@client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    if not is_authorized(event.sender_id): return
     logger.info(f"Comando recebido: .start de {event.sender_id}")
     text = (
-        "🛡️ <b>Jtzin Userbot V2.7 (Telethon)</b>\n\n"
+        "🛡️ <b>Jtzin Userbot V2.9 (Telethon)</b>\n\n"
         "Userbot de administração avançado operando com estabilidade máxima.\n"
         "Equipe Diamond — Segurança total."
     )
     await reply_or_edit(event, text)
 
-@client.on(events.NewMessage(pattern=r'^\.autorizar', incoming=True, outgoing=True))
+@client.on(events.NewMessage(pattern=r'^\.autorizar', func=lambda e: is_owner(e.sender_id)))
 async def cmd_autorizar(event):
-    if not is_owner(event.sender_id): return
     logger.info(f"Comando recebido: .autorizar de {event.sender_id}")
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -299,12 +300,11 @@ async def cmd_autorizar(event):
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ Usuário {user_info} (<code>{target_id}</code>) autorizado a usar o Userbot.")
 
-@client.on(events.NewMessage(pattern=r'^\.help', incoming=True, outgoing=True))
+@client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
-    if not is_authorized(event.sender_id): return
     logger.info(f"Comando recebido: .help de {event.sender_id}")
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V2.7</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V2.9</b>\n\n"
         "🛡️ <b>MODERAÇÃO:</b>\n"
         "• <code>.banperm</code> - Bane permanentemente do grupo.\n"
         "• <code>.blacklist</code> - Apaga mensagens do usuário no grupo.\n"
@@ -320,16 +320,14 @@ async def cmd_help(event):
     )
     await reply_or_edit(event, text)
 
-@client.on(events.NewMessage(pattern=r'^\.id', incoming=True, outgoing=True))
+@client.on(events.NewMessage(pattern=r'^\.id', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_id(event):
-    if not is_authorized(event.sender_id): return
     logger.info(f"Comando recebido: .id de {event.sender_id}")
     target_id = await get_target_from_event(event) or event.sender_id
     await reply_or_edit(event, f"🆔 ID: <code>{target_id}</code>")
 
-@client.on(events.NewMessage(pattern=r'^\.banperm', incoming=True, outgoing=True))
+@client.on(events.NewMessage(pattern=r'^\.banperm', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_banperm(event):
-    if not is_authorized(event.sender_id): return
     logger.info(f"Comando recebido: .banperm de {event.sender_id}")
     target_id = await get_target_from_event(event)
     if not target_id or is_owner(target_id): return
@@ -339,9 +337,8 @@ async def cmd_banperm(event):
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) banido permanentemente deste grupo.")
 
-@client.on(events.NewMessage(pattern=r'^\.blacklist', incoming=True, outgoing=True))
+@client.on(events.NewMessage(pattern=r'^\.blacklist', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_blacklist(event):
-    if not is_authorized(event.sender_id): return
     logger.info(f"Comando recebido: .blacklist de {event.sender_id}")
     target_id = await get_target_from_event(event)
     if not target_id or is_owner(target_id): return
@@ -349,9 +346,8 @@ async def cmd_blacklist(event):
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist local.")
 
-@client.on(events.NewMessage(pattern=r'^\.allban', incoming=True, outgoing=True))
+@client.on(events.NewMessage(pattern=r'^\.allban', func=lambda e: is_owner(e.sender_id)))
 async def cmd_allban(event):
-    if not is_owner(event.sender_id): return
     logger.info(f"Comando recebido: .allban de {event.sender_id}")
     target_id = await get_target_from_event(event)
     if not target_id or is_owner(target_id): return
@@ -368,9 +364,8 @@ async def cmd_allban(event):
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"☢️ {user_info} (<code>{target_id}</code>) BANIDO GLOBALMENTE.")
 
-@client.on(events.NewMessage(pattern=r'^\.allblack', incoming=True, outgoing=True))
+@client.on(events.NewMessage(pattern=r'^\.allblack', func=lambda e: is_owner(e.sender_id)))
 async def cmd_allblack(event):
-    if not is_owner(event.sender_id): return
     logger.info(f"Comando recebido: .allblack de {event.sender_id}")
     target_id = await get_target_from_event(event)
     if not target_id or is_owner(target_id): return
@@ -378,9 +373,8 @@ async def cmd_allblack(event):
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist global.")
 
-@client.on(events.NewMessage(pattern=r'^\.listdn', incoming=True, outgoing=True))
+@client.on(events.NewMessage(pattern=r'^\.listdn', func=lambda e: is_owner(e.sender_id)))
 async def cmd_listdn(event):
-    if not is_owner(event.sender_id): return
     logger.info(f"Comando recebido: .listdn de {event.sender_id}")
     shadow, glob = db.get_all_banned_list_detailed()
     text = "📋 <b>LISTA DE PUNIÇÕES GLOBAIS</b>\n\n"
@@ -405,9 +399,8 @@ async def cmd_listdn(event):
         
     await reply_or_edit(event, text)
 
-@client.on(events.NewMessage(pattern=r'^\.chats', incoming=True, outgoing=True))
+@client.on(events.NewMessage(pattern=r'^\.chats', func=lambda e: is_owner(e.sender_id)))
 async def cmd_chats(event):
-    if not is_owner(event.sender_id): return
     logger.info(f"Comando recebido: .chats de {event.sender_id}")
     rows = db.all_chats_detailed()
     grupos, canais, privados = [], [], []
@@ -436,7 +429,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V2.7 (TELETHON) INICIANDO...")
+    logger.info("JTZIN USERBOT V2.9 (TELETHON) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE E OPERACIONAL!")
     client.run_until_disconnected()
