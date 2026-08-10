@@ -270,17 +270,18 @@ async def global_security_filter(event):
 
 # --- COMANDOS DO TELETHON ---
 
-@client.on(events.NewMessage(pattern=r'/start'))
+# Adicionamos incoming=True e outgoing=True para capturar comandos de todos os autorizados e de você mesmo
+@client.on(events.NewMessage(pattern=r'^/start', incoming=True, outgoing=True))
 async def cmd_start(event):
     if not is_authorized(event.sender_id): return
     text = (
-        "🛡️ <b>Jtzin Userbot V2.3 (Telethon)</b>\n\n"
+        "🛡️ <b>Jtzin Userbot V2.4 (Telethon)</b>\n\n"
         "Userbot de administração avançado operando com estabilidade máxima.\n"
         "Equipe Diamond — Segurança total."
     )
     await reply_or_edit(event, text)
 
-@client.on(events.NewMessage(pattern=r'/autorizar'))
+@client.on(events.NewMessage(pattern=r'^/autorizar', incoming=True, outgoing=True))
 async def cmd_autorizar(event):
     if not is_owner(event.sender_id): return
     target_id = await get_target_from_event(event)
@@ -291,11 +292,11 @@ async def cmd_autorizar(event):
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ Usuário {user_info} (<code>{target_id}</code>) autorizado a usar o Userbot.")
 
-@client.on(events.NewMessage(pattern=r'/help'))
+@client.on(events.NewMessage(pattern=r'^/help', incoming=True, outgoing=True))
 async def cmd_help(event):
     if not is_authorized(event.sender_id): return
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V2.3</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V2.4</b>\n\n"
         "🛡️ <b>MODERAÇÃO:</b>\n"
         "• <code>/banperm</code> - Bane permanentemente do grupo.\n"
         "• <code>/blacklist</code> - Apaga mensagens do usuário no grupo.\n"
@@ -311,13 +312,13 @@ async def cmd_help(event):
     )
     await reply_or_edit(event, text)
 
-@client.on(events.NewMessage(pattern=r'/id'))
+@client.on(events.NewMessage(pattern=r'^/id', incoming=True, outgoing=True))
 async def cmd_id(event):
     if not is_authorized(event.sender_id): return
     target_id = await get_target_from_event(event) or event.sender_id
     await reply_or_edit(event, f"🆔 ID: <code>{target_id}</code>")
 
-@client.on(events.NewMessage(pattern=r'/banperm'))
+@client.on(events.NewMessage(pattern=r'^/banperm', incoming=True, outgoing=True))
 async def cmd_banperm(event):
     if not is_authorized(event.sender_id): return
     target_id = await get_target_from_event(event)
@@ -328,7 +329,7 @@ async def cmd_banperm(event):
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) banido permanentemente deste grupo.")
 
-@client.on(events.NewMessage(pattern=r'/blacklist'))
+@client.on(events.NewMessage(pattern=r'^/blacklist', incoming=True, outgoing=True))
 async def cmd_blacklist(event):
     if not is_authorized(event.sender_id): return
     target_id = await get_target_from_event(event)
@@ -337,7 +338,7 @@ async def cmd_blacklist(event):
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist local.")
 
-@client.on(events.NewMessage(pattern=r'/allban'))
+@client.on(events.NewMessage(pattern=r'^/allban', incoming=True, outgoing=True))
 async def cmd_allban(event):
     if not is_owner(event.sender_id): return
     target_id = await get_target_from_event(event)
@@ -353,7 +354,7 @@ async def cmd_allban(event):
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"☢️ {user_info} (<code>{target_id}</code>) BANIDO GLOBALMENTE.")
 
-@client.on(events.NewMessage(pattern=r'/allblack'))
+@client.on(events.NewMessage(pattern=r'^/allblack', incoming=True, outgoing=True))
 async def cmd_allblack(event):
     if not is_owner(event.sender_id): return
     target_id = await get_target_from_event(event)
@@ -362,7 +363,7 @@ async def cmd_allblack(event):
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist global.")
 
-@client.on(events.NewMessage(pattern=r'/listdn'))
+@client.on(events.NewMessage(pattern=r'^/listdn', incoming=True, outgoing=True))
 async def cmd_listdn(event):
     if not is_owner(event.sender_id): return
     shadow, glob = db.get_all_banned_list_detailed()
@@ -388,7 +389,7 @@ async def cmd_listdn(event):
         
     await reply_or_edit(event, text)
 
-@client.on(events.NewMessage(pattern=r'/chats'))
+@client.on(events.NewMessage(pattern=r'^/chats', incoming=True, outgoing=True))
 async def cmd_chats(event):
     if not is_owner(event.sender_id): return
     rows = db.all_chats_detailed()
@@ -418,7 +419,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V2.3 (TELETHON) INICIANDO...")
+    logger.info("JTZIN USERBOT V2.4 (TELETHON) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE E OPERACIONAL!")
     client.run_until_disconnected()
