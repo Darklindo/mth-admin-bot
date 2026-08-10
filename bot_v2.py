@@ -9,8 +9,8 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
-from telethon.tl.types import ChatAdminRights, ChannelParticipantsAdmins
-from telethon.errors import RPCError
+from telethon.tl.types import ChatAdminRights, ChannelParticipantsAdmins, Channel, User
+from telethon.errors import RPCError, FloodWaitError
 
 # --- CONFIGURAÇÕES INICIAIS ---
 BASE_DIR = Path(__file__).resolve().parent
@@ -71,7 +71,7 @@ class Cache:
                 self.settings[row[0]] = {
                     "antispam": row[1], "antilink": row[2], "captcha_enabled": row[3]
                 }
-            logger.info("Cache carregado com sucesso (Telethon).")
+            logger.info("Cache carregado com sucesso (V2.6).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -171,9 +171,6 @@ class Database:
     def all_chats_detailed(self):
         return self.execute("SELECT chat_id, title, chat_type, active FROM chats").fetchall()
 
-    def set_chat_active(self, chat_id, status):
-        self.execute("UPDATE chats SET active=? WHERE chat_id=?", (status, int(chat_id)), commit=True)
-
     def remember_user(self, user_id, username, first_name):
         if not user_id: return
         username = (username or "").lower().lstrip("@") or None
@@ -231,14 +228,17 @@ async def reply_or_edit(event, text):
 async def global_security_filter(event):
     if not event.is_group and not event.is_channel: return
     sender = await event.get_sender()
-    if not sender or sender.bot: return
+    if not sender or getattr(sender, 'bot', False): return
     
     user_id = sender.id
     chat_id = event.chat_id
     
-    chat = await event.get_chat()
-    db.register_chat(chat_id, getattr(chat, 'title', 'Chat'), chat.__class__.__name__)
-    db.remember_user(user_id, getattr(sender, 'username', None), getattr(sender, 'first_name', ''))
+    # Registrar chat e usuário
+    try:
+        chat = await event.get_chat()
+        db.register_chat(chat_id, getattr(chat, 'title', 'Chat'), chat.__class__.__name__)
+        db.remember_user(user_id, getattr(sender, 'username', None), getattr(sender, 'first_name', ''))
+    except: pass
 
     if is_owner(user_id): return
 
@@ -257,7 +257,7 @@ async def global_security_filter(event):
 
     # Anti-Link
     if db.get_setting(chat_id, "antilink") and event.text:
-        if "http://" in event.text or "https://" in event.text or "t.me/" in event.text:
+        if any(x in event.text.lower() for x in ["http://", "https://", "t.me/"]):
             if user_id not in cache.link_whitelist[chat_id]:
                 try:
                     perms = await client.get_permissions(chat_id, user_id)
@@ -270,12 +270,11 @@ async def global_security_filter(event):
 
 # --- COMANDOS DO TELETHON ---
 
-# Adicionamos incoming=True e outgoing=True para capturar comandos de todos os autorizados e de você mesmo
 @client.on(events.NewMessage(pattern=r'^\.start', incoming=True, outgoing=True))
 async def cmd_start(event):
     if not is_authorized(event.sender_id): return
     text = (
-        "🛡️ <b>Jtzin Userbot V2.4 (Telethon)</b>\n\n"
+        "🛡️ <b>Jtzin Userbot V2.6 (Telethon)</b>\n\n"
         "Userbot de administração avançado operando com estabilidade máxima.\n"
         "Equipe Diamond — Segurança total."
     )
@@ -296,7 +295,7 @@ async def cmd_autorizar(event):
 async def cmd_help(event):
     if not is_authorized(event.sender_id): return
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V2.5</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V2.6</b>\n\n"
         "🛡️ <b>MODERAÇÃO:</b>\n"
         "• <code>.banperm</code> - Bane permanentemente do grupo.\n"
         "• <code>.blacklist</code> - Apaga mensagens do usuário no grupo.\n"
@@ -346,10 +345,12 @@ async def cmd_allban(event):
     db.add_global_blacklist(target_id, 'ban', get_reason_from_event(event))
     chats = db.all_chats_detailed()
     for chat in chats:
-        if chat['chat_type'] != 'private':
+        if chat['chat_type'] not in ['private', 'User']:
             try:
                 await client.edit_permissions(chat['chat_id'], target_id, view_messages=False)
                 await asyncio.sleep(0.1)
+            except FloodWaitError as e:
+                await asyncio.sleep(e.seconds)
             except: continue
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"☢️ {user_info} (<code>{target_id}</code>) BANIDO GLOBALMENTE.")
@@ -419,7 +420,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V2.4 (TELETHON) INICIANDO...")
+    logger.info("JTZIN USERBOT V2.6 (TELETHON) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE E OPERACIONAL!")
     client.run_until_disconnected()
