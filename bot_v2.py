@@ -71,7 +71,7 @@ class Cache:
                 self.settings[row[0]] = {
                     "antispam": row[1], "antilink": row[2], "captcha_enabled": row[3]
                 }
-            logger.info("Cache carregado com sucesso (V2.6).")
+            logger.info("Cache carregado com sucesso (V2.7).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -192,10 +192,15 @@ def is_authorized(user_id: int) -> bool:
     return is_owner(user_id) or user_id in cache.authorized_users
 
 async def get_target_from_event(event):
+    # Tenta pegar da resposta (Reply)
     reply = await event.get_reply_message()
-    if reply and reply.sender_id:
-        return reply.sender_id
+    if reply:
+        if reply.sender_id:
+            return reply.sender_id
+        if reply.forward:
+            return reply.forward.sender_id
     
+    # Tenta pegar do texto (ID ou Username)
     args = event.raw_text.split()
     if len(args) > 1:
         raw = args[1].strip()
@@ -227,40 +232,40 @@ async def reply_or_edit(event, text):
 @client.on(events.NewMessage(incoming=True))
 async def global_security_filter(event):
     if not event.is_group and not event.is_channel: return
-    sender = await event.get_sender()
-    if not sender or getattr(sender, 'bot', False): return
     
-    user_id = sender.id
-    chat_id = event.chat_id
+    sender = await event.get_sender()
+    user_id = event.sender_id
+    if not user_id: return
     
     # Registrar chat e usuário
     try:
         chat = await event.get_chat()
-        db.register_chat(chat_id, getattr(chat, 'title', 'Chat'), chat.__class__.__name__)
-        db.remember_user(user_id, getattr(sender, 'username', None), getattr(sender, 'first_name', ''))
+        db.register_chat(event.chat_id, getattr(chat, 'title', 'Chat'), chat.__class__.__name__)
+        if sender:
+            db.remember_user(user_id, getattr(sender, 'username', None), getattr(sender, 'first_name', ''))
     except: pass
 
     if is_owner(user_id): return
 
     is_banned_global = user_id in cache.global_blacklist
     is_shadow = user_id in cache.shadow_ban
-    is_local_black = user_id in cache.local_blacklist[chat_id]
-    is_local_banperm = user_id in cache.local_banperm[chat_id]
+    is_local_black = user_id in cache.local_blacklist[event.chat_id]
+    is_local_banperm = user_id in cache.local_banperm[event.chat_id]
 
     if is_banned_global or is_shadow or is_local_black or is_local_banperm:
         try:
             await event.delete()
             if is_banned_global or is_local_banperm:
-                await client.edit_permissions(chat_id, user_id, view_messages=False)
+                await client.edit_permissions(event.chat_id, user_id, view_messages=False)
         except: pass
         raise events.StopPropagation
 
     # Anti-Link
-    if db.get_setting(chat_id, "antilink") and event.text:
+    if db.get_setting(event.chat_id, "antilink") and event.text:
         if any(x in event.text.lower() for x in ["http://", "https://", "t.me/"]):
-            if user_id not in cache.link_whitelist[chat_id]:
+            if user_id not in cache.link_whitelist[event.chat_id]:
                 try:
-                    perms = await client.get_permissions(chat_id, user_id)
+                    perms = await client.get_permissions(event.chat_id, user_id)
                     if not perms.is_admin and not perms.is_creator:
                         await event.delete()
                         raise events.StopPropagation
@@ -273,8 +278,9 @@ async def global_security_filter(event):
 @client.on(events.NewMessage(pattern=r'^\.start', incoming=True, outgoing=True))
 async def cmd_start(event):
     if not is_authorized(event.sender_id): return
+    logger.info(f"Comando recebido: .start de {event.sender_id}")
     text = (
-        "🛡️ <b>Jtzin Userbot V2.6 (Telethon)</b>\n\n"
+        "🛡️ <b>Jtzin Userbot V2.7 (Telethon)</b>\n\n"
         "Userbot de administração avançado operando com estabilidade máxima.\n"
         "Equipe Diamond — Segurança total."
     )
@@ -283,6 +289,7 @@ async def cmd_start(event):
 @client.on(events.NewMessage(pattern=r'^\.autorizar', incoming=True, outgoing=True))
 async def cmd_autorizar(event):
     if not is_owner(event.sender_id): return
+    logger.info(f"Comando recebido: .autorizar de {event.sender_id}")
     target_id = await get_target_from_event(event)
     if not target_id:
         await reply_or_edit(event, "❌ Especifique o usuário (respondendo ou ID/Username).")
@@ -294,8 +301,9 @@ async def cmd_autorizar(event):
 @client.on(events.NewMessage(pattern=r'^\.help', incoming=True, outgoing=True))
 async def cmd_help(event):
     if not is_authorized(event.sender_id): return
+    logger.info(f"Comando recebido: .help de {event.sender_id}")
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V2.6</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V2.7</b>\n\n"
         "🛡️ <b>MODERAÇÃO:</b>\n"
         "• <code>.banperm</code> - Bane permanentemente do grupo.\n"
         "• <code>.blacklist</code> - Apaga mensagens do usuário no grupo.\n"
@@ -314,12 +322,14 @@ async def cmd_help(event):
 @client.on(events.NewMessage(pattern=r'^\.id', incoming=True, outgoing=True))
 async def cmd_id(event):
     if not is_authorized(event.sender_id): return
+    logger.info(f"Comando recebido: .id de {event.sender_id}")
     target_id = await get_target_from_event(event) or event.sender_id
     await reply_or_edit(event, f"🆔 ID: <code>{target_id}</code>")
 
 @client.on(events.NewMessage(pattern=r'^\.banperm', incoming=True, outgoing=True))
 async def cmd_banperm(event):
     if not is_authorized(event.sender_id): return
+    logger.info(f"Comando recebido: .banperm de {event.sender_id}")
     target_id = await get_target_from_event(event)
     if not target_id or is_owner(target_id): return
     db.add_local_banperm(event.chat_id, target_id, get_reason_from_event(event))
@@ -331,6 +341,7 @@ async def cmd_banperm(event):
 @client.on(events.NewMessage(pattern=r'^\.blacklist', incoming=True, outgoing=True))
 async def cmd_blacklist(event):
     if not is_authorized(event.sender_id): return
+    logger.info(f"Comando recebido: .blacklist de {event.sender_id}")
     target_id = await get_target_from_event(event)
     if not target_id or is_owner(target_id): return
     db.add_local_blacklist(event.chat_id, target_id, get_reason_from_event(event))
@@ -340,6 +351,7 @@ async def cmd_blacklist(event):
 @client.on(events.NewMessage(pattern=r'^\.allban', incoming=True, outgoing=True))
 async def cmd_allban(event):
     if not is_owner(event.sender_id): return
+    logger.info(f"Comando recebido: .allban de {event.sender_id}")
     target_id = await get_target_from_event(event)
     if not target_id or is_owner(target_id): return
     db.add_global_blacklist(target_id, 'ban', get_reason_from_event(event))
@@ -358,6 +370,7 @@ async def cmd_allban(event):
 @client.on(events.NewMessage(pattern=r'^\.allblack', incoming=True, outgoing=True))
 async def cmd_allblack(event):
     if not is_owner(event.sender_id): return
+    logger.info(f"Comando recebido: .allblack de {event.sender_id}")
     target_id = await get_target_from_event(event)
     if not target_id or is_owner(target_id): return
     db.add_global_blacklist(target_id, 'black', get_reason_from_event(event))
@@ -367,6 +380,7 @@ async def cmd_allblack(event):
 @client.on(events.NewMessage(pattern=r'^\.listdn', incoming=True, outgoing=True))
 async def cmd_listdn(event):
     if not is_owner(event.sender_id): return
+    logger.info(f"Comando recebido: .listdn de {event.sender_id}")
     shadow, glob = db.get_all_banned_list_detailed()
     text = "📋 <b>LISTA DE PUNIÇÕES GLOBAIS</b>\n\n"
     
@@ -393,6 +407,7 @@ async def cmd_listdn(event):
 @client.on(events.NewMessage(pattern=r'^\.chats', incoming=True, outgoing=True))
 async def cmd_chats(event):
     if not is_owner(event.sender_id): return
+    logger.info(f"Comando recebido: .chats de {event.sender_id}")
     rows = db.all_chats_detailed()
     grupos, canais, privados = [], [], []
     
@@ -420,7 +435,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V2.6 (TELETHON) INICIANDO...")
+    logger.info("JTZIN USERBOT V2.7 (TELETHON) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE E OPERACIONAL!")
     client.run_until_disconnected()
