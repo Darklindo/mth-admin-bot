@@ -72,7 +72,7 @@ class Cache:
                 self.settings[row[0]] = {
                     "antispam": row[1], "antilink": row[2], "captcha_enabled": row[3]
                 }
-            logger.info("Cache carregado com sucesso (V3.2).")
+            logger.info("Cache carregado com sucesso (V3.3).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -120,9 +120,17 @@ class Database:
         self.execute("INSERT OR REPLACE INTO local_banperm(chat_id, user_id, reason, created_at) VALUES(?,?,?,?)", (int(chat_id), int(user_id), reason, int(time.time())), commit=True)
         cache.local_banperm[int(chat_id)].add(int(user_id))
 
+    def remove_local_banperm(self, chat_id, user_id):
+        self.execute("DELETE FROM local_banperm WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)), commit=True)
+        cache.local_banperm[int(chat_id)].discard(int(user_id))
+
     def add_local_blacklist(self, chat_id, user_id, reason=None):
         self.execute("INSERT OR REPLACE INTO local_blacklist(chat_id, user_id, reason, created_at) VALUES(?,?,?,?)", (int(chat_id), int(user_id), reason, int(time.time())), commit=True)
         cache.local_blacklist[int(chat_id)].add(int(user_id))
+
+    def remove_local_blacklist(self, chat_id, user_id):
+        self.execute("DELETE FROM local_blacklist WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)), commit=True)
+        cache.local_blacklist[int(chat_id)].discard(int(user_id))
 
     def add_global_blacklist(self, user_id, type_name="ban", reason=None):
         self.execute("INSERT OR REPLACE INTO global_blacklist(user_id, type, reason, created_at) VALUES(?,?,?,?)", (int(user_id), type_name, reason, int(time.time())), commit=True)
@@ -278,16 +286,76 @@ async def global_security_filter(event):
                     await event.delete()
                     raise events.StopPropagation
 
-# --- COMANDOS DO TELETHON (V3.2 - AUDITADO) ---
+# --- COMANDOS DO TELETHON (V3.3 - REVERSÃO) ---
 
 @client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
     text = (
-        "🛡️ <b>Jtzin Userbot V3.2 (Auditado & Estável)</b>\n\n"
+        "🛡️ <b>Jtzin Userbot V3.3 (Controle Total)</b>\n\n"
         "Userbot de administração avançado operando com estabilidade máxima.\n"
         "Equipe Diamond — Segurança total."
     )
     await reply_or_edit(event, text)
+
+@client.on(events.NewMessage(pattern=r'^\.unban', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_unban(event):
+    target_id = await get_target_from_event(event)
+    if not target_id:
+        await reply_or_edit(event, "❌ Especifique o usuário.")
+        return
+    try:
+        await client.edit_permissions(event.chat_id, target_id, view_messages=True, send_messages=True)
+        db.remove_local_banperm(event.chat_id, target_id)
+        user_info = db.get_user_info(target_id)
+        await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) desbanido com sucesso.")
+    except Exception as e:
+        await reply_or_edit(event, f"❌ Erro ao desbanir: {e}")
+
+@client.on(events.NewMessage(pattern=r'^\.unmute', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_unmute(event):
+    target_id = await get_target_from_event(event)
+    if not target_id:
+        await reply_or_edit(event, "❌ Especifique o usuário.")
+        return
+    try:
+        await client.edit_permissions(event.chat_id, target_id, send_messages=True)
+        user_info = db.get_user_info(target_id)
+        await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) pode falar novamente.")
+    except Exception as e:
+        await reply_or_edit(event, f"❌ Erro ao desmutar: {e}")
+
+@client.on(events.NewMessage(pattern=r'^\.unblacklist', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_unblacklist(event):
+    target_id = await get_target_from_event(event)
+    if not target_id:
+        await reply_or_edit(event, "❌ Especifique o usuário.")
+        return
+    db.remove_local_blacklist(event.chat_id, target_id)
+    user_info = db.get_user_info(target_id)
+    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido da blacklist local.")
+
+@client.on(events.NewMessage(pattern=r'^\.unallblack', func=lambda e: is_owner(e.sender_id)))
+async def cmd_unallblack(event):
+    target_id = await get_target_from_event(event)
+    if not target_id:
+        await reply_or_edit(event, "❌ Especifique o usuário.")
+        return
+    db.remove_global_blacklist(target_id)
+    user_info = db.get_user_info(target_id)
+    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido da blacklist global.")
+
+@client.on(events.NewMessage(pattern=r'^\.unbanperm', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_unbanperm(event):
+    target_id = await get_target_from_event(event)
+    if not target_id:
+        await reply_or_edit(event, "❌ Especifique o usuário.")
+        return
+    db.remove_local_banperm(event.chat_id, target_id)
+    try:
+        await client.edit_permissions(event.chat_id, target_id, view_messages=True)
+    except: pass
+    user_info = db.get_user_info(target_id)
+    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido do banimento permanente.")
 
 @client.on(events.NewMessage(pattern=r'^\.logs', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_logs(event):
@@ -311,7 +379,7 @@ async def cmd_logs(event):
 @client.on(events.NewMessage(pattern=r'^\.listdn', func=lambda e: is_owner(e.sender_id)))
 async def cmd_listdn(event):
     shadow, glob = db.get_all_banned_list_detailed()
-    text = "📋 <b>LISTA DE PUNIÇÕES GLOBAIS (V3.2)</b>\n\n"
+    text = "📋 <b>LISTA DE PUNIÇÕES GLOBAIS</b>\n\n"
     
     if shadow:
         text += "🌑 <b>Shadow Ban:</b>\n"
@@ -348,18 +416,18 @@ async def cmd_autorizar(event):
 @client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V3.2</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V3.3</b>\n\n"
         "🛡️ <b>MODERAÇÃO:</b>\n"
-        "• <code>.banperm</code> | <code>.blacklist</code>\n"
-        "• <code>.ban</code> | <code>.mute</code>\n"
+        "• <code>.ban</code> | <code>.unban</code>\n"
+        "• <code>.mute</code> | <code>.unmute</code>\n"
+        "• <code>.blacklist</code> | <code>.unblacklist</code>\n"
+        "• <code>.banperm</code> | <code>.unbanperm</code>\n"
         "• <code>.shadow</code> | <code>.unshadow</code>\n\n"
         "👑 <b>CONTROLE E LOGS:</b>\n"
-        "• <code>.autorizar</code> - Autoriza usuário.\n"
-        "• <code>.logs</code> - Ver mensagens apagadas.\n"
-        "• <code>.listdn</code> - Relatório global (Donos).\n"
-        "• <code>.allban / .allblack</code> - Donos.\n"
-        "• <code>.msg</code> - Transmissão global.\n"
-        "• <code>.chats</code> - Relatório detalhado."
+        "• <code>.autorizar</code> | <code>.unallblack</code>\n"
+        "• <code>.logs</code> | <code>.listdn</code>\n"
+        "• <code>.allban / .allblack</code>\n"
+        "• <code>.msg</code> | <code>.chats</code>"
     )
     await reply_or_edit(event, text)
 
@@ -468,7 +536,7 @@ async def cmd_chats(event):
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
 
-    text = "📡 <b>RELATÓRIO DE CHATS V3.2</b>\n\n"
+    text = "📡 <b>RELATÓRIO DE CHATS V3.3</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
@@ -480,7 +548,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V3.2 (AUDITADO) INICIANDO...")
+    logger.info("JTZIN USERBOT V3.3 (REVERSÃO) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE E OPERACIONAL!")
     client.run_until_disconnected()
