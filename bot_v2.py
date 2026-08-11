@@ -255,7 +255,7 @@ def get_reason_from_event(event):
     if event.is_reply: return " ".join(args[1:]) if len(args) > 1 else None
     return " ".join(args[2:]) if len(args) > 2 else None
 
-async def reply_or_edit(event, text, delete_after=2):
+async def reply_or_edit(event, text, delete_after=5):
     try:
         msg = None
         if event.out:
@@ -658,7 +658,7 @@ async def cmd_antispy(event):
         await reply_or_edit(event, "❌ Este comando só pode ser usado em grupos ou canais.", delete_after=2)
         return
     bait_msg = await event.respond("🕵️‍♂️ [AntiSpy] Varrendo o chat em busca de espiões... Analisando logs de moderação...")
-    await asyncio.sleep(2)
+    await asyncio.sleep(5)
     try:
         result = await client(functions.channels.GetAdminLogRequest(
             channel=event.chat_id,
@@ -758,7 +758,7 @@ async def cmd_purge(event):
                     logger.error(f"Erro ao deletar mensagem ID {msg.id}: {del_err}")
                     pass
         await status_msg.edit(f"✅ <b>Purge concluído!</b> {deleted_count} mensagens de {info} foram apagadas.", parse_mode='html')
-        await asyncio.sleep(2)
+        await asyncio.sleep(5)
         await status_msg.delete()
     except Exception as e:
         await status_msg.edit(f"❌ Erro ao executar .purge: {e}", parse_mode='html')
@@ -801,7 +801,7 @@ async def cmd_purgeme(event):
                     logger.error(f"Erro ao apagar mensagem própria ID {msg.id}: {del_err}")
                     pass
         await status_msg.edit(f"✅ <b>PurgeMe concluído!</b> {deleted_count} mensagens suas foram apagadas.", parse_mode='html')
-        await asyncio.sleep(2)
+        await asyncio.sleep(5)
         await status_msg.delete()
     except Exception as e:
         await status_msg.edit(f"❌ Erro ao executar .purgeme: {e}", parse_mode='html')
