@@ -88,6 +88,17 @@ def migrate():
         created_at INTEGER
     )""")
 
+    # Logs de mensagens deletadas
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS deleted_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        user_id INTEGER,
+        content TEXT,
+        reason TEXT,
+        created_at INTEGER
+    )""")
+
     # Índices para performance
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_local_blacklist_chat ON local_blacklist(chat_id)")
