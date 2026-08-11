@@ -75,7 +75,7 @@ class Cache:
             except sqlite3.OperationalError:
                 pass
 
-            logger.info("Cache carregado com sucesso (V6.2 - Purge Pro Edition).")
+            logger.info("Cache carregado com sucesso (V6.3 - Pro Control Edition).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -333,7 +333,7 @@ async def global_security_filter(event):
 
 @client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    text = "🛡️ <b>Jtzin Userbot V6.2 (Purge Pro Edition)</b>\n\nEquipe Diamond — Operacional."
+    text = "🛡️ <b>Jtzin Userbot V6.3 (Pro Control Edition)</b>\n\nEquipe Diamond — Operacional."
     await reply_or_edit(event, text, delete_after=2)
 
 @client.on(events.NewMessage(pattern=r'^\.antiblack', func=lambda e: is_authorized(e.sender_id)))
@@ -576,12 +576,23 @@ async def cmd_unallblack(event):
 async def cmd_autorizar(event):
     target_id = await get_target_from_event(event)
     if not target_id:
-        await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=2)
+        await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=5)
         return
     db.add_authorized(target_id)
     user_info = db.get_user_info(target_id)
     db.add_deleted_log(event.chat_id, target_id, "Ação: Autorizar", "Controle", admin_id=event.sender_id)
-    await reply_or_edit(event, f"✅ Usuário {user_info} (<code>{target_id}</code>) autorizado.", delete_after=2)
+    await reply_or_edit(event, f"✅ Usuário {user_info} (<code>{target_id}</code>) autorizado.", delete_after=5)
+
+@client.on(events.NewMessage(pattern=r'^\.desautorizar', func=lambda e: is_owner(e.sender_id)))
+async def cmd_desautorizar(event):
+    target_id = await get_target_from_event(event)
+    if not target_id:
+        await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=5)
+        return
+    db.remove_authorized(target_id)
+    user_info = db.get_user_info(target_id)
+    db.add_deleted_log(event.chat_id, target_id, "Ação: Desautorizar", "Controle", admin_id=event.sender_id)
+    await reply_or_edit(event, f"❌ Acesso revogado para {user_info} (<code>{target_id}</code>).", delete_after=5)
 
 @client.on(events.NewMessage(pattern=r'^\.logs', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_logs(event):
@@ -629,7 +640,7 @@ async def cmd_listdn(event):
 @client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.2</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.3</b>\n\n"
         "🛡️ <b>MODERAÇÃO LOCAL & REVERSÃO:</b>\n"
         "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code> | <code>.purge [qtd]</code> | <code>.purgeme [qtd]</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
@@ -638,7 +649,7 @@ async def cmd_help(event):
         "• <code>.shadow</code> | <code>.unshadow</code>\n\n"
         "👑 <b>CONTROLE NUCLEAS & GLOBAIS:</b>\n"
         "• <code>.allban</code> | <code>.allblack</code> | <code>.unallblack</code>\n"
-        "• <code>.autorizar</code> (Dar acesso a usuários)\n\n"
+        "• <code>.autorizar</code> | <code>.desautorizar</code> (Gestão de Acessos)\n\n"
         "🔍 <b>SEGURANÇA & CONTRA-ESPIONAGEM:</b>\n"
         "• <code>.antiblack on/off</code> (Modo Fênix)\n"
         "• <code>.antispy</code> (Varredura de Espiões)\n"
@@ -860,7 +871,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V6.2 (PURGE PRO EDITION) INICIANDO...")
+    logger.info("JTZIN USERBOT V6.3 (PRO CONTROL EDITION) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE!")
     client.run_until_disconnected()
