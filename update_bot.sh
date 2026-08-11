@@ -1,26 +1,22 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "🚀 Iniciando Atualização MTH ADMIN BOT V3.0 (Versão Blindada)..."
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 
-# Puxar atualizações do Git
-git pull origin master
+echo "Iniciando atualização do Jtzin Userbot..."
+git pull --ff-only origin master
 
-# Garantir que o ambiente virtual existe
-if [ ! -d ".venv" ]; then
-    echo "📦 Criando ambiente virtual..."
+if [[ ! -x ".venv/bin/python" ]]; then
+    echo "Criando ambiente virtual..."
     python -m venv .venv
 fi
 
-# Instalar dependências
-source .venv/bin/activate
-pip install -r requirements.txt
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python migrate_db.py
+chmod +x watchdog.sh update_bot.sh
 
-# Rodar migração
-python migrate_db.py
-
-# Dar permissão ao watchdog
-chmod +x watchdog.sh
-
-echo "✅ Atualização concluída com sucesso!"
-echo "🛡️ Para iniciar o bot com AUTO-RESTART no tmux, use:"
-echo "tmux kill-session -t mthadmin 2>/dev/null; tmux new-session -d -s mthadmin './watchdog.sh'"
+echo "Atualização concluída com sucesso."
+echo "Para iniciar no tmux:"
+echo "tmux kill-session -t mthadmin 2>/dev/null || true; tmux new-session -d -s mthadmin './watchdog.sh'; tmux attach -t mthadmin"

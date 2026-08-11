@@ -5,3 +5,5 @@ data/
 .venv/
 venv/
 *.log
+*.session
+*.session-journal
