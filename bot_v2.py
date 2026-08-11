@@ -75,7 +75,7 @@ class Cache:
             except sqlite3.OperationalError:
                 pass
 
-            logger.info("Cache carregado com sucesso (V6.3 - Pro Control Edition).")
+            logger.info("Cache carregado com sucesso (V6.4 - Stable Precision Edition).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -333,7 +333,7 @@ async def global_security_filter(event):
 
 @client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    text = "🛡️ <b>Jtzin Userbot V6.3 (Pro Control Edition)</b>\n\nEquipe Diamond — Operacional."
+    text = "🛡️ <b>Jtzin Userbot V6.4 (Stable Precision Edition)</b>\n\nEquipe Diamond — Operacional."
     await reply_or_edit(event, text, delete_after=2)
 
 @client.on(events.NewMessage(pattern=r'^\.antiblack', func=lambda e: is_authorized(e.sender_id)))
@@ -372,7 +372,7 @@ async def cmd_kick(event):
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao expulsar: {e}", delete_after=2)
 
-@client.on(events.NewMessage(pattern=r'^\.ban', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.ban(\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_ban(event):
     target_id = await get_target_from_event(event)
     if not target_id or is_authorized(target_id):
@@ -640,7 +640,7 @@ async def cmd_listdn(event):
 @client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.3</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.4</b>\n\n"
         "🛡️ <b>MODERAÇÃO LOCAL & REVERSÃO:</b>\n"
         "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code> | <code>.purge [qtd]</code> | <code>.purgeme [qtd]</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
@@ -730,7 +730,7 @@ async def cmd_delspy(event):
     info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ <b>{info} (<code>{target_id}</code>) removido da lista de espiões.</b>", delete_after=3)
 
-@client.on(events.NewMessage(pattern=r'^\.purge', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.purge(\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_purge(event):
     if not event.is_group and not event.is_channel:
         await reply_or_edit(event, "❌ Este comando só pode ser usado em grupos ou canais.", delete_after=2)
@@ -871,7 +871,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V6.3 (PRO CONTROL EDITION) INICIANDO...")
+    logger.info("JTZIN USERBOT V6.4 (STABLE PRECISION EDITION) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE!")
     client.run_until_disconnected()
