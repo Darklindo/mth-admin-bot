@@ -72,7 +72,7 @@ class Cache:
                 self.settings[row[0]] = {
                     "antispam": row[1], "antilink": row[2], "captcha_enabled": row[3]
                 }
-            logger.info("Cache carregado com sucesso (V3.1).")
+            logger.info("Cache carregado com sucesso (V3.2).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -203,21 +203,24 @@ def is_authorized(user_id: int) -> bool:
     return is_owner(user_id) or user_id in cache.authorized_users
 
 async def get_target_from_event(event):
-    reply = await event.get_reply_message()
-    if reply:
-        if reply.sender_id: return reply.sender_id
-        if reply.forward: return reply.forward.sender_id
-    
-    args = event.raw_text.split()
-    if len(args) > 1:
-        raw = args[1].strip()
-        if raw.startswith("@"):
-            try:
-                user = await client.get_entity(raw)
-                return user.id
-            except: return db.resolve_username(raw)
-        if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
-            return int(raw)
+    try:
+        reply = await event.get_reply_message()
+        if reply:
+            if reply.sender_id: return reply.sender_id
+            if reply.forward: return reply.forward.sender_id
+        
+        args = event.raw_text.split()
+        if len(args) > 1:
+            raw = args[1].strip()
+            if raw.startswith("@"):
+                try:
+                    user = await client.get_entity(raw)
+                    return user.id
+                except: return db.resolve_username(raw)
+            if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
+                return int(raw)
+    except Exception as e:
+        logger.error(f"Erro ao extrair alvo: {e}")
     return None
 
 def get_reason_from_event(event):
@@ -229,12 +232,15 @@ async def reply_or_edit(event, text):
     try:
         if event.out: return await event.edit(text, parse_mode='html')
     except: pass
-    return await event.reply(text, parse_mode='html')
+    try:
+        return await event.reply(text, parse_mode='html')
+    except Exception as e:
+        logger.error(f"Erro ao enviar resposta: {e}")
 
-# --- FILTRO DE SEGURANÇA GLOBAL (ALTA PERFORMANCE + LOGS) ---
+# --- FILTRO DE SEGURANÇA GLOBAL ---
 @client.on(events.NewMessage(incoming=True))
 async def global_security_filter(event):
-    if event.raw_text.startswith("."): return
+    if event.raw_text and event.raw_text.startswith("."): return
     if not event.is_group and not event.is_channel: return
     
     user_id = event.sender_id
@@ -243,7 +249,6 @@ async def global_security_filter(event):
     chat_id = event.chat_id
     reason = None
     
-    # Verificação de Cache
     if user_id in cache.global_blacklist: reason = "Global Blacklist"
     elif user_id in cache.shadow_ban: reason = "Shadow Ban"
     elif user_id in cache.local_blacklist[chat_id]: reason = "Local Blacklist"
@@ -273,12 +278,12 @@ async def global_security_filter(event):
                     await event.delete()
                     raise events.StopPropagation
 
-# --- COMANDOS DO TELETHON (V3.1) ---
+# --- COMANDOS DO TELETHON (V3.2 - AUDITADO) ---
 
 @client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
     text = (
-        "🛡️ <b>Jtzin Userbot V3.1 (Logs Ativados)</b>\n\n"
+        "🛡️ <b>Jtzin Userbot V3.2 (Auditado & Estável)</b>\n\n"
         "Userbot de administração avançado operando com estabilidade máxima.\n"
         "Equipe Diamond — Segurança total."
     )
@@ -303,6 +308,33 @@ async def cmd_logs(event):
     
     await reply_or_edit(event, text)
 
+@client.on(events.NewMessage(pattern=r'^\.listdn', func=lambda e: is_owner(e.sender_id)))
+async def cmd_listdn(event):
+    shadow, glob = db.get_all_banned_list_detailed()
+    text = "📋 <b>LISTA DE PUNIÇÕES GLOBAIS (V3.2)</b>\n\n"
+    
+    if shadow:
+        text += "🌑 <b>Shadow Ban:</b>\n"
+        for r in shadow:
+            info = db.get_user_info(r['user_id'])
+            reason = f" | Motivo: {r['reason']}" if r['reason'] else ""
+            date_str = datetime.fromtimestamp(r['created_at']).strftime('%d/%m/%Y %H:%M')
+            text += f"• {info} (<code>{r['user_id']}</code>){reason}\n└ 📅 {date_str}\n"
+        text += "\n"
+
+    if glob:
+        text += "🌎 <b>Global Blacklist:</b>\n"
+        for r in glob:
+            info = db.get_user_info(r['user_id'])
+            reason = f" | Motivo: {r['reason']}" if r['reason'] else ""
+            date_str = datetime.fromtimestamp(r['created_at']).strftime('%d/%m/%Y %H:%M')
+            text += f"• {info} (<code>{r['user_id']}</code>) [{r['type'].upper()}]{reason}\n└ 📅 {date_str}\n"
+    
+    if not shadow and not glob:
+        text += "Nenhuma punição global registrada."
+        
+    await reply_or_edit(event, text)
+
 @client.on(events.NewMessage(pattern=r'^\.autorizar', func=lambda e: is_owner(e.sender_id)))
 async def cmd_autorizar(event):
     target_id = await get_target_from_event(event)
@@ -316,7 +348,7 @@ async def cmd_autorizar(event):
 @client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V3.1</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V3.2</b>\n\n"
         "🛡️ <b>MODERAÇÃO:</b>\n"
         "• <code>.banperm</code> | <code>.blacklist</code>\n"
         "• <code>.ban</code> | <code>.mute</code>\n"
@@ -324,6 +356,7 @@ async def cmd_help(event):
         "👑 <b>CONTROLE E LOGS:</b>\n"
         "• <code>.autorizar</code> - Autoriza usuário.\n"
         "• <code>.logs</code> - Ver mensagens apagadas.\n"
+        "• <code>.listdn</code> - Relatório global (Donos).\n"
         "• <code>.allban / .allblack</code> - Donos.\n"
         "• <code>.msg</code> - Transmissão global.\n"
         "• <code>.chats</code> - Relatório detalhado."
@@ -435,7 +468,7 @@ async def cmd_chats(event):
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
 
-    text = "📡 <b>RELATÓRIO DE CHATS V3.1</b>\n\n"
+    text = "📡 <b>RELATÓRIO DE CHATS V3.2</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
@@ -447,7 +480,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V3.1 (SISTEMA DE LOGS) INICIANDO...")
+    logger.info("JTZIN USERBOT V3.2 (AUDITADO) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE E OPERACIONAL!")
     client.run_until_disconnected()
