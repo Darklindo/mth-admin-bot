@@ -42,6 +42,7 @@ class Cache:
         self.shadow_ban = set()
         self.link_whitelist = defaultdict(set)
         self.authorized_users = set()
+        self.antiblack_chats = set()
         self.settings = {}
 
     def load_all(self, db_conn):
@@ -68,15 +69,13 @@ class Cache:
             self.authorized_users = {row[0] for row in cursor.fetchall()}
             
             try:
-                cursor = db_conn.execute("SELECT chat_id, antispam, antilink, captcha_enabled FROM settings")
+                cursor = db_conn.execute("SELECT chat_id, antiblack FROM settings WHERE antiblack=1")
                 for row in cursor.fetchall():
-                    self.settings[row[0]] = {
-                        "antispam": row[1], "antilink": row[2], "captcha_enabled": row[3]
-                    }
+                    self.antiblack_chats.add(row[0])
             except sqlite3.OperationalError:
-                logger.warning("Tabela settings incompleta no cache.")
+                pass
 
-            logger.info("Cache carregado com sucesso (V4.5 - Segurança Suprema).")
+            logger.info("Cache carregado com sucesso (V4.6 - Anti-Black).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -108,9 +107,11 @@ class Database:
             (int(chat_id), title or "", str(chat_type), 1, int(time.time())),
             commit=True
         )
-        if int(chat_id) not in cache.settings:
-            self.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (int(chat_id),), commit=True)
-            cache.settings[int(chat_id)] = {"antispam": 1, "antilink": 0, "captcha_enabled": 0}
+
+    def set_antiblack(self, chat_id, state: int):
+        self.execute("INSERT INTO settings(chat_id, antiblack) VALUES(?, ?) ON CONFLICT(chat_id) DO UPDATE SET antiblack=excluded.antiblack", (int(chat_id), state), commit=True)
+        if state == 1: cache.antiblack_chats.add(int(chat_id))
+        else: cache.antiblack_chats.discard(int(chat_id))
 
     def add_authorized(self, user_id):
         self.execute("INSERT OR IGNORE INTO authorized_users(user_id, created_at) VALUES(?,?)", (int(user_id), int(time.time())), commit=True)
@@ -255,14 +256,40 @@ async def reply_or_edit(event, text, delete_after=2):
     except Exception as e:
         logger.error(f"Erro ao enviar/editar resposta: {e}")
 
-# --- FILTRO DE SEGURANÇA GLOBAL & SHADOW BAN (BLINDADO) ---
+# --- SISTEMA ANTIBLACK (AUTO-REPOSTE FÊNIX) ---
+recent_sent_messages = {}
+
+@client.on(events.NewMessage(outgoing=True))
+async def antiblack_tracker(event):
+    if not event.is_group and not event.is_channel: return
+    chat_id = event.chat_id
+    if chat_id in cache.antiblack_chats and event.text and not event.text.startswith("."):
+        recent_sent_messages[event.id] = {
+            "chat_id": chat_id,
+            "text": event.text,
+            "time": time.time()
+        }
+
+@client.on(events.MessageDeleted())
+async def antiblack_resender(event):
+    for chat_id in event.deleted_ids:
+        for msg_id, data in list(recent_sent_messages.items()):
+            if data["chat_id"] == event.chat_id and msg_id == chat_id:
+                if time.time() - data["time"] < 10:  # Se foi apagado em menos de 10s por bot rival
+                    try:
+                        await client.send_message(event.chat_id, f"🛡️ [Anti-Black Ativo]\n{data['text']}")
+                    except Exception as e:
+                        logger.error(f"Erro no auto-reposte antiblack: {e}")
+                del recent_sent_messages[msg_id]
+
+# --- FILTRO DE SEGURANÇA GLOBAL & SHADOW BAN ---
 @client.on(events.NewMessage(incoming=True))
 async def global_security_filter(event):
     if event.raw_text and event.raw_text.startswith("."): return
     if not event.is_group and not event.is_channel: return
     
     user_id = event.sender_id
-    if not user_id or is_authorized(user_id): return  # Imunidade absoluta para donos e autorizados
+    if not user_id or is_authorized(user_id): return
     
     chat_id = event.chat_id
     reason = None
@@ -287,8 +314,26 @@ async def global_security_filter(event):
 
 @client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    text = "🛡️ <b>Jtzin Userbot V4.5 (Segurança Suprema)</b>\n\nEquipe Diamond — Operacional."
+    text = "🛡️ <b>Jtzin Userbot V4.6 (Anti-Black & Fênix)</b>\n\nEquipe Diamond — Operacional."
     await reply_or_edit(event, text, delete_after=2)
+
+@client.on(events.NewMessage(pattern=r'^\.antiblack', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_antiblack(event):
+    args = event.raw_text.split()
+    if len(args) < 2:
+        status = "ATIVADO 🛡️" if event.chat_id in cache.antiblack_chats else "DESATIVADO ❌"
+        await reply_or_edit(event, f"ℹ️ Anti-Black neste chat está: <b>{status}</b>\nUse <code>.antiblack on</code> ou <code>.antiblack off</code>", delete_after=5)
+        return
+    
+    action = args[1].lower()
+    if action in ['on', 'ativar', '1']:
+        db.set_antiblack(event.chat_id, 1)
+        await reply_or_edit(event, "🛡️ <b>Anti-Black ATIVADO!</b> Se algum bot rival apagar suas mensagens, o Userbot irá repostá-las instantaneamente.", delete_after=3)
+    elif action in ['off', 'desativar', '0']:
+        db.set_antiblack(event.chat_id, 0)
+        await reply_or_edit(event, "❌ <b>Anti-Black DESATIVADO.</b>", delete_after=3)
+    else:
+        await reply_or_edit(event, "❌ Use <code>.antiblack on</code> ou <code>.antiblack off</code>", delete_after=2)
 
 @client.on(events.NewMessage(pattern=r'^\.kick', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_kick(event):
@@ -517,7 +562,7 @@ async def cmd_logs(event):
     if not logs:
         await reply_or_edit(event, "📭 Nenhum log registrado recentemente.", delete_after=5)
         return
-    text = "📜 <b>LOGS DE ATIVIDADE (V4.5)</b>\n\n"
+    text = "📜 <b>LOGS DE ATIVIDADE (V4.6)</b>\n\n"
     for log in logs:
         user_info = db.get_user_info(log['user_id'])
         time_str = datetime.fromtimestamp(log['created_at']).strftime('%H:%M:%S')
@@ -557,7 +602,7 @@ async def cmd_listdn(event):
 @client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V4.5</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V4.6</b>\n\n"
         "🛡️ <b>MODERAÇÃO:</b>\n"
         "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
@@ -565,6 +610,7 @@ async def cmd_help(event):
         "• <code>.banperm</code> | <code>.unbanperm</code>\n"
         "• <code>.shadow</code> | <code>.unshadow</code>\n\n"
         "👑 <b>CONTROLE E SEGURANÇA:</b>\n"
+        "• <code>.antiblack on/off</code> (Modo Fênix)\n"
         "• <code>.autorizar</code> | <code>.logs</code>\n"
         "• <code>.allban / .allblack / .unallblack</code>\n"
         "• <code>.msg</code> | <code>.chats</code> | <code>.listdn</code>"
@@ -607,7 +653,7 @@ async def cmd_chats(event):
         elif r['chat_type'] in ['private', 'User']:
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
-    text = "📡 <b>RELATÓRIO DE CHATS V4.5</b>\n\n"
+    text = "📡 <b>RELATÓRIO DE CHATS V4.6</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
@@ -618,7 +664,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V4.5 (SEGURANÇA SUPREMA) INICIANDO...")
+    logger.info("JTZIN USERBOT V4.6 (ANTI-BLACK & FÊNIX) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE!")
     client.run_until_disconnected()
