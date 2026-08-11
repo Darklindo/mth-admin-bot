@@ -40,9 +40,13 @@ THIRD_OWNER_ID = int(os.getenv("THIRD_OWNER_ID", "7916427095"))
 MIN_PURGE_LIMIT = 5
 MAX_PURGE_LIMIT = 100
 MAX_HISTORY_SCAN = 1000
+PURGEALL_MIN_LIMIT = 1
+PURGEALL_MAX_LIMIT = 1000
+PURGEALL_MAX_SCAN = 1200
+PURGEALL_BATCH_SIZE = 50
 DEFAULT_DELETE_AFTER = 5
 STARTED_AT = time.time()
-VERSION = "V6.12"
+VERSION = "V6.13"
 
 DB_PATH = DATA_DIR / "bot.db"
 
@@ -450,6 +454,20 @@ def parse_purge_limit(event, default=50):
     value = values[0]
     if value < MIN_PURGE_LIMIT or value > MAX_PURGE_LIMIT:
         return None, f"❌ A quantidade deve estar entre {MIN_PURGE_LIMIT} e {MAX_PURGE_LIMIT}."
+    return value, None
+
+
+def parse_purgeall_limit(event, default=100):
+    """Valida o limite do purgeall e evita uma limpeza ilimitada acidental."""
+    args = (event.raw_text or "").split()[1:]
+    if not args:
+        return default, None
+    try:
+        value = int(args[0])
+    except (TypeError, ValueError):
+        return None, f"❌ Use <code>.purgeall {PURGEALL_MIN_LIMIT}-{PURGEALL_MAX_LIMIT}</code>."
+    if value < PURGEALL_MIN_LIMIT or value > PURGEALL_MAX_LIMIT:
+        return None, f"❌ A quantidade deve estar entre {PURGEALL_MIN_LIMIT} e {PURGEALL_MAX_LIMIT}."
     return value, None
 
 
@@ -1088,9 +1106,10 @@ async def cmd_health(event):
 @client.on(events.NewMessage(pattern=r'^\.help(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.12</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.13</b>\n\n"
         "🛡️ <b>MODERAÇÃO LOCAL & REVERSÃO:</b>\n"
         "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code> | <code>.purge [5-100]</code> | <code>.purgeme [5-100]</code>\n"
+        "• <code>.purgeall [1-1000]</code> (todos os usuários; somente proprietários)\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
         "• <code>.blacklist</code> | <code>.unblacklist</code> (somente este chat)\n"
         "• <code>.banperm</code> | <code>.unbanperm</code> (somente este chat)\n"
@@ -1175,6 +1194,58 @@ async def cmd_delspy(event):
     db.remove_spy(target_id)
     info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ <b>{info} (<code>{target_id}</code>) removido da lista de espiões.</b>", delete_after=DEFAULT_DELETE_AFTER)
+
+@client.on(events.NewMessage(pattern=r'^\.purgeall(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+async def cmd_purgeall(event):
+    """Apaga mensagens recentes de todos os remetentes no chat atual."""
+    if not event.is_group and not event.is_channel:
+        await reply_or_edit(event, "❌ Este comando só pode ser usado em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+
+    limit, limit_error = parse_purgeall_limit(event)
+    if limit_error:
+        await reply_or_edit(event, limit_error, delete_after=DEFAULT_DELETE_AFTER)
+        return
+
+    status_msg = await event.respond(
+        f"🧹 [PurgeAll] Apagando até {limit} mensagens recentes de todos os usuários..."
+    )
+    message_ids = []
+    try:
+        # Não usamos deleteHistory: somente os IDs coletados nesta janela
+        # são removidos, mantendo o alcance previsível e reversível no código.
+        scan_limit = min(PURGEALL_MAX_SCAN, limit + 2)
+        async for msg in client.iter_messages(event.chat_id, limit=scan_limit):
+            if msg.id in {event.id, status_msg.id}:
+                continue
+            message_ids.append(msg.id)
+            if len(message_ids) >= limit:
+                break
+
+        deleted_count = await delete_message_ids_safely(
+            event.chat_id, message_ids, batch_size=PURGEALL_BATCH_SIZE
+        )
+        await status_msg.edit(
+            f"✅ <b>PurgeAll concluído!</b> {deleted_count} de {limit} mensagens foram apagadas.",
+            parse_mode="html",
+        )
+        await asyncio.sleep(DEFAULT_DELETE_AFTER)
+        await delete_message_safely(status_msg, "status do purgeall")
+    except FloodWaitError as exc:
+        logger.warning("FloodWait no .purgeall por %s segundos", exc.seconds)
+        await asyncio.sleep(exc.seconds)
+        await delete_message_safely(status_msg, "status do purgeall")
+    except Exception as exc:
+        logger.error("Erro ao executar .purgeall: %s", exc)
+        try:
+            await status_msg.edit("❌ Não foi possível concluir o .purgeall.", parse_mode="html")
+            await asyncio.sleep(DEFAULT_DELETE_AFTER)
+        except Exception:
+            pass
+        await delete_message_safely(status_msg, "status do purgeall")
+
+    await delete_command_safely(event)
+
 
 @client.on(events.NewMessage(pattern=r'^\.purge(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_purge(event):
