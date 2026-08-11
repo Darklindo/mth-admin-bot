@@ -8,7 +8,7 @@ DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "bot.db"
 
 def migrate():
-    print("Iniciando Migração V4.6 (Anti-Black & Auto-Resend)...")
+    print("Iniciando Migração V5.2 (AntiSpy Persistente)...")
     conn = sqlite3.connect(DB_PATH)
     
     conn.execute("""
@@ -94,6 +94,13 @@ def migrate():
         admin_id INTEGER
     )""")
 
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS detected_spies (
+        user_id INTEGER PRIMARY KEY,
+        chat_id INTEGER,
+        detected_at INTEGER
+    )""")
+
     cursor = conn.cursor()
     
     cursor.execute("PRAGMA table_info(deleted_logs)")
@@ -114,7 +121,7 @@ def migrate():
 
     conn.commit()
     conn.close()
-    print("Migração V4.6 concluída com sucesso!")
+    print("Migração V5.2 concluída com sucesso!")
 
 if __name__ == "__main__":
     migrate()
