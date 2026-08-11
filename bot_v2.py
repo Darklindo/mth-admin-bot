@@ -9,7 +9,7 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, functions, types
-from telethon.tl.types import ChatAdminRights, ChannelParticipantsAdmins, Channel, User, MessageMediaPhoto, MessageMediaDocument
+from telethon.tl.types import ChatAdminRights, ChannelParticipantsAdmins, Channel, User
 from telethon.errors import RPCError, FloodWaitError, ChatAdminRequiredError, UserAdminInvalidError
 
 # --- CONFIGURAÇÕES INICIAIS ---
@@ -67,12 +67,12 @@ class Cache:
             cursor = db_conn.execute("SELECT user_id FROM authorized_users")
             self.authorized_users = {row[0] for row in cursor.fetchall()}
             
-            cursor = db_conn.execute("SELECT chat_id, antispam, antilink, captcha_enabled, protect_porn FROM settings")
+            cursor = db_conn.execute("SELECT chat_id, antispam, antilink, captcha_enabled FROM settings")
             for row in cursor.fetchall():
                 self.settings[row[0]] = {
-                    "antispam": row[1], "antilink": row[2], "captcha_enabled": row[3], "protect_porn": row[4]
+                    "antispam": row[1], "antilink": row[2], "captcha_enabled": row[3]
                 }
-            logger.info("Cache carregado com sucesso (V3.8).")
+            logger.info("Cache carregado com sucesso (V4.0).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -106,7 +106,7 @@ class Database:
         )
         if int(chat_id) not in cache.settings:
             self.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (int(chat_id),), commit=True)
-            cache.settings[int(chat_id)] = {"antispam": 1, "antilink": 0, "captcha_enabled": 0, "protect_porn": 0}
+            cache.settings[int(chat_id)] = {"antispam": 1, "antilink": 0, "captcha_enabled": 0}
 
     def add_authorized(self, user_id):
         self.execute("INSERT OR IGNORE INTO authorized_users(user_id, created_at) VALUES(?,?)", (int(user_id), int(time.time())), commit=True)
@@ -236,14 +236,19 @@ def get_reason_from_event(event):
     if event.is_reply: return " ".join(args[1:]) if len(args) > 1 else None
     return " ".join(args[2:]) if len(args) > 2 else None
 
-async def reply_or_edit(event, text):
+async def reply_or_edit(event, text, delete_after=2):
     try:
-        if event.out: return await event.edit(text, parse_mode='html')
-    except: pass
-    try:
-        return await event.reply(text, parse_mode='html')
+        msg = None
+        if event.out:
+            msg = await event.edit(text, parse_mode='html')
+        else:
+            msg = await event.reply(text, parse_mode='html')
+        
+        if delete_after and msg:
+            await asyncio.sleep(delete_after)
+            await msg.delete()
     except Exception as e:
-        logger.error(f"Erro ao enviar resposta: {e}")
+        logger.error(f"Erro ao enviar/editar resposta: {e}")
 
 # --- FILTRO DE SEGURANÇA GLOBAL ---
 @client.on(events.NewMessage(incoming=True))
@@ -257,7 +262,6 @@ async def global_security_filter(event):
     chat_id = event.chat_id
     reason = None
     
-    # 1. Verificação de Punições
     if user_id in cache.global_blacklist: reason = "Global Blacklist"
     elif user_id in cache.shadow_ban: reason = "Shadow Ban"
     elif user_id in cache.local_blacklist[chat_id]: reason = "Local Blacklist"
@@ -272,22 +276,7 @@ async def global_security_filter(event):
         except: pass
         raise events.StopPropagation
 
-    # 2. Anti-Porn (Imagens, GIFs, Stickers)
-    if db.get_setting(chat_id, "protect_porn"):
-        is_media = event.photo or event.gif or event.sticker or (event.document and event.document.mime_type.startswith('image/'))
-        if is_media:
-            try:
-                perms = await client.get_permissions(chat_id, user_id)
-                if not perms.is_admin and not perms.is_creator:
-                    db.add_deleted_log(chat_id, user_id, "[Mídia Bloqueada]", "Anti-Porn")
-                    await event.delete()
-                    raise events.StopPropagation
-            except:
-                db.add_deleted_log(chat_id, user_id, "[Mídia Bloqueada]", "Anti-Porn")
-                await event.delete()
-                raise events.StopPropagation
-
-    # 3. Anti-Link
+    # Anti-Link
     if db.get_setting(chat_id, "antilink") and event.text:
         if any(x in event.text.lower() for x in ["http://", "https://", "t.me/"]):
             if user_id not in cache.link_whitelist[chat_id]:
@@ -302,26 +291,12 @@ async def global_security_filter(event):
                     await event.delete()
                     raise events.StopPropagation
 
-# --- COMANDOS DO TELETHON (V3.8 - ANTI-PORN & PERMISSÕES) ---
+# --- COMANDOS DO TELETHON (V4.0 - AUTO-DELEÇÃO 2S) ---
 
 @client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    text = (
-        "🛡️ <b>Jtzin Userbot V3.8 (Anti-Porn)</b>\n\n"
-        "Userbot de administração avançado operando com estabilidade máxima.\n"
-        "Equipe Diamond — Segurança total."
-    )
+    text = "🛡️ <b>Jtzin Userbot V4.0 (Limpeza Total)</b>\n\nEquipe Diamond — Segurança total."
     await reply_or_edit(event, text)
-
-@client.on(events.NewMessage(pattern=r'^\.protectporn', func=lambda e: is_authorized(e.sender_id)))
-async def cmd_protectporn(event):
-    db.set_setting(event.chat_id, "protect_porn", 1)
-    await reply_or_edit(event, "✅ <b>Proteção Anti-Porn ATIVADA!</b>\nImagens, GIFs e Stickers agora são permitidos apenas para Admins.")
-
-@client.on(events.NewMessage(pattern=r'^\.unprotectporn', func=lambda e: is_authorized(e.sender_id)))
-async def cmd_unprotectporn(event):
-    db.set_setting(event.chat_id, "protect_porn", 0)
-    await reply_or_edit(event, "❌ <b>Proteção Anti-Porn DESATIVADA!</b>\nTodos os usuários podem mandar mídias novamente.")
 
 @client.on(events.NewMessage(pattern=r'^\.unban', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unban(event):
@@ -338,7 +313,7 @@ async def cmd_unban(event):
         user_info = db.get_user_info(target_id)
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) desbanido totalmente.")
     except ChatAdminRequiredError:
-        await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador neste grupo.")
+        await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.")
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao desbanir: {e}")
 
@@ -354,7 +329,7 @@ async def cmd_unmute(event):
         user_info = db.get_user_info(target_id)
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) pode falar novamente.")
     except ChatAdminRequiredError:
-        await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador neste grupo.")
+        await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.")
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao desmutar: {e}")
 
@@ -397,7 +372,7 @@ async def cmd_unbanperm(event):
         user_info = db.get_user_info(target_id)
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) totalmente perdoado.")
     except ChatAdminRequiredError:
-        await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador neste grupo.")
+        await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.")
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao desbanir: {e}")
 
@@ -418,7 +393,7 @@ async def cmd_logs(event):
     if not logs:
         await reply_or_edit(event, "📭 Nenhum log registrado recentemente.")
         return
-    text = "📜 <b>LOGS DE ATIVIDADE (V3.8)</b>\n\n"
+    text = "📜 <b>LOGS DE ATIVIDADE (V4.0)</b>\n\n"
     for log in logs:
         user_info = db.get_user_info(log['user_id'])
         time_str = datetime.fromtimestamp(log['created_at']).strftime('%H:%M:%S')
@@ -430,10 +405,12 @@ async def cmd_logs(event):
             text += f"👮 <b>Admin:</b> {admin_info}\n"
         text += f"💬 <b>Conteúdo:</b> <i>{content}</i>\n"
         text += "------------------\n"
-    await reply_or_edit(event, text)
+    await reply_or_edit(event, text, delete_after=10) # Logs ficam mais tempo na tela
 
 @client.on(events.NewMessage(pattern=r'^\.listdn', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_listdn(event):
+    # Recarrega cache antes de listar para garantir que não está bugado
+    cache.load_all(db.conn)
     shadow, glob = db.get_all_banned_list_detailed()
     text = "📋 <b>LISTA DE PUNIÇÕES GLOBAIS</b>\n\n"
     if shadow:
@@ -453,7 +430,7 @@ async def cmd_listdn(event):
             text += f"• {info} (<code>{r['user_id']}</code>) [{r['type'].upper()}]{reason}\n└ 📅 {date_str}\n"
     if not shadow and not glob:
         text += "Nenhuma punição global registrada."
-    await reply_or_edit(event, text)
+    await reply_or_edit(event, text, delete_after=10) # Lista fica mais tempo na tela
 
 @client.on(events.NewMessage(pattern=r'^\.autorizar', func=lambda e: is_owner(e.sender_id)))
 async def cmd_autorizar(event):
@@ -468,7 +445,7 @@ async def cmd_autorizar(event):
 @client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V3.8</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V4.0</b>\n\n"
         "🛡️ <b>MODERAÇÃO:</b>\n"
         "• <code>.ban</code> | <code>.unban</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
@@ -476,12 +453,11 @@ async def cmd_help(event):
         "• <code>.banperm</code> | <code>.unbanperm</code>\n"
         "• <code>.shadow</code> | <code>.unshadow</code>\n\n"
         "👑 <b>CONTROLE E SEGURANÇA:</b>\n"
-        "• <code>.autorizar</code> | <code>.protectporn</code>\n"
-        "• <code>.unprotectporn</code> | <code>.logs</code>\n"
+        "• <code>.autorizar</code> | <code>.logs</code>\n"
         "• <code>.allban / .allblack</code>\n"
         "• <code>.msg</code> | <code>.chats</code> | <code>.listdn</code>"
     )
-    await reply_or_edit(event, text)
+    await reply_or_edit(event, text, delete_after=15)
 
 @client.on(events.NewMessage(pattern=r'^\.id', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_id(event):
@@ -498,7 +474,7 @@ async def cmd_banperm(event):
         user_info = db.get_user_info(target_id)
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) banido permanentemente.")
     except ChatAdminRequiredError:
-        await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador neste grupo.")
+        await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.")
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao banir: {e}")
 
@@ -575,18 +551,18 @@ async def cmd_chats(event):
         elif r['chat_type'] in ['private', 'User']:
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
-    text = "📡 <b>RELATÓRIO DE CHATS V3.8</b>\n\n"
+    text = "📡 <b>RELATÓRIO DE CHATS V4.0</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
     text += "📊 <b>RESUMO:</b>\n"
     text += f"• Grupos/Canais: {len(grupos) + len(canais)}\n• Usuários: {len(privados)}"
-    await reply_or_edit(event, text)
+    await reply_or_edit(event, text, delete_after=15)
 
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V3.8 (ANTI-PORN) INICIANDO...")
+    logger.info("JTZIN USERBOT V4.0 (LIMPEZA TOTAL) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE E OPERACIONAL!")
     client.run_until_disconnected()
