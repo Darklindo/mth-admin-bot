@@ -41,6 +41,8 @@ MIN_PURGE_LIMIT = 5
 MAX_PURGE_LIMIT = 100
 MAX_HISTORY_SCAN = 1000
 DEFAULT_DELETE_AFTER = 5
+STARTED_AT = time.time()
+VERSION = "V6.12"
 
 DB_PATH = DATA_DIR / "bot.db"
 
@@ -102,7 +104,7 @@ class Cache:
             except sqlite3.OperationalError:
                 pass
 
-            logger.info("Cache carregado com sucesso (V6.11 - Stability Audit).")
+            logger.info("Cache carregado com sucesso (V6.12 - Status e Health).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -232,6 +234,30 @@ class Database:
         rows = self.fetchall("SELECT chat_id, title, chat_type, active FROM chats")
         return [dict(r) for r in rows]
 
+    def get_diagnostic_counts(self):
+        tables = {
+            "chats": "chats",
+            "users": "users",
+            "authorized": "authorized_users",
+            "global_blacklist": "global_blacklist",
+            "local_blacklist": "local_blacklist",
+            "local_banperm": "local_banperm",
+            "shadow": "shadow_ban",
+            "deleted_logs": "deleted_logs",
+            "spies": "detected_spies",
+        }
+        counts = {}
+        for key, table in tables.items():
+            row = self.fetchone(f"SELECT COUNT(*) AS total FROM {table}")
+            counts[key] = int(row["total"]) if row is not None else 0
+        return counts
+
+    def get_db_size_bytes(self):
+        try:
+            return int(self.path.stat().st_size)
+        except (OSError, TypeError, ValueError):
+            return 0
+
     def remember_user(self, user_id, username, first_name):
         if not user_id: return
         username = (username or "").lower().lstrip("@") or None
@@ -339,6 +365,74 @@ def format_timestamp(value, fmt="%d/%m/%Y %H:%M"):
         return datetime.fromtimestamp(timestamp).strftime(fmt) if timestamp > 0 else "-"
     except (TypeError, ValueError, OverflowError, OSError):
         return "-"
+
+
+def format_duration(seconds):
+    total = max(0, int(seconds or 0))
+    days, remainder = divmod(total, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    if minutes or hours or days:
+        parts.append(f"{minutes}min")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+def get_session_state():
+    try:
+        filename = getattr(client.session, "filename", None)
+        if filename and Path(str(filename)).exists():
+            return "✅ arquivo de sessão presente"
+    except (OSError, TypeError, ValueError):
+        pass
+    return "⚠️ arquivo de sessão não localizado"
+
+
+def get_cache_counts():
+    return {
+        "global_blacklist": len(cache.global_blacklist),
+        "local_blacklist": sum(len(users) for users in cache.local_blacklist.values()),
+        "local_banperm": sum(len(users) for users in cache.local_banperm.values()),
+        "shadow": len(cache.shadow_ban),
+        "authorized": len(cache.authorized_users),
+        "antiblack_chats": len(cache.antiblack_chats),
+    }
+
+
+def format_bytes(value):
+    size = float(max(0, value or 0))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return "0 B"
+
+
+async def get_chat_permission_health(chat_id):
+    if chat_id is None:
+        return "⚪ não aplicável fora de chats"
+    try:
+        permissions = await client.get_permissions(chat_id, "me")
+        required = {
+            "apagar mensagens": "delete_messages",
+            "banir/restringir": "ban_users",
+            "gerenciar informações": "change_info",
+        }
+        missing = [label for label, attribute in required.items() if not getattr(permissions, attribute, False)]
+        if not missing:
+            return "✅ permissões principais disponíveis"
+        return "⚠️ ausentes: " + ", ".join(missing)
+    except (RPCError, ValueError) as exc:
+        logger.debug("Não foi possível verificar permissões no chat %s: %s", chat_id, exc)
+        return "⚠️ não foi possível consultar as permissões"
+    except Exception as exc:
+        logger.debug("Falha inesperada ao verificar permissões no chat %s: %s", chat_id, exc)
+        return "⚠️ não foi possível consultar as permissões"
 
 
 def get_reason_from_event(event):
@@ -584,7 +678,7 @@ async def global_security_filter(event):
 
 @client.on(events.NewMessage(pattern=r'^\.start(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    text = "🛡️ <b>Jtzin Userbot V6.11 (Stability Audit)</b>\n\nEquipe Diamond — Operacional."
+    text = f"🛡️ <b>Jtzin Userbot {VERSION} (Status e Health)</b>\n\nEquipe Diamond — Operacional."
     await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.antiblack(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
@@ -858,7 +952,7 @@ async def cmd_logs(event):
     if not logs:
         await reply_or_edit(event, "📭 Nenhum log registrado recentemente.", delete_after=5)
         return
-    text = "📜 <b>LOGS DE ATIVIDADE (V6.11)</b>\n\n"
+    text = f"📜 <b>LOGS DE ATIVIDADE ({VERSION})</b>\n\n"
     for log in logs:
         user_info = db.get_user_info(log['user_id'])
         time_str = format_timestamp(log['created_at'], '%H:%M:%S')
@@ -898,10 +992,103 @@ async def cmd_listdn(event):
         text += "Nenhuma punição global registrada."
     await reply_or_edit(event, text, delete_after=15)
 
+@client.on(events.NewMessage(pattern=r'^\.status(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_status(event):
+    started = time.perf_counter()
+    api_state = "⚠️ indisponível"
+    api_latency = "-"
+    identity = "não confirmada"
+    try:
+        api_started = time.perf_counter()
+        me = await client.get_me()
+        api_latency = f"{(time.perf_counter() - api_started) * 1000:.0f} ms"
+        identity = escape(str(getattr(me, "username", None) or getattr(me, "first_name", None) or me.id))
+        api_state = "✅ conectada"
+    except (RPCError, asyncio.TimeoutError) as exc:
+        logger.warning("Falha ao consultar status da API: %s", exc)
+    except Exception as exc:
+        logger.warning("Falha inesperada ao consultar status da API: %s", exc)
+
+    counts = get_cache_counts()
+    db_counts = db.get_diagnostic_counts()
+    chats = db.all_chats_detailed()
+    active_chats = sum(1 for chat in chats if chat.get("active"))
+    text = (
+        f"📊 <b>STATUS DO JTZIN USERBOT {VERSION}</b>\n\n"
+        f"• Estado: <b>{'✅ online' if client.is_connected() else '⚠️ desconectado'}</b>\n"
+        f"• API Telegram: {api_state} | Latência: <code>{api_latency}</code>\n"
+        f"• Conta: <code>{identity}</code>\n"
+        f"• Uptime: <code>{format_duration(time.time() - STARTED_AT)}</code>\n"
+        f"• Chats registrados: <code>{len(chats)}</code> | Ativos: <code>{active_chats}</code>\n"
+        f"• Autorizados: <code>{counts['authorized']}</code>\n"
+        f"• Blacklists: local <code>{counts['local_blacklist']}</code> | global <code>{counts['global_blacklist']}</code>\n"
+        f"• Banimentos locais: <code>{counts['local_banperm']}</code> | Shadow: <code>{counts['shadow']}</code>\n"
+        f"• Logs: <code>{db_counts['deleted_logs']}</code> | Banco: <code>{format_bytes(db.get_db_size_bytes())}</code>"
+    )
+    elapsed = (time.perf_counter() - started) * 1000
+    text += f"\n• Diagnóstico concluído em: <code>{elapsed:.0f} ms</code>"
+    await reply_or_edit(event, text, delete_after=15)
+
+
+@client.on(events.NewMessage(pattern=r'^\.health(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_health(event):
+    checks = []
+    critical_ok = True
+
+    try:
+        integrity = db.fetchone("PRAGMA integrity_check")
+        db_ok = bool(integrity and str(integrity[0]).lower() == "ok")
+    except Exception as exc:
+        logger.error("Falha no integrity_check do banco: %s", exc)
+        db_ok = False
+    checks.append(("SQLite", "✅ íntegro" if db_ok else "❌ falha"))
+    critical_ok = critical_ok and db_ok
+
+    connected = bool(client.is_connected())
+    checks.append(("Conexão", "✅ conectada" if connected else "❌ desconectada"))
+    critical_ok = critical_ok and connected
+
+    authorized_session = False
+    if connected:
+        try:
+            authorized_session = bool(await client.is_user_authorized())
+        except (RPCError, asyncio.TimeoutError) as exc:
+            logger.warning("Falha ao confirmar autorização da sessão: %s", exc)
+        except Exception as exc:
+            logger.warning("Falha inesperada ao confirmar sessão: %s", exc)
+    checks.append(("Sessão Telegram", "✅ autorizada" if authorized_session else "⚠️ não confirmada"))
+    critical_ok = critical_ok and authorized_session
+
+    try:
+        db_counts = db.get_diagnostic_counts()
+        counts_ok = True
+    except Exception as exc:
+        logger.error("Falha ao consultar contadores do banco: %s", exc)
+        db_counts = {}
+        counts_ok = False
+    checks.append(("Esquema", "✅ tabelas acessíveis" if counts_ok else "❌ consulta falhou"))
+    critical_ok = critical_ok and counts_ok
+
+    permission_state = await get_chat_permission_health(event.chat_id) if (event.is_group or event.is_channel) else "⚪ use em grupo/canal para verificar permissões"
+    checks.append(("Permissões no chat", permission_state))
+
+    check_text = "\n".join(f"• <b>{escape(name)}:</b> {value}" for name, value in checks)
+    cache_counts = get_cache_counts()
+    text = (
+        f"🩺 <b>HEALTH CHECK — JTZIN USERBOT {VERSION}</b>\n\n"
+        f"{check_text}\n\n"
+        f"• Sessão local: {get_session_state()}\n"
+        f"• Cache: <code>{sum(cache_counts.values())}</code> itens monitorados\n"
+        f"• Registros no banco: <code>{db_counts.get('deleted_logs', 0)}</code> logs / <code>{db_counts.get('chats', 0)}</code> chats\n"
+        f"• Resultado geral: <b>{'✅ saudável' if critical_ok else '⚠️ requer atenção'}</b>"
+    )
+    await reply_or_edit(event, text, delete_after=15)
+
+
 @client.on(events.NewMessage(pattern=r'^\.help(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.11</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.12</b>\n\n"
         "🛡️ <b>MODERAÇÃO LOCAL & REVERSÃO:</b>\n"
         "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code> | <code>.purge [5-100]</code> | <code>.purgeme [5-100]</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
@@ -916,6 +1103,7 @@ async def cmd_help(event):
         "• <code>.antispy</code> (Varredura de Espiões)\n"
         "• <code>.listspy</code> | <code>.delspy</code> (Gestão de Espiões)\n\n"
         "🛠️ <b>UTILITÁRIOS & RELATÓRIOS:</b>\n"
+        "• <code>.status</code> | <code>.health</code> (Diagnóstico rápido)\n"
         "• <code>.msg</code> (Broadcast Global)\n"
         "• <code>.chats</code> (Lista de Chats)\n"
         "• <code>.listdn</code> (Punições Globais)\n"
@@ -1101,7 +1289,7 @@ async def cmd_chats(event):
         elif r['chat_type'] in ['private', 'User']:
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
-    text = "📡 <b>RELATÓRIO DE CHATS V6.11</b>\n\n"
+    text = f"📡 <b>RELATÓRIO DE CHATS {VERSION}</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
@@ -1112,7 +1300,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V6.11 (STABILITY AUDIT) INICIANDO...")
+    logger.info("JTZIN USERBOT %s (STATUS E HEALTH) INICIANDO...", VERSION)
     client.start()
     logger.info("USERBOT TELETHON ONLINE!")
     client.run_until_disconnected()
