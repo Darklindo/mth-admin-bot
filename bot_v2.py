@@ -102,7 +102,7 @@ class Cache:
             except sqlite3.OperationalError:
                 pass
 
-            logger.info("Cache carregado com sucesso (V6.9 - Stability Audit).")
+            logger.info("Cache carregado com sucesso (V6.10 - Stability Audit).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -401,6 +401,17 @@ async def delete_message_ids_safely(chat_id, message_ids, batch_size=100):
     return deleted
 
 
+async def log_deleted_in_background(chat_id, user_id, content, reason, admin_id=None):
+    """Registra auditoria depois da exclusão sem atrasar a operação crítica."""
+    try:
+        # Entrega o controle ao loop para que a exclusão já enviada ao Telegram
+        # não fique atrás de um commit SQLite síncrono.
+        await asyncio.sleep(0)
+        db.add_deleted_log(chat_id, user_id, content, reason, admin_id=admin_id)
+    except Exception as exc:
+        logger.error(f"Falha ao registrar log assíncrono: {exc}")
+
+
 async def reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER):
     msg = None
     try:
@@ -443,41 +454,53 @@ async def send_broadcast_payload(chat_id, reply, text=None):
         await client.send_message(chat_id, text if text is not None else (reply.raw_text or ""))
 
 # --- REGISTRO DE CHATS E USUÁRIOS ---
-@client.on(events.NewMessage)
-async def chat_registry(event):
+registered_chat_ids = set()
+registered_user_ids = set()
+
+
+async def register_chat_and_user(event):
     try:
-        if not event.chat_id:
+        chat_id = event.chat_id
+        if not chat_id:
             return
-        # O filtro de segurança roda depois deste handler no Telethon. Não
-        # faça consultas de rede nem gravações SQLite para mensagens que já
-        # estão marcadas no cache como bloqueadas; isso preserva a latência de
-        # exclusão e deixa o filtro global agir imediatamente em seguida.
+        if chat_id not in registered_chat_ids:
+            entity = await event.get_chat()
+            if event.is_group:
+                chat_type = "group"
+            elif event.is_channel:
+                chat_type = "channel"
+            else:
+                chat_type = "private"
+            title = getattr(entity, "title", None) or getattr(entity, "first_name", None) or ""
+            db.register_chat(chat_id, title, chat_type)
+            registered_chat_ids.add(chat_id)
+
         sender_id = event.sender_id
-        if sender_id and not is_immune(sender_id):
-            chat_id = event.chat_id
-            if (
-                sender_id in cache.global_blacklist
-                or sender_id in cache.shadow_ban
-                or sender_id in cache.local_blacklist[chat_id]
-                or sender_id in cache.local_banperm[chat_id]
-            ):
-                return
-        if (event.raw_text or "").startswith("."):
-            return
-        entity = await event.get_chat()
-        if event.is_group:
-            chat_type = "group"
-        elif event.is_channel:
-            chat_type = "channel"
-        else:
-            chat_type = "private"
-        title = getattr(entity, "title", None) or getattr(entity, "first_name", None) or ""
-        db.register_chat(event.chat_id, title, chat_type)
-        sender = await event.get_sender()
-        if isinstance(sender, User):
-            db.remember_user(sender.id, sender.username, sender.first_name)
+        if sender_id and sender_id not in registered_user_ids:
+            sender = await event.get_sender()
+            registered_user_ids.add(sender_id)
+            if isinstance(sender, User):
+                db.remember_user(sender.id, sender.username, sender.first_name)
     except Exception as exc:
         logger.debug(f"Falha não crítica ao registrar chat/usuário: {exc}")
+
+
+@client.on(events.NewMessage)
+async def chat_registry(event):
+    if not event.chat_id or (event.raw_text or "").startswith("."):
+        return
+    sender_id = event.sender_id
+    if sender_id and not is_immune(sender_id):
+        chat_id = event.chat_id
+        if (
+            sender_id in cache.global_blacklist
+            or sender_id in cache.shadow_ban
+            or sender_id in cache.local_blacklist.get(chat_id, ())
+            or sender_id in cache.local_banperm.get(chat_id, ())
+        ):
+            return
+    # Registro é secundário: nunca deve bloquear o filtro de exclusão.
+    asyncio.create_task(register_chat_and_user(event))
 
 
 # --- SISTEMA ANTIBLACK (AUTO-REPOSTE FÊNIX) ---
@@ -542,7 +565,7 @@ async def global_security_filter(event):
             await event.delete()
         except Exception as delete_exc:
             logger.error(f"Erro ao apagar mensagem do filtro de segurança: {delete_exc}")
-        db.add_deleted_log(chat_id, user_id, content_text, reason)
+        asyncio.create_task(log_deleted_in_background(chat_id, user_id, content_text, reason))
         if reason in ["Global Blacklist", "Local BanPerm"]:
             try:
                 await client.edit_permissions(chat_id, user_id, view_messages=False)
@@ -556,7 +579,7 @@ async def global_security_filter(event):
 
 @client.on(events.NewMessage(pattern=r'^\.start(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    text = "🛡️ <b>Jtzin Userbot V6.9 (Stability Audit)</b>\n\nEquipe Diamond — Operacional."
+    text = "🛡️ <b>Jtzin Userbot V6.10 (Stability Audit)</b>\n\nEquipe Diamond — Operacional."
     await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.antiblack(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
@@ -830,7 +853,7 @@ async def cmd_logs(event):
     if not logs:
         await reply_or_edit(event, "📭 Nenhum log registrado recentemente.", delete_after=5)
         return
-    text = "📜 <b>LOGS DE ATIVIDADE (V6.9)</b>\n\n"
+    text = "📜 <b>LOGS DE ATIVIDADE (V6.10)</b>\n\n"
     for log in logs:
         user_info = db.get_user_info(log['user_id'])
         time_str = format_timestamp(log['created_at'], '%H:%M:%S')
@@ -873,7 +896,7 @@ async def cmd_listdn(event):
 @client.on(events.NewMessage(pattern=r'^\.help(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.9</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.10</b>\n\n"
         "🛡️ <b>MODERAÇÃO LOCAL & REVERSÃO:</b>\n"
         "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code> | <code>.purge [5-100]</code> | <code>.purgeme [5-100]</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
@@ -983,8 +1006,9 @@ async def cmd_purge(event):
     try:
         # Primeiro coleta os IDs; depois envia a exclusão em lotes para reduzir
         # chamadas individuais sem alterar o limite de 5–100 mensagens.
-        async for msg in client.iter_messages(event.chat_id, limit=MAX_HISTORY_SCAN):
-            if msg.sender_id == target_id and msg.id != event.id:
+        scan_limit = min(MAX_HISTORY_SCAN, limit + 2)
+        async for msg in client.iter_messages(event.chat_id, limit=scan_limit, from_user=target_id):
+            if msg.id != event.id:
                 message_ids.append(msg.id)
                 if len(message_ids) >= limit:
                     break
@@ -1015,8 +1039,9 @@ async def cmd_purgeme(event):
     me_id = event.sender_id
     message_ids = []
     try:
-        async for msg in client.iter_messages(event.chat_id, limit=MAX_HISTORY_SCAN):
-            if msg.sender_id == me_id and msg.id != status_msg.id and msg.id != event.id:
+        scan_limit = min(MAX_HISTORY_SCAN, limit + 2)
+        async for msg in client.iter_messages(event.chat_id, limit=scan_limit, from_user=me_id):
+            if msg.id != status_msg.id and msg.id != event.id:
                 message_ids.append(msg.id)
                 if len(message_ids) >= limit:
                     break
@@ -1071,7 +1096,7 @@ async def cmd_chats(event):
         elif r['chat_type'] in ['private', 'User']:
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
-    text = "📡 <b>RELATÓRIO DE CHATS V6.9</b>\n\n"
+    text = "📡 <b>RELATÓRIO DE CHATS V6.10</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
@@ -1082,7 +1107,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V6.9 (STABILITY AUDIT) INICIANDO...")
+    logger.info("JTZIN USERBOT V6.10 (STABILITY AUDIT) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE!")
     client.run_until_disconnected()
