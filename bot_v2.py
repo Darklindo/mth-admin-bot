@@ -72,7 +72,7 @@ class Cache:
                 self.settings[row[0]] = {
                     "antispam": row[1], "antilink": row[2], "captcha_enabled": row[3]
                 }
-            logger.info("Cache carregado com sucesso (V3.5).")
+            logger.info("Cache carregado com sucesso (V3.6).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -286,12 +286,12 @@ async def global_security_filter(event):
                     await event.delete()
                     raise events.StopPropagation
 
-# --- COMANDOS DO TELETHON (V3.5 - REVERSÃO INTELIGENTE) ---
+# --- COMANDOS DO TELETHON (V3.6 - REVERSÃO EM CASCATA) ---
 
 @client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
     text = (
-        "🛡️ <b>Jtzin Userbot V3.5 (Reversão Inteligente)</b>\n\n"
+        "🛡️ <b>Jtzin Userbot V3.6 (Reversão em Cascata)</b>\n\n"
         "Userbot de administração avançado operando com estabilidade máxima.\n"
         "Equipe Diamond — Segurança total."
     )
@@ -304,11 +304,15 @@ async def cmd_unban(event):
         await reply_or_edit(event, "❌ Especifique o usuário.")
         return
     try:
+        # Reversão em Cascata: Limpa o banimento de todas as frentes
         await client.edit_permissions(event.chat_id, target_id, view_messages=True, send_messages=True)
         db.remove_local_banperm(event.chat_id, target_id)
-        db.add_deleted_log(event.chat_id, target_id, "Ação: Unban", "Reversão", admin_id=event.sender_id)
+        db.remove_global_blacklist(target_id) # Remove se for ban global
+        db.remove_shadow_ban(target_id)
+        
+        db.add_deleted_log(event.chat_id, target_id, "Ação: Unban em Cascata", "Reversão", admin_id=event.sender_id)
         user_info = db.get_user_info(target_id)
-        await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) desbanido com sucesso.")
+        await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) desbanido totalmente.")
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao desbanir: {e}")
 
@@ -333,14 +337,14 @@ async def cmd_unblacklist(event):
         await reply_or_edit(event, "❌ Especifique o usuário.")
         return
     
-    # Reversão Inteligente: Tenta remover de todas as listas possíveis
+    # Reversão em Cascata: Limpa todas as blacklists
     db.remove_local_blacklist(event.chat_id, target_id)
     db.remove_global_blacklist(target_id)
     db.remove_shadow_ban(target_id)
     
-    db.add_deleted_log(event.chat_id, target_id, "Ação: Unblacklist Inteligente", "Reversão", admin_id=event.sender_id)
+    db.add_deleted_log(event.chat_id, target_id, "Ação: Unblacklist em Cascata", "Reversão", admin_id=event.sender_id)
     user_info = db.get_user_info(target_id)
-    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido de todas as blacklists (Local/Global/Shadow).")
+    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido de todas as blacklists.")
 
 @client.on(events.NewMessage(pattern=r'^\.unallblack', func=lambda e: is_owner(e.sender_id)))
 async def cmd_unallblack(event):
@@ -349,6 +353,7 @@ async def cmd_unallblack(event):
         await reply_or_edit(event, "❌ Especifique o usuário.")
         return
     db.remove_global_blacklist(target_id)
+    db.remove_shadow_ban(target_id) # Se está na allblack, limpa shadow também
     db.add_deleted_log(0, target_id, "Ação: Unallblack Global", "Reversão", admin_id=event.sender_id)
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido da blacklist global.")
@@ -359,13 +364,27 @@ async def cmd_unbanperm(event):
     if not target_id:
         await reply_or_edit(event, "❌ Especifique o usuário.")
         return
+    # Reversão em Cascata: Limpa o banimento permanente e global se houver
     db.remove_local_banperm(event.chat_id, target_id)
-    db.add_deleted_log(event.chat_id, target_id, "Ação: Unbanperm", "Reversão", admin_id=event.sender_id)
+    db.remove_global_blacklist(target_id)
+    db.add_deleted_log(event.chat_id, target_id, "Ação: Unbanperm em Cascata", "Reversão", admin_id=event.sender_id)
     try:
         await client.edit_permissions(event.chat_id, target_id, view_messages=True)
     except: pass
     user_info = db.get_user_info(target_id)
-    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido do banimento permanente.")
+    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) totalmente perdoado.")
+
+@client.on(events.NewMessage(pattern=r'^\.unshadow', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_unshadow(event):
+    target_id = await get_target_from_event(event)
+    if not target_id: return
+    # Reversão em Cascata: Limpa Shadow Ban e Blacklists
+    db.remove_shadow_ban(target_id)
+    db.remove_global_blacklist(target_id)
+    db.remove_local_blacklist(event.chat_id, target_id)
+    db.add_deleted_log(event.chat_id, target_id, "Ação: Unshadow em Cascata", "Reversão", admin_id=event.sender_id)
+    user_info = db.get_user_info(target_id)
+    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) saiu das sombras.")
 
 @client.on(events.NewMessage(pattern=r'^\.logs', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_logs(event):
@@ -374,7 +393,7 @@ async def cmd_logs(event):
         await reply_or_edit(event, "📭 Nenhum log registrado recentemente.")
         return
     
-    text = "📜 <b>LOGS DE ATIVIDADE (V3.5)</b>\n\n"
+    text = "📜 <b>LOGS DE ATIVIDADE (V3.6)</b>\n\n"
     for log in logs:
         user_info = db.get_user_info(log['user_id'])
         time_str = datetime.fromtimestamp(log['created_at']).strftime('%H:%M:%S')
@@ -430,7 +449,7 @@ async def cmd_autorizar(event):
 @client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V3.5</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V3.6</b>\n\n"
         "🛡️ <b>MODERAÇÃO:</b>\n"
         "• <code>.ban</code> | <code>.unban</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
@@ -502,14 +521,6 @@ async def cmd_shadow(event):
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"🌑 {user_info} (<code>{target_id}</code>) em Shadow Ban.")
 
-@client.on(events.NewMessage(pattern=r'^\.unshadow', func=lambda e: is_authorized(e.sender_id)))
-async def cmd_unshadow(event):
-    target_id = await get_target_from_event(event)
-    if not target_id: return
-    db.remove_shadow_ban(target_id)
-    user_info = db.get_user_info(target_id)
-    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido do Shadow Ban.")
-
 @client.on(events.NewMessage(pattern=r'^\.msg', func=lambda e: is_owner(e.sender_id)))
 async def cmd_msg(event):
     reply = await event.get_reply_message()
@@ -550,7 +561,7 @@ async def cmd_chats(event):
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
 
-    text = "📡 <b>RELATÓRIO DE CHATS V3.5</b>\n\n"
+    text = "📡 <b>RELATÓRIO DE CHATS V3.6</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
@@ -562,7 +573,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V3.5 (REVERSÃO INTELIGENTE) INICIANDO...")
+    logger.info("JTZIN USERBOT V3.6 (REVERSÃO EM CASCATA) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE E OPERACIONAL!")
     client.run_until_disconnected()
