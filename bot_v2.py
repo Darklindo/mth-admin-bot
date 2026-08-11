@@ -11,7 +11,7 @@ from html import escape
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, functions, types
 from telethon.tl.types import User
-from telethon.errors import RPCError, FloodWaitError, ChatAdminRequiredError, UserAdminInvalidError
+from telethon.errors import RPCError, FloodWaitError, ChatAdminRequiredError, UserAdminInvalidError, MessageNotModifiedError
 
 # --- CONFIGURAÇÕES INICIAIS ---
 BASE_DIR = Path(__file__).resolve().parent
@@ -64,6 +64,16 @@ class Cache:
 
     def load_all(self, db_conn):
         try:
+            # Permite recarregar o cache sem manter punições removidas em memória.
+            self.global_blacklist.clear()
+            self.local_blacklist.clear()
+            self.local_banperm.clear()
+            self.shadow_ban.clear()
+            self.link_whitelist.clear()
+            self.authorized_users.clear()
+            self.antiblack_chats.clear()
+            self.settings.clear()
+
             cursor = db_conn.execute("SELECT user_id FROM global_blacklist")
             self.global_blacklist = {row[0] for row in cursor.fetchall()}
             
@@ -92,7 +102,7 @@ class Cache:
             except sqlite3.OperationalError:
                 pass
 
-            logger.info("Cache carregado com sucesso (V6.8 - Stability Audit).")
+            logger.info("Cache carregado com sucesso (V6.9 - Stability Audit).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -292,6 +302,11 @@ def is_owner(user_id: int) -> bool:
 def is_authorized(user_id: int) -> bool:
     return is_owner(user_id) or user_id in cache.authorized_users
 
+
+def is_immune(user_id: int) -> bool:
+    """Somente os proprietários ficam imunes às punições do Userbot."""
+    return bool(user_id) and is_owner(int(user_id))
+
 async def get_target_from_event(event):
     try:
         reply = await event.get_reply_message()
@@ -334,13 +349,14 @@ def get_reason_from_event(event):
 
 
 def parse_purge_limit(event, default=50):
-    values = [int(arg) for arg in event.raw_text.split()[1:] if arg.isdigit()]
+    args = (event.raw_text or "").split()[1:]
+    values = [int(arg) for arg in args if arg.isdigit()]
     if not values:
         return default, None
     value = values[0]
-    if value < MIN_PURGE_LIMIT:
+    if value < MIN_PURGE_LIMIT or value > MAX_PURGE_LIMIT:
         return None, f"❌ A quantidade deve estar entre {MIN_PURGE_LIMIT} e {MAX_PURGE_LIMIT}."
-    return min(value, MAX_PURGE_LIMIT), None
+    return value, None
 
 
 async def delete_message_safely(message, label="mensagem"):
@@ -358,6 +374,33 @@ async def delete_command_safely(event):
     return await delete_message_safely(event, "mensagem de comando")
 
 
+async def delete_message_ids_safely(chat_id, message_ids, batch_size=100):
+    """Apaga mensagens em lotes e usa fallback individual quando necessário."""
+    ids = [int(message_id) for message_id in message_ids if message_id]
+    deleted = 0
+    for start in range(0, len(ids), batch_size):
+        batch = ids[start:start + batch_size]
+        try:
+            await client.delete_messages(chat_id, batch)
+            deleted += len(batch)
+        except FloodWaitError as exc:
+            await asyncio.sleep(exc.seconds)
+            try:
+                await client.delete_messages(chat_id, batch)
+                deleted += len(batch)
+            except Exception as retry_exc:
+                logger.error(f"Falha ao apagar lote após FloodWait: {retry_exc}")
+        except Exception as batch_exc:
+            logger.debug(f"Falha no lote de exclusão; usando fallback: {batch_exc}")
+            for message_id in batch:
+                try:
+                    await client.delete_messages(chat_id, message_id)
+                    deleted += 1
+                except Exception as item_exc:
+                    logger.debug(f"Não foi possível apagar mensagem {message_id}: {item_exc}")
+    return deleted
+
+
 async def reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER):
     msg = None
     try:
@@ -365,6 +408,10 @@ async def reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER):
             msg = await event.edit(text, parse_mode="html")
         else:
             msg = await event.reply(text, parse_mode="html")
+    except MessageNotModifiedError:
+        # O comando já contém exatamente o texto solicitado; ainda assim,
+        # ele deve seguir o ciclo normal de autoexclusão.
+        msg = event
     except Exception as exc:
         logger.warning(f"Resposta HTML falhou; tentando texto simples: {exc}")
         try:
@@ -372,15 +419,16 @@ async def reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER):
                 msg = await event.edit(text, parse_mode=None)
             else:
                 msg = await event.reply(text, parse_mode=None)
+        except MessageNotModifiedError:
+            msg = event
         except Exception as fallback_exc:
             logger.error(f"Erro ao enviar/editar resposta: {fallback_exc}")
-            return
 
     if delete_after:
         await asyncio.sleep(delete_after)
         # Quando a conta envia o comando, a edição e a confirmação têm o
         # mesmo ID; quando outro usuário autorizado envia, são mensagens distintas.
-        if msg is not event and getattr(msg, "id", None) != getattr(event, "id", None):
+        if msg is not None and msg is not event and getattr(msg, "id", None) != getattr(event, "id", None):
             await delete_message_safely(msg, "resposta automática")
         await delete_command_safely(event)
 
@@ -405,7 +453,7 @@ async def chat_registry(event):
         # estão marcadas no cache como bloqueadas; isso preserva a latência de
         # exclusão e deixa o filtro global agir imediatamente em seguida.
         sender_id = event.sender_id
-        if sender_id and not is_authorized(sender_id):
+        if sender_id and not is_immune(sender_id):
             chat_id = event.chat_id
             if (
                 sender_id in cache.global_blacklist
@@ -475,16 +523,16 @@ async def global_security_filter(event):
         return
 
     user_id = event.sender_id
-    if not user_id or is_authorized(user_id):
+    if not user_id or is_immune(user_id):
         return
-    
+
     chat_id = event.chat_id
     reason = None
     
     if user_id in cache.global_blacklist: reason = "Global Blacklist"
     elif user_id in cache.shadow_ban: reason = "Shadow Ban"
-    elif user_id in cache.local_blacklist[chat_id]: reason = "Local Blacklist"
-    elif user_id in cache.local_banperm[chat_id]: reason = "Local BanPerm"
+    elif user_id in cache.local_blacklist.get(chat_id, ()): reason = "Local Blacklist"
+    elif user_id in cache.local_banperm.get(chat_id, ()): reason = "Local BanPerm"
 
     if reason:
         content_text = event.text or "[Mídia / Sticker / GIF]"
@@ -508,7 +556,7 @@ async def global_security_filter(event):
 
 @client.on(events.NewMessage(pattern=r'^\.start(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    text = "🛡️ <b>Jtzin Userbot V6.8 (Stability Audit)</b>\n\nEquipe Diamond — Operacional."
+    text = "🛡️ <b>Jtzin Userbot V6.9 (Stability Audit)</b>\n\nEquipe Diamond — Operacional."
     await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.antiblack(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
@@ -532,7 +580,7 @@ async def cmd_antiblack(event):
 @client.on(events.NewMessage(pattern=r'^\.kick(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_kick(event):
     target_id = await get_target_from_event(event)
-    if not target_id or is_authorized(target_id):
+    if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
     try:
@@ -550,7 +598,7 @@ async def cmd_kick(event):
 @client.on(events.NewMessage(pattern=r'^\.ban(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_ban(event):
     target_id = await get_target_from_event(event)
-    if not target_id or is_authorized(target_id):
+    if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
     try:
@@ -574,9 +622,7 @@ async def cmd_unban(event):
     try:
         await client.edit_permissions(event.chat_id, target_id, view_messages=True, send_messages=True)
         db.remove_local_banperm(event.chat_id, target_id)
-        db.remove_global_blacklist(target_id)
-        db.remove_shadow_ban(target_id)
-        db.add_deleted_log(event.chat_id, target_id, "Ação: Unban em Cascata", "Reversão", admin_id=event.sender_id)
+        db.add_deleted_log(event.chat_id, target_id, "Ação: Unban Local", "Reversão", admin_id=event.sender_id)
         user_info = db.get_user_info(target_id)
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) desbanido totalmente.", delete_after=DEFAULT_DELETE_AFTER)
     except ChatAdminRequiredError:
@@ -587,7 +633,7 @@ async def cmd_unban(event):
 @client.on(events.NewMessage(pattern=r'^\.mute(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_mute(event):
     target_id = await get_target_from_event(event)
-    if not target_id or is_authorized(target_id):
+    if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
     try:
@@ -621,7 +667,7 @@ async def cmd_unmute(event):
 @client.on(events.NewMessage(pattern=r'^\.blacklist(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_blacklist(event):
     target_id = await get_target_from_event(event)
-    if not target_id or is_authorized(target_id):
+    if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
     db.add_local_blacklist(event.chat_id, target_id, get_reason_from_event(event))
@@ -636,16 +682,14 @@ async def cmd_unblacklist(event):
         await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=DEFAULT_DELETE_AFTER)
         return
     db.remove_local_blacklist(event.chat_id, target_id)
-    db.remove_global_blacklist(target_id)
-    db.remove_shadow_ban(target_id)
-    db.add_deleted_log(event.chat_id, target_id, "Ação: Unblacklist em Cascata", "Reversão", admin_id=event.sender_id)
+    db.add_deleted_log(event.chat_id, target_id, "Ação: Unblacklist Local", "Reversão", admin_id=event.sender_id)
     user_info = db.get_user_info(target_id)
-    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido de todas as blacklists.", delete_after=DEFAULT_DELETE_AFTER)
+    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido da blacklist local deste chat.", delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.banperm(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_banperm(event):
     target_id = await get_target_from_event(event)
-    if not target_id or is_authorized(target_id):
+    if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
     db.add_local_banperm(event.chat_id, target_id, get_reason_from_event(event))
@@ -667,13 +711,12 @@ async def cmd_unbanperm(event):
     if not target_id:
         await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    db.remove_local_banperm(event.chat_id, target_id)
-    db.remove_global_blacklist(target_id)
-    db.add_deleted_log(event.chat_id, target_id, "Ação: Unbanperm em Cascata", "Reversão", admin_id=event.sender_id)
     try:
-        await client.edit_permissions(event.chat_id, target_id, view_messages=True)
+        await client.edit_permissions(event.chat_id, target_id, view_messages=True, send_messages=True)
+        db.remove_local_banperm(event.chat_id, target_id)
+        db.add_deleted_log(event.chat_id, target_id, "Ação: UnbanPerm Local", "Reversão", admin_id=event.sender_id)
         user_info = db.get_user_info(target_id)
-        await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) totalmente perdoado.", delete_after=DEFAULT_DELETE_AFTER)
+        await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) perdoado neste chat.", delete_after=DEFAULT_DELETE_AFTER)
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
     except Exception as e:
@@ -682,7 +725,7 @@ async def cmd_unbanperm(event):
 @client.on(events.NewMessage(pattern=r'^\.shadow(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_shadow(event):
     target_id = await get_target_from_event(event)
-    if not target_id or is_authorized(target_id):
+    if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
     db.add_shadow_ban(target_id, get_reason_from_event(event))
@@ -697,16 +740,14 @@ async def cmd_unshadow(event):
         await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=DEFAULT_DELETE_AFTER)
         return
     db.remove_shadow_ban(target_id)
-    db.remove_global_blacklist(target_id)
-    db.remove_local_blacklist(event.chat_id, target_id)
-    db.add_deleted_log(event.chat_id, target_id, "Ação: Unshadow em Cascata", "Reversão", admin_id=event.sender_id)
+    db.add_deleted_log(event.chat_id, target_id, "Ação: Unshadow Global", "Reversão", admin_id=event.sender_id)
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) saiu das sombras.", delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.allban(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_allban(event):
     target_id = await get_target_from_event(event)
-    if not target_id or is_authorized(target_id):
+    if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
     db.add_global_blacklist(target_id, 'ban', get_reason_from_event(event))
@@ -729,7 +770,7 @@ async def cmd_allban(event):
 @client.on(events.NewMessage(pattern=r'^\.allblack(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_allblack(event):
     target_id = await get_target_from_event(event)
-    if not target_id or is_authorized(target_id):
+    if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
     db.add_global_blacklist(target_id, 'black', get_reason_from_event(event))
@@ -744,8 +785,7 @@ async def cmd_unallblack(event):
         await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=DEFAULT_DELETE_AFTER)
         return
     db.remove_global_blacklist(target_id)
-    db.remove_shadow_ban(target_id)
-    db.add_deleted_log(0, target_id, "Ação: Unallblack Global", "Reversão Global", admin_id=event.sender_id)
+    db.add_deleted_log(event.chat_id, target_id, "Ação: Unallblack Global", "Reversão Global", admin_id=event.sender_id)
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido da blacklist global.", delete_after=DEFAULT_DELETE_AFTER)
 
@@ -790,7 +830,7 @@ async def cmd_logs(event):
     if not logs:
         await reply_or_edit(event, "📭 Nenhum log registrado recentemente.", delete_after=5)
         return
-    text = "📜 <b>LOGS DE ATIVIDADE (V6.8)</b>\n\n"
+    text = "📜 <b>LOGS DE ATIVIDADE (V6.9)</b>\n\n"
     for log in logs:
         user_info = db.get_user_info(log['user_id'])
         time_str = format_timestamp(log['created_at'], '%H:%M:%S')
@@ -833,13 +873,13 @@ async def cmd_listdn(event):
 @client.on(events.NewMessage(pattern=r'^\.help(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.8</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.9</b>\n\n"
         "🛡️ <b>MODERAÇÃO LOCAL & REVERSÃO:</b>\n"
-        "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code> | <code>.purge [qtd]</code> | <code>.purgeme [qtd]</code>\n"
+        "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code> | <code>.purge [5-100]</code> | <code>.purgeme [5-100]</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
-        "• <code>.blacklist</code> | <code>.unblacklist</code>\n"
-        "• <code>.banperm</code> | <code>.unbanperm</code>\n"
-        "• <code>.shadow</code> | <code>.unshadow</code>\n\n"
+        "• <code>.blacklist</code> | <code>.unblacklist</code> (somente este chat)\n"
+        "• <code>.banperm</code> | <code>.unbanperm</code> (somente este chat)\n"
+        "• <code>.shadow</code> | <code>.unshadow</code> (global)\n\n"
         "👑 <b>CONTROLE GLOBAL:</b>\n"
         "• <code>.allban</code> | <code>.allblack</code> | <code>.unallblack</code>\n"
         "• <code>.autorizar</code> | <code>.desautorizar</code> | <code>.listauth</code> (Gestão de Acessos)\n\n"
@@ -939,19 +979,16 @@ async def cmd_purge(event):
     info = db.get_user_info(target_id)
     status_msg = await event.respond(f"🧹 [Purge] Apagando até {limit} mensagens (qualquer tipo) de {info}...")
     
-    deleted_count = 0
+    message_ids = []
     try:
-        # Varre o histórico iterando e apagando exatamente o número de mensagens solicitadas (texto, gifs, stickers, mídia, etc.)
+        # Primeiro coleta os IDs; depois envia a exclusão em lotes para reduzir
+        # chamadas individuais sem alterar o limite de 5–100 mensagens.
         async for msg in client.iter_messages(event.chat_id, limit=MAX_HISTORY_SCAN):
             if msg.sender_id == target_id and msg.id != event.id:
-                try:
-                    await msg.delete()
-                    deleted_count += 1
-                    if deleted_count >= limit:
-                        break
-                except Exception as del_err:
-                    logger.error(f"Erro ao deletar mensagem ID {msg.id}: {del_err}")
-                    pass
+                message_ids.append(msg.id)
+                if len(message_ids) >= limit:
+                    break
+        deleted_count = await delete_message_ids_safely(event.chat_id, message_ids)
         await status_msg.edit(f"✅ <b>Purge concluído!</b> {deleted_count} mensagens de {info} foram apagadas.", parse_mode='html')
         await asyncio.sleep(DEFAULT_DELETE_AFTER)
         await status_msg.delete()
@@ -975,19 +1012,15 @@ async def cmd_purgeme(event):
 
     status_msg = await event.respond(f"🧹 [PurgeMe] Apagando suas últimas {limit} mensagens...")
     
-    deleted_count = 0
     me_id = event.sender_id
+    message_ids = []
     try:
         async for msg in client.iter_messages(event.chat_id, limit=MAX_HISTORY_SCAN):
             if msg.sender_id == me_id and msg.id != status_msg.id and msg.id != event.id:
-                try:
-                    await msg.delete()
-                    deleted_count += 1
-                    if deleted_count >= limit:
-                        break
-                except Exception as del_err:
-                    logger.error(f"Erro ao apagar mensagem própria ID {msg.id}: {del_err}")
-                    pass
+                message_ids.append(msg.id)
+                if len(message_ids) >= limit:
+                    break
+        deleted_count = await delete_message_ids_safely(event.chat_id, message_ids)
         await status_msg.edit(f"✅ <b>PurgeMe concluído!</b> {deleted_count} mensagens suas foram apagadas.", parse_mode='html')
         await asyncio.sleep(DEFAULT_DELETE_AFTER)
         await status_msg.delete()
@@ -1038,7 +1071,7 @@ async def cmd_chats(event):
         elif r['chat_type'] in ['private', 'User']:
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
-    text = "📡 <b>RELATÓRIO DE CHATS V6.8</b>\n\n"
+    text = "📡 <b>RELATÓRIO DE CHATS V6.9</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
@@ -1049,7 +1082,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V6.8 (STABILITY AUDIT) INICIANDO...")
+    logger.info("JTZIN USERBOT V6.9 (STABILITY AUDIT) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE!")
     client.run_until_disconnected()
