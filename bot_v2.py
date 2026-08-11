@@ -75,7 +75,7 @@ class Cache:
             except sqlite3.OperationalError:
                 pass
 
-            logger.info("Cache carregado com sucesso (V4.6 - Anti-Black).")
+            logger.info("Cache carregado com sucesso (V4.7 - Hierarquia de Admins).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -275,7 +275,7 @@ async def antiblack_resender(event):
     for chat_id in event.deleted_ids:
         for msg_id, data in list(recent_sent_messages.items()):
             if data["chat_id"] == event.chat_id and msg_id == chat_id:
-                if time.time() - data["time"] < 10:  # Se foi apagado em menos de 10s por bot rival
+                if time.time() - data["time"] < 10:
                     try:
                         await client.send_message(event.chat_id, f"🛡️ [Anti-Black Ativo]\n{data['text']}")
                     except Exception as e:
@@ -305,7 +305,10 @@ async def global_security_filter(event):
             db.add_deleted_log(chat_id, user_id, content_text, reason)
             await event.delete()
             if reason in ["Global Blacklist", "Local BanPerm"]:
-                await client.edit_permissions(chat_id, user_id, view_messages=False)
+                try:
+                    await client.edit_permissions(chat_id, user_id, view_messages=False)
+                except UserAdminInvalidError:
+                    pass # Se o alvo for admin, o bot apaga a mensagem mas não consegue banir
         except Exception as e:
             logger.error(f"Erro no filtro de segurança: {e}")
         raise events.StopPropagation
@@ -314,7 +317,7 @@ async def global_security_filter(event):
 
 @client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    text = "🛡️ <b>Jtzin Userbot V4.6 (Anti-Black & Fênix)</b>\n\nEquipe Diamond — Operacional."
+    text = "🛡️ <b>Jtzin Userbot V4.7 (Hierarquia & Fênix)</b>\n\nEquipe Diamond — Operacional."
     await reply_or_edit(event, text, delete_after=2)
 
 @client.on(events.NewMessage(pattern=r'^\.antiblack', func=lambda e: is_authorized(e.sender_id)))
@@ -348,6 +351,8 @@ async def cmd_kick(event):
         await reply_or_edit(event, f"👢 {user_info} (<code>{target_id}</code>) foi expulso.", delete_after=2)
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=2)
+    except UserAdminInvalidError:
+        await reply_or_edit(event, "❌ Erro: Não é possível expulsar outro administrador (hierarquia).", delete_after=2)
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao expulsar: {e}", delete_after=2)
 
@@ -364,6 +369,8 @@ async def cmd_ban(event):
         await reply_or_edit(event, f"🔨 {user_info} (<code>{target_id}</code>) banido do grupo.", delete_after=2)
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=2)
+    except UserAdminInvalidError:
+        await reply_or_edit(event, "❌ Erro: Não é possível banir outro administrador (hierarquia).", delete_after=2)
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao banir: {e}", delete_after=2)
 
@@ -399,6 +406,8 @@ async def cmd_mute(event):
         await reply_or_edit(event, f"🔇 {user_info} (<code>{target_id}</code>) silenciado.", delete_after=2)
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=2)
+    except UserAdminInvalidError:
+        await reply_or_edit(event, "❌ Erro: Não é possível silenciar outro administrador (hierarquia).", delete_after=2)
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao silenciar: {e}", delete_after=2)
 
@@ -427,7 +436,7 @@ async def cmd_blacklist(event):
     db.add_local_blacklist(event.chat_id, target_id, get_reason_from_event(event))
     user_info = db.get_user_info(target_id)
     db.add_deleted_log(event.chat_id, target_id, "Ação: Blacklist Local", "Moderação", admin_id=event.sender_id)
-    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist local.", delete_after=2)
+    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist local (mensagens serão apagadas).", delete_after=2)
 
 @client.on(events.NewMessage(pattern=r'^\.unblacklist', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unblacklist(event):
@@ -456,6 +465,8 @@ async def cmd_banperm(event):
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) banido permanentemente.", delete_after=2)
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=2)
+    except UserAdminInvalidError:
+        await reply_or_edit(event, "❌ Erro: Não é possível banir permanentemente outro administrador.", delete_after=2)
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao banir: {e}", delete_after=2)
 
@@ -486,7 +497,7 @@ async def cmd_shadow(event):
     db.add_shadow_ban(target_id, get_reason_from_event(event))
     user_info = db.get_user_info(target_id)
     db.add_deleted_log(event.chat_id, target_id, "Ação: Shadow Ban", "Moderação", admin_id=event.sender_id)
-    await reply_or_edit(event, f"🌑 {user_info} (<code>{target_id}</code>) em Shadow Ban.", delete_after=2)
+    await reply_or_edit(event, f"🌑 {user_info} (<code>{target_id}</code>) em Shadow Ban (mensagens serão apagadas globalmente).", delete_after=2)
 
 @client.on(events.NewMessage(pattern=r'^\.unshadow', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unshadow(event):
@@ -562,7 +573,7 @@ async def cmd_logs(event):
     if not logs:
         await reply_or_edit(event, "📭 Nenhum log registrado recentemente.", delete_after=5)
         return
-    text = "📜 <b>LOGS DE ATIVIDADE (V4.6)</b>\n\n"
+    text = "📜 <b>LOGS DE ATIVIDADE (V4.7)</b>\n\n"
     for log in logs:
         user_info = db.get_user_info(log['user_id'])
         time_str = datetime.fromtimestamp(log['created_at']).strftime('%H:%M:%S')
@@ -602,7 +613,7 @@ async def cmd_listdn(event):
 @client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V4.6</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V4.7</b>\n\n"
         "🛡️ <b>MODERAÇÃO:</b>\n"
         "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
@@ -653,7 +664,7 @@ async def cmd_chats(event):
         elif r['chat_type'] in ['private', 'User']:
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
-    text = "📡 <b>RELATÓRIO DE CHATS V4.6</b>\n\n"
+    text = "📡 <b>RELATÓRIO DE CHATS V4.7</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
@@ -664,7 +675,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V4.6 (ANTI-BLACK & FÊNIX) INICIANDO...")
+    logger.info("JTZIN USERBOT V4.7 (HIERARQUIA & FÊNIX) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE!")
     client.run_until_disconnected()
