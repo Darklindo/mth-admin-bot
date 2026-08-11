@@ -10,7 +10,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, functions, types
 from telethon.tl.types import ChatAdminRights, ChannelParticipantsAdmins, Channel, User
-from telethon.errors import RPCError, FloodWaitError
+from telethon.errors import RPCError, FloodWaitError, ChatAdminRequiredError, UserAdminInvalidError
 
 # --- CONFIGURAÇÕES INICIAIS ---
 BASE_DIR = Path(__file__).resolve().parent
@@ -72,7 +72,7 @@ class Cache:
                 self.settings[row[0]] = {
                     "antispam": row[1], "antilink": row[2], "captcha_enabled": row[3]
                 }
-            logger.info("Cache carregado com sucesso (V3.6).")
+            logger.info("Cache carregado com sucesso (V3.7).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -286,12 +286,12 @@ async def global_security_filter(event):
                     await event.delete()
                     raise events.StopPropagation
 
-# --- COMANDOS DO TELETHON (V3.6 - REVERSÃO EM CASCATA) ---
+# --- COMANDOS DO TELETHON (V3.7 - TRATAMENTO DE ERROS) ---
 
 @client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
     text = (
-        "🛡️ <b>Jtzin Userbot V3.6 (Reversão em Cascata)</b>\n\n"
+        "🛡️ <b>Jtzin Userbot V3.7 (Blindado)</b>\n\n"
         "Userbot de administração avançado operando com estabilidade máxima.\n"
         "Equipe Diamond — Segurança total."
     )
@@ -304,15 +304,15 @@ async def cmd_unban(event):
         await reply_or_edit(event, "❌ Especifique o usuário.")
         return
     try:
-        # Reversão em Cascata: Limpa o banimento de todas as frentes
         await client.edit_permissions(event.chat_id, target_id, view_messages=True, send_messages=True)
         db.remove_local_banperm(event.chat_id, target_id)
-        db.remove_global_blacklist(target_id) # Remove se for ban global
+        db.remove_global_blacklist(target_id)
         db.remove_shadow_ban(target_id)
-        
         db.add_deleted_log(event.chat_id, target_id, "Ação: Unban em Cascata", "Reversão", admin_id=event.sender_id)
         user_info = db.get_user_info(target_id)
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) desbanido totalmente.")
+    except ChatAdminRequiredError:
+        await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador neste grupo.")
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao desbanir: {e}")
 
@@ -327,6 +327,8 @@ async def cmd_unmute(event):
         db.add_deleted_log(event.chat_id, target_id, "Ação: Unmute", "Reversão", admin_id=event.sender_id)
         user_info = db.get_user_info(target_id)
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) pode falar novamente.")
+    except ChatAdminRequiredError:
+        await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador neste grupo.")
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao desmutar: {e}")
 
@@ -336,12 +338,9 @@ async def cmd_unblacklist(event):
     if not target_id:
         await reply_or_edit(event, "❌ Especifique o usuário.")
         return
-    
-    # Reversão em Cascata: Limpa todas as blacklists
     db.remove_local_blacklist(event.chat_id, target_id)
     db.remove_global_blacklist(target_id)
     db.remove_shadow_ban(target_id)
-    
     db.add_deleted_log(event.chat_id, target_id, "Ação: Unblacklist em Cascata", "Reversão", admin_id=event.sender_id)
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido de todas as blacklists.")
@@ -353,7 +352,7 @@ async def cmd_unallblack(event):
         await reply_or_edit(event, "❌ Especifique o usuário.")
         return
     db.remove_global_blacklist(target_id)
-    db.remove_shadow_ban(target_id) # Se está na allblack, limpa shadow também
+    db.remove_shadow_ban(target_id)
     db.add_deleted_log(0, target_id, "Ação: Unallblack Global", "Reversão", admin_id=event.sender_id)
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido da blacklist global.")
@@ -364,21 +363,22 @@ async def cmd_unbanperm(event):
     if not target_id:
         await reply_or_edit(event, "❌ Especifique o usuário.")
         return
-    # Reversão em Cascata: Limpa o banimento permanente e global se houver
     db.remove_local_banperm(event.chat_id, target_id)
     db.remove_global_blacklist(target_id)
     db.add_deleted_log(event.chat_id, target_id, "Ação: Unbanperm em Cascata", "Reversão", admin_id=event.sender_id)
     try:
         await client.edit_permissions(event.chat_id, target_id, view_messages=True)
-    except: pass
-    user_info = db.get_user_info(target_id)
-    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) totalmente perdoado.")
+        user_info = db.get_user_info(target_id)
+        await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) totalmente perdoado.")
+    except ChatAdminRequiredError:
+        await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador neste grupo.")
+    except Exception as e:
+        await reply_or_edit(event, f"❌ Erro ao desbanir: {e}")
 
 @client.on(events.NewMessage(pattern=r'^\.unshadow', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unshadow(event):
     target_id = await get_target_from_event(event)
     if not target_id: return
-    # Reversão em Cascata: Limpa Shadow Ban e Blacklists
     db.remove_shadow_ban(target_id)
     db.remove_global_blacklist(target_id)
     db.remove_local_blacklist(event.chat_id, target_id)
@@ -392,13 +392,11 @@ async def cmd_logs(event):
     if not logs:
         await reply_or_edit(event, "📭 Nenhum log registrado recentemente.")
         return
-    
-    text = "📜 <b>LOGS DE ATIVIDADE (V3.6)</b>\n\n"
+    text = "📜 <b>LOGS DE ATIVIDADE (V3.7)</b>\n\n"
     for log in logs:
         user_info = db.get_user_info(log['user_id'])
         time_str = datetime.fromtimestamp(log['created_at']).strftime('%H:%M:%S')
         content = (log['content'][:30] + '...') if len(log['content']) > 30 else log['content']
-        
         text += f"⏰ <code>{time_str}</code> | 👤 {user_info}\n"
         text += f"🚫 <b>Motivo:</b> {log['reason']}\n"
         if log['admin_id']:
@@ -406,14 +404,12 @@ async def cmd_logs(event):
             text += f"👮 <b>Admin:</b> {admin_info}\n"
         text += f"💬 <b>Conteúdo:</b> <i>{content}</i>\n"
         text += "------------------\n"
-    
     await reply_or_edit(event, text)
 
 @client.on(events.NewMessage(pattern=r'^\.listdn', func=lambda e: is_owner(e.sender_id)))
 async def cmd_listdn(event):
     shadow, glob = db.get_all_banned_list_detailed()
     text = "📋 <b>LISTA DE PUNIÇÕES GLOBAIS</b>\n\n"
-    
     if shadow:
         text += "🌑 <b>Shadow Ban:</b>\n"
         for r in shadow:
@@ -422,7 +418,6 @@ async def cmd_listdn(event):
             date_str = datetime.fromtimestamp(r['created_at']).strftime('%d/%m/%Y %H:%M')
             text += f"• {info} (<code>{r['user_id']}</code>){reason}\n└ 📅 {date_str}\n"
         text += "\n"
-
     if glob:
         text += "🌎 <b>Global Blacklist:</b>\n"
         for r in glob:
@@ -430,10 +425,8 @@ async def cmd_listdn(event):
             reason = f" | Motivo: {r['reason']}" if r['reason'] else ""
             date_str = datetime.fromtimestamp(r['created_at']).strftime('%d/%m/%Y %H:%M')
             text += f"• {info} (<code>{r['user_id']}</code>) [{r['type'].upper()}]{reason}\n└ 📅 {date_str}\n"
-    
     if not shadow and not glob:
         text += "Nenhuma punição global registrada."
-        
     await reply_or_edit(event, text)
 
 @client.on(events.NewMessage(pattern=r'^\.autorizar', func=lambda e: is_owner(e.sender_id)))
@@ -449,7 +442,7 @@ async def cmd_autorizar(event):
 @client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V3.6</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V3.7</b>\n\n"
         "🛡️ <b>MODERAÇÃO:</b>\n"
         "• <code>.ban</code> | <code>.unban</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
@@ -474,10 +467,14 @@ async def cmd_banperm(event):
     target_id = await get_target_from_event(event)
     if not target_id or is_owner(target_id): return
     db.add_local_banperm(event.chat_id, target_id, get_reason_from_event(event))
-    try: await client.edit_permissions(event.chat_id, target_id, view_messages=False)
-    except: pass
-    user_info = db.get_user_info(target_id)
-    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) banido permanentemente.")
+    try:
+        await client.edit_permissions(event.chat_id, target_id, view_messages=False)
+        user_info = db.get_user_info(target_id)
+        await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) banido permanentemente.")
+    except ChatAdminRequiredError:
+        await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador neste grupo.")
+    except Exception as e:
+        await reply_or_edit(event, f"❌ Erro ao banir: {e}")
 
 @client.on(events.NewMessage(pattern=r'^\.blacklist', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_blacklist(event):
@@ -524,17 +521,10 @@ async def cmd_shadow(event):
 @client.on(events.NewMessage(pattern=r'^\.msg', func=lambda e: is_owner(e.sender_id)))
 async def cmd_msg(event):
     reply = await event.get_reply_message()
-    msg_to_send = None
-    
-    if reply: msg_to_send = reply
-    else:
-        args = event.raw_text.split(maxsplit=1)
-        if len(args) > 1: msg_to_send = args[1]
-    
+    msg_to_send = reply if reply else (event.raw_text.split(maxsplit=1)[1] if len(event.raw_text.split()) > 1 else None)
     if not msg_to_send:
         await reply_or_edit(event, "❌ Digite a mensagem ou responda a uma mídia.")
         return
-        
     chats = db.all_chats_detailed()
     success = 0
     for chat in chats:
@@ -545,7 +535,6 @@ async def cmd_msg(event):
                 await asyncio.sleep(0.1)
             except FloodWaitError as e: await asyncio.sleep(e.seconds)
             except: continue
-            
     await reply_or_edit(event, f"📢 Transmissão concluída: {success} chats receberam.")
 
 @client.on(events.NewMessage(pattern=r'^\.chats', func=lambda e: is_owner(e.sender_id)))
@@ -560,12 +549,10 @@ async def cmd_chats(event):
         elif r['chat_type'] in ['private', 'User']:
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
-
-    text = "📡 <b>RELATÓRIO DE CHATS V3.6</b>\n\n"
+    text = "📡 <b>RELATÓRIO DE CHATS V3.7</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
-    
     text += "📊 <b>RESUMO:</b>\n"
     text += f"• Grupos/Canais: {len(grupos) + len(canais)}\n• Usuários: {len(privados)}"
     await reply_or_edit(event, text)
@@ -573,7 +560,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V3.6 (REVERSÃO EM CASCATA) INICIANDO...")
+    logger.info("JTZIN USERBOT V3.7 (BLINDADO) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE E OPERACIONAL!")
     client.run_until_disconnected()
