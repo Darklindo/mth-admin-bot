@@ -75,7 +75,7 @@ class Cache:
             except sqlite3.OperationalError:
                 pass
 
-            logger.info("Cache carregado com sucesso (V6.0 - Ultimate Edition).")
+            logger.info("Cache carregado com sucesso (V6.1 - Purge Edition).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -333,7 +333,7 @@ async def global_security_filter(event):
 
 @client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    text = "🛡️ <b>Jtzin Userbot V6.0 (Ultimate Edition)</b>\n\nEquipe Diamond — Operacional."
+    text = "🛡️ <b>Jtzin Userbot V6.1 (Purge Edition)</b>\n\nEquipe Diamond — Operacional."
     await reply_or_edit(event, text, delete_after=2)
 
 @client.on(events.NewMessage(pattern=r'^\.antiblack', func=lambda e: is_authorized(e.sender_id)))
@@ -629,9 +629,9 @@ async def cmd_listdn(event):
 @client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.0</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.1</b>\n\n"
         "🛡️ <b>MODERAÇÃO LOCAL & REVERSÃO:</b>\n"
-        "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code>\n"
+        "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code> | <code>.purge [qtd]</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
         "• <code>.blacklist</code> | <code>.unblacklist</code>\n"
         "• <code>.banperm</code> | <code>.unbanperm</code>\n"
@@ -719,6 +719,55 @@ async def cmd_delspy(event):
     info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ <b>{info} (<code>{target_id}</code>) removido da lista de espiões.</b>", delete_after=3)
 
+@client.on(events.NewMessage(pattern=r'^\.purge', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_purge(event):
+    if not event.is_group and not event.is_channel:
+        await reply_or_edit(event, "❌ Este comando só pode ser usado em grupos ou canais.", delete_after=2)
+        return
+    
+    target_id = await get_target_from_event(event)
+    args = event.raw_text.split()
+    
+    # Extrair quantidade (máx 100)
+    limit = 50
+    for arg in args:
+        if arg.isdigit():
+            val = int(arg)
+            if val > 0:
+                limit = min(val, 100)
+                break
+
+    if not target_id:
+        await reply_or_edit(event, "❌ Responda à mensagem do usuário ou informe @username / ID junto com a quantidade. Ex: <code>.purge 30</code>", delete_after=3)
+        return
+
+    info = db.get_user_info(target_id)
+    status_msg = await event.respond(f"🧹 [Purge] Varrendo até {limit} mensagens recentes de {info}...")
+    
+    deleted_count = 0
+    try:
+        async for msg in client.iter_messages(event.chat_id, limit=300):
+            if msg.sender_id == target_id:
+                try:
+                    await msg.delete()
+                    deleted_count += 1
+                    if deleted_count >= limit:
+                        break
+                except:
+                    pass
+        await status_msg.edit(f"✅ <b>Limpeza concluída!</b> {deleted_count} mensagens de {info} foram apagadas.", parse_mode='html')
+        await asyncio.sleep(2)
+        await status_msg.delete()
+    except Exception as e:
+        await status_msg.edit(f"❌ Erro ao executar .purge: {e}", parse_mode='html')
+        await asyncio.sleep(4)
+        await status_msg.delete()
+
+    try:
+        await event.delete()
+    except:
+        pass
+
 @client.on(events.NewMessage(pattern=r'^\.id', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_id(event):
     target_id = await get_target_from_event(event) or event.sender_id
@@ -755,7 +804,7 @@ async def cmd_chats(event):
         elif r['chat_type'] in ['private', 'User']:
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
-    text = "📡 <b>RELATÓRIO DE CHATS V6.0</b>\n\n"
+    text = "📡 <b>RELATÓRIO DE CHATS V6.1</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
@@ -766,7 +815,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V6.0 (ULTIMATE EDITION) INICIANDO...")
+    logger.info("JTZIN USERBOT V6.1 (PURGE EDITION) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE!")
     client.run_until_disconnected()
