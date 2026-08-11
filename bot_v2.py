@@ -76,7 +76,7 @@ class Cache:
             except sqlite3.OperationalError:
                 logger.warning("Tabela settings incompleta no cache. Rode migrate_db.py.")
 
-            logger.info("Cache carregado com sucesso (V4.2).")
+            logger.info("Cache carregado com sucesso (V4.3).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -179,10 +179,11 @@ class Database:
     def get_all_banned_list_detailed(self):
         shadow = self.execute("SELECT user_id, reason, created_at FROM shadow_ban ORDER BY created_at DESC").fetchall()
         glob = self.execute("SELECT user_id, type, reason, created_at FROM global_blacklist ORDER BY created_at DESC").fetchall()
-        return shadow, glob
+        return [dict(r) for r in shadow], [dict(r) for r in glob]
 
     def all_chats_detailed(self):
-        return self.execute("SELECT chat_id, title, chat_type, active FROM chats").fetchall()
+        rows = self.execute("SELECT chat_id, title, chat_type, active FROM chats").fetchall()
+        return [dict(r) for r in rows]
 
     def remember_user(self, user_id, username, first_name):
         if not user_id: return
@@ -194,13 +195,12 @@ class Database:
         )
 
     def add_deleted_log(self, chat_id, user_id, content, reason, admin_id=None):
-        # Tenta inserir com admin_id, se falhar (coluna não existe), tenta sem
         res = self.execute(
             "INSERT INTO deleted_logs(chat_id, user_id, admin_id, content, reason, created_at) VALUES(?,?,?,?,?,?)",
             (int(chat_id), int(user_id), admin_id, content or "[Ação de Sistema]", reason, int(time.time())),
             commit=True
         )
-        if res is None: # Provavelmente erro de admin_id ausente
+        if res is None:
             self.execute(
                 "INSERT INTO deleted_logs(chat_id, user_id, content, reason, created_at) VALUES(?,?,?,?,?)",
                 (int(chat_id), int(user_id), content or "[Ação de Sistema]", reason, int(time.time())),
@@ -208,20 +208,10 @@ class Database:
             )
 
     def get_latest_logs(self, limit=10):
-        # Tenta selecionar com admin_id, se falhar, tenta sem
-        res = self.execute("SELECT chat_id, user_id, admin_id, content, reason, created_at FROM deleted_logs ORDER BY created_at DESC LIMIT ?", (limit,))
-        if res: return res.fetchall()
-        
-        res = self.execute("SELECT chat_id, user_id, content, reason, created_at FROM deleted_logs ORDER BY created_at DESC LIMIT ?", (limit,))
+        res = self.execute("SELECT * FROM deleted_logs ORDER BY created_at DESC LIMIT ?", (limit,))
         if res:
             rows = res.fetchall()
-            # Adiciona admin_id fake para não quebrar o código do comando
-            new_rows = []
-            for r in rows:
-                d = dict(r)
-                d['admin_id'] = None
-                new_rows.append(d)
-            return new_rows
+            return [dict(r) for r in rows]
         return []
 
 db = Database(DB_PATH)
@@ -316,11 +306,11 @@ async def global_security_filter(event):
                     await event.delete()
                     raise events.StopPropagation
 
-# --- COMANDOS DO TELETHON (V4.2 - BLINDAGEM DE BANCO) ---
+# --- COMANDOS ---
 
 @client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    text = "🛡️ <b>Jtzin Userbot V4.2 (Blindagem Total)</b>\n\nEquipe Diamond — Segurança total."
+    text = "🛡️ <b>Jtzin Userbot V4.3 (Estabilidade Final)</b>\n\nEquipe Diamond — Blindado."
     await reply_or_edit(event, text, delete_after=2)
 
 @client.on(events.NewMessage(pattern=r'^\.unban', func=lambda e: is_authorized(e.sender_id)))
@@ -420,7 +410,7 @@ async def cmd_logs(event):
     if not logs:
         await reply_or_edit(event, "📭 Nenhum log registrado recentemente.", delete_after=5)
         return
-    text = "📜 <b>LOGS DE ATIVIDADE (V4.2)</b>\n\n"
+    text = "📜 <b>LOGS DE ATIVIDADE (V4.3)</b>\n\n"
     for log in logs:
         user_info = db.get_user_info(log['user_id'])
         time_str = datetime.fromtimestamp(log['created_at']).strftime('%H:%M:%S')
@@ -436,7 +426,6 @@ async def cmd_logs(event):
 
 @client.on(events.NewMessage(pattern=r'^\.listdn', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_listdn(event):
-    cache.load_all(db.conn)
     shadow, glob = db.get_all_banned_list_detailed()
     text = "📋 <b>LISTA DE PUNIÇÕES GLOBAIS</b>\n\n"
     if shadow:
@@ -471,7 +460,7 @@ async def cmd_autorizar(event):
 @client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V4.2</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V4.3</b>\n\n"
         "🛡️ <b>MODERAÇÃO:</b>\n"
         "• <code>.ban</code> | <code>.unban</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
@@ -587,7 +576,7 @@ async def cmd_chats(event):
         elif r['chat_type'] in ['private', 'User']:
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
-    text = "📡 <b>RELATÓRIO DE CHATS V4.2</b>\n\n"
+    text = "📡 <b>RELATÓRIO DE CHATS V4.3</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
@@ -598,7 +587,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V4.2 (BLINDAGEM & AUTO-DELEÇÃO TOTAL) INICIANDO...")
+    logger.info("JTZIN USERBOT V4.3 (ESTABILIDADE FINAL) INICIANDO...")
     client.start()
-    logger.info("USERBOT TELETHON ONLINE E OPERACIONAL!")
+    logger.info("USERBOT TELETHON ONLINE!")
     client.run_until_disconnected()
