@@ -8,7 +8,7 @@ DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "bot.db"
 
 def migrate():
-    print("Iniciando Migração V1.4.1 (Punições Locais vs Globais)...")
+    print("Iniciando Migração V1.4.2 (Anti-Porn & Permissões)...")
     conn = sqlite3.connect(DB_PATH)
     
     # Tabela de Chats
@@ -35,7 +35,8 @@ def migrate():
         chat_id INTEGER PRIMARY KEY,
         antispam INTEGER DEFAULT 1,
         antilink INTEGER DEFAULT 0,
-        captcha_enabled INTEGER DEFAULT 0
+        captcha_enabled INTEGER DEFAULT 0,
+        protect_porn INTEGER DEFAULT 0
     )""")
 
     # --- PUNIÇÕES LOCAIS ---
@@ -107,7 +108,13 @@ def migrate():
 
     conn.commit()
     conn.close()
-    print("Migração V1.4.1 concluída com sucesso!")
+    # Adicionar coluna se não existir (para quem já tem o banco)
+    try:
+        conn.execute("ALTER TABLE settings ADD COLUMN protect_porn INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass # Coluna já existe
+
+    print("Migração V1.4.2 concluída com sucesso!")
 
 if __name__ == "__main__":
     migrate()
