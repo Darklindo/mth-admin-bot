@@ -92,7 +92,7 @@ class Cache:
             except sqlite3.OperationalError:
                 pass
 
-            logger.info("Cache carregado com sucesso (V6.6 - Stability Audit).")
+            logger.info("Cache carregado com sucesso (V6.7 - Stability Audit).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -343,6 +343,21 @@ def parse_purge_limit(event, default=50):
     return min(value, MAX_PURGE_LIMIT), None
 
 
+async def delete_message_safely(message, label="mensagem"):
+    if message is None:
+        return False
+    try:
+        await message.delete()
+        return True
+    except Exception as exc:
+        logger.debug(f"Não foi possível apagar {label}: {exc}")
+        return False
+
+
+async def delete_command_safely(event):
+    return await delete_message_safely(event, "mensagem de comando")
+
+
 async def reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER):
     msg = None
     try:
@@ -361,12 +376,13 @@ async def reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER):
             logger.error(f"Erro ao enviar/editar resposta: {fallback_exc}")
             return
 
-    if delete_after and msg:
+    if delete_after:
         await asyncio.sleep(delete_after)
-        try:
-            await msg.delete()
-        except Exception as exc:
-            logger.debug(f"Não foi possível apagar resposta automática: {exc}")
+        # Quando a conta envia o comando, a edição e a confirmação têm o
+        # mesmo ID; quando outro usuário autorizado envia, são mensagens distintas.
+        if msg is not event and getattr(msg, "id", None) != getattr(event, "id", None):
+            await delete_message_safely(msg, "resposta automática")
+        await delete_command_safely(event)
 
 
 async def send_broadcast_payload(chat_id, reply, text=None):
@@ -472,7 +488,7 @@ async def global_security_filter(event):
 
 @client.on(events.NewMessage(pattern=r'^\.start(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    text = "🛡️ <b>Jtzin Userbot V6.6 (Stability Audit)</b>\n\nEquipe Diamond — Operacional."
+    text = "🛡️ <b>Jtzin Userbot V6.7 (Stability Audit)</b>\n\nEquipe Diamond — Operacional."
     await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.antiblack(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
@@ -754,7 +770,7 @@ async def cmd_logs(event):
     if not logs:
         await reply_or_edit(event, "📭 Nenhum log registrado recentemente.", delete_after=5)
         return
-    text = "📜 <b>LOGS DE ATIVIDADE (V6.6)</b>\n\n"
+    text = "📜 <b>LOGS DE ATIVIDADE (V6.7)</b>\n\n"
     for log in logs:
         user_info = db.get_user_info(log['user_id'])
         time_str = format_timestamp(log['created_at'], '%H:%M:%S')
@@ -797,7 +813,7 @@ async def cmd_listdn(event):
 @client.on(events.NewMessage(pattern=r'^\.help(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.6</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.7</b>\n\n"
         "🛡️ <b>MODERAÇÃO LOCAL & REVERSÃO:</b>\n"
         "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code> | <code>.purge [qtd]</code> | <code>.purgeme [qtd]</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
@@ -859,10 +875,7 @@ async def cmd_antispy(event):
         await bait_msg.edit(f"❌ Erro na varredura AntiSpy: {e}", parse_mode='html')
         await asyncio.sleep(DEFAULT_DELETE_AFTER)
         await bait_msg.delete()
-    try:
-        await event.delete()
-    except Exception as exc:
-        logger.debug(f"Não foi possível apagar a mensagem do comando: {exc}")
+    await delete_command_safely(event)
 
 @client.on(events.NewMessage(pattern=r'^\.listspy(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_listspy(event):
@@ -927,10 +940,7 @@ async def cmd_purge(event):
         await asyncio.sleep(DEFAULT_DELETE_AFTER)
         await status_msg.delete()
 
-    try:
-        await event.delete()
-    except Exception as exc:
-        logger.debug(f"Não foi possível apagar a mensagem do comando: {exc}")
+    await delete_command_safely(event)
 
 @client.on(events.NewMessage(pattern=r'^\.purgeme(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_purgeme(event):
@@ -966,10 +976,7 @@ async def cmd_purgeme(event):
         await asyncio.sleep(DEFAULT_DELETE_AFTER)
         await status_msg.delete()
 
-    try:
-        await event.delete()
-    except Exception as exc:
-        logger.debug(f"Não foi possível apagar a mensagem do comando: {exc}")
+    await delete_command_safely(event)
 
 @client.on(events.NewMessage(pattern=r'^\.id(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_id(event):
@@ -1011,7 +1018,7 @@ async def cmd_chats(event):
         elif r['chat_type'] in ['private', 'User']:
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
-    text = "📡 <b>RELATÓRIO DE CHATS V6.6</b>\n\n"
+    text = "📡 <b>RELATÓRIO DE CHATS V6.7</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
@@ -1022,7 +1029,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V6.6 (STABILITY AUDIT) INICIANDO...")
+    logger.info("JTZIN USERBOT V6.7 (STABILITY AUDIT) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE!")
     client.run_until_disconnected()
