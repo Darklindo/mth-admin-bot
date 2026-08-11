@@ -72,7 +72,7 @@ class Cache:
                 self.settings[row[0]] = {
                     "antispam": row[1], "antilink": row[2], "captcha_enabled": row[3]
                 }
-            logger.info("Cache carregado com sucesso (V3.3).")
+            logger.info("Cache carregado com sucesso (V3.4).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -189,15 +189,15 @@ class Database:
             commit=True
         )
 
-    def add_deleted_log(self, chat_id, user_id, content, reason):
+    def add_deleted_log(self, chat_id, user_id, content, reason, admin_id=None):
         self.execute(
-            "INSERT INTO deleted_logs(chat_id, user_id, content, reason, created_at) VALUES(?,?,?,?,?)",
-            (int(chat_id), int(user_id), content or "[Mídia/Sem Texto]", reason, int(time.time())),
+            "INSERT INTO deleted_logs(chat_id, user_id, admin_id, content, reason, created_at) VALUES(?,?,?,?,?,?)",
+            (int(chat_id), int(user_id), admin_id, content or "[Ação de Sistema]", reason, int(time.time())),
             commit=True
         )
 
     def get_latest_logs(self, limit=10):
-        return self.execute("SELECT chat_id, user_id, content, reason, created_at FROM deleted_logs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        return self.execute("SELECT chat_id, user_id, admin_id, content, reason, created_at FROM deleted_logs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
 
 db = Database(DB_PATH)
 
@@ -286,12 +286,12 @@ async def global_security_filter(event):
                     await event.delete()
                     raise events.StopPropagation
 
-# --- COMANDOS DO TELETHON (V3.3 - REVERSÃO) ---
+# --- COMANDOS DO TELETHON (V3.4 - LOGS DE ADMIN) ---
 
 @client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
     text = (
-        "🛡️ <b>Jtzin Userbot V3.3 (Controle Total)</b>\n\n"
+        "🛡️ <b>Jtzin Userbot V3.4 (Logs de Admin)</b>\n\n"
         "Userbot de administração avançado operando com estabilidade máxima.\n"
         "Equipe Diamond — Segurança total."
     )
@@ -306,6 +306,7 @@ async def cmd_unban(event):
     try:
         await client.edit_permissions(event.chat_id, target_id, view_messages=True, send_messages=True)
         db.remove_local_banperm(event.chat_id, target_id)
+        db.add_deleted_log(event.chat_id, target_id, "Ação: Unban", "Reversão", admin_id=event.sender_id)
         user_info = db.get_user_info(target_id)
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) desbanido com sucesso.")
     except Exception as e:
@@ -319,6 +320,7 @@ async def cmd_unmute(event):
         return
     try:
         await client.edit_permissions(event.chat_id, target_id, send_messages=True)
+        db.add_deleted_log(event.chat_id, target_id, "Ação: Unmute", "Reversão", admin_id=event.sender_id)
         user_info = db.get_user_info(target_id)
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) pode falar novamente.")
     except Exception as e:
@@ -331,6 +333,7 @@ async def cmd_unblacklist(event):
         await reply_or_edit(event, "❌ Especifique o usuário.")
         return
     db.remove_local_blacklist(event.chat_id, target_id)
+    db.add_deleted_log(event.chat_id, target_id, "Ação: Unblacklist Local", "Reversão", admin_id=event.sender_id)
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido da blacklist local.")
 
@@ -341,6 +344,7 @@ async def cmd_unallblack(event):
         await reply_or_edit(event, "❌ Especifique o usuário.")
         return
     db.remove_global_blacklist(target_id)
+    db.add_deleted_log(0, target_id, "Ação: Unallblack Global", "Reversão", admin_id=event.sender_id)
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido da blacklist global.")
 
@@ -351,6 +355,7 @@ async def cmd_unbanperm(event):
         await reply_or_edit(event, "❌ Especifique o usuário.")
         return
     db.remove_local_banperm(event.chat_id, target_id)
+    db.add_deleted_log(event.chat_id, target_id, "Ação: Unbanperm", "Reversão", admin_id=event.sender_id)
     try:
         await client.edit_permissions(event.chat_id, target_id, view_messages=True)
     except: pass
@@ -361,17 +366,21 @@ async def cmd_unbanperm(event):
 async def cmd_logs(event):
     logs = db.get_latest_logs(10)
     if not logs:
-        await reply_or_edit(event, "📭 Nenhum log de deleção registrado recentemente.")
+        await reply_or_edit(event, "📭 Nenhum log registrado recentemente.")
         return
     
-    text = "📜 <b>LOGS DE MENSAGENS APAGADAS</b>\n\n"
+    text = "📜 <b>LOGS DE ATIVIDADE (V3.4)</b>\n\n"
     for log in logs:
         user_info = db.get_user_info(log['user_id'])
         time_str = datetime.fromtimestamp(log['created_at']).strftime('%H:%M:%S')
         content = (log['content'][:30] + '...') if len(log['content']) > 30 else log['content']
+        
         text += f"⏰ <code>{time_str}</code> | 👤 {user_info}\n"
         text += f"🚫 <b>Motivo:</b> {log['reason']}\n"
-        text += f"💬 <b>Texto:</b> <i>{content}</i>\n"
+        if log['admin_id']:
+            admin_info = db.get_user_info(log['admin_id'])
+            text += f"👮 <b>Admin:</b> {admin_info}\n"
+        text += f"💬 <b>Conteúdo:</b> <i>{content}</i>\n"
         text += "------------------\n"
     
     await reply_or_edit(event, text)
@@ -416,7 +425,7 @@ async def cmd_autorizar(event):
 @client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V3.3</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V3.4</b>\n\n"
         "🛡️ <b>MODERAÇÃO:</b>\n"
         "• <code>.ban</code> | <code>.unban</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
@@ -536,7 +545,7 @@ async def cmd_chats(event):
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
 
-    text = "📡 <b>RELATÓRIO DE CHATS V3.3</b>\n\n"
+    text = "📡 <b>RELATÓRIO DE CHATS V3.4</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
@@ -548,7 +557,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V3.3 (REVERSÃO) INICIANDO...")
+    logger.info("JTZIN USERBOT V3.4 (LOGS DE ADMIN) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE E OPERACIONAL!")
     client.run_until_disconnected()

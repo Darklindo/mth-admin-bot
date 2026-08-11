@@ -88,12 +88,13 @@ def migrate():
         created_at INTEGER
     )""")
 
-    # Logs de mensagens deletadas
+    # Logs de mensagens deletadas e ações de admin
     conn.execute("""
     CREATE TABLE IF NOT EXISTS deleted_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id INTEGER,
         user_id INTEGER,
+        admin_id INTEGER, -- ID do admin que executou a ação (opcional)
         content TEXT,
         reason TEXT,
         created_at INTEGER
