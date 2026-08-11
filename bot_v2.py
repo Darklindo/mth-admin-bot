@@ -75,7 +75,7 @@ class Cache:
             except sqlite3.OperationalError:
                 pass
 
-            logger.info("Cache carregado com sucesso (V5.2 - AntiSpy Persistente).")
+            logger.info("Cache carregado com sucesso (V6.0 - Ultimate Edition).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -333,7 +333,7 @@ async def global_security_filter(event):
 
 @client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    text = "🛡️ <b>Jtzin Userbot V5.2 (AntiSpy Persistente)</b>\n\nEquipe Diamond — Operacional."
+    text = "🛡️ <b>Jtzin Userbot V6.0 (Ultimate Edition)</b>\n\nEquipe Diamond — Operacional."
     await reply_or_edit(event, text, delete_after=2)
 
 @client.on(events.NewMessage(pattern=r'^\.antiblack', func=lambda e: is_authorized(e.sender_id)))
@@ -629,18 +629,26 @@ async def cmd_listdn(event):
 @client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V5.2</b>\n\n"
-        "🛡️ <b>MODERAÇÃO:</b>\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.0</b>\n\n"
+        "🛡️ <b>MODERAÇÃO LOCAL & REVERSÃO:</b>\n"
         "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
         "• <code>.blacklist</code> | <code>.unblacklist</code>\n"
         "• <code>.banperm</code> | <code>.unbanperm</code>\n"
         "• <code>.shadow</code> | <code>.unshadow</code>\n\n"
-        "👑 <b>CONTROLE E SEGURANÇA:</b>\n"
-        "• <code>.antiblack on/off</code> (Modo Fênix)\n• <code>.antispy</code> | <code>.listspy</code> | <code>.delspy</code> (Caça-Espiões)\n"
-        "• <code>.autorizar</code> | <code>.logs</code>\n"
-        "• <code>.allban / .allblack / .unallblack</code>\n"
-        "• <code>.msg</code> | <code>.chats</code> | <code>.listdn</code>"
+        "👑 <b>CONTROLE NUCLEAS & GLOBAIS:</b>\n"
+        "• <code>.allban</code> | <code>.allblack</code> | <code>.unallblack</code>\n"
+        "• <code>.autorizar</code> (Dar acesso a usuários)\n\n"
+        "🔍 <b>SEGURANÇA & CONTRA-ESPIONAGEM:</b>\n"
+        "• <code>.antiblack on/off</code> (Modo Fênix)\n"
+        "• <code>.antispy</code> (Varredura de Espiões)\n"
+        "• <code>.listspy</code> | <code>.delspy</code> (Gestão de Espiões)\n\n"
+        "🛠️ <b>UTILITÁRIOS & RELATÓRIOS:</b>\n"
+        "• <code>.msg</code> (Broadcast Global)\n"
+        "• <code>.chats</code> (Lista de Chats)\n"
+        "• <code>.listdn</code> (Punições Globais)\n"
+        "• <code>.logs</code> (Auditoria de Deleções)\n"
+        "• <code>.id</code> | <code>.help</code>"
     )
     await reply_or_edit(event, text, delete_after=15)
 
@@ -747,7 +755,7 @@ async def cmd_chats(event):
         elif r['chat_type'] in ['private', 'User']:
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
-    text = "📡 <b>RELATÓRIO DE CHATS V5.2</b>\n\n"
+    text = "📡 <b>RELATÓRIO DE CHATS V6.0</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
@@ -758,7 +766,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V5.2 (ANTISPY PERSISTENTE) INICIANDO...")
+    logger.info("JTZIN USERBOT V6.0 (ULTIMATE EDITION) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE!")
     client.run_until_disconnected()
