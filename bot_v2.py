@@ -67,12 +67,16 @@ class Cache:
             cursor = db_conn.execute("SELECT user_id FROM authorized_users")
             self.authorized_users = {row[0] for row in cursor.fetchall()}
             
-            cursor = db_conn.execute("SELECT chat_id, antispam, antilink, captcha_enabled FROM settings")
-            for row in cursor.fetchall():
-                self.settings[row[0]] = {
-                    "antispam": row[1], "antilink": row[2], "captcha_enabled": row[3]
-                }
-            logger.info("Cache carregado com sucesso (V4.1).")
+            try:
+                cursor = db_conn.execute("SELECT chat_id, antispam, antilink, captcha_enabled FROM settings")
+                for row in cursor.fetchall():
+                    self.settings[row[0]] = {
+                        "antispam": row[1], "antilink": row[2], "captcha_enabled": row[3]
+                    }
+            except sqlite3.OperationalError:
+                logger.warning("Tabela settings incompleta no cache. Rode migrate_db.py.")
+
+            logger.info("Cache carregado com sucesso (V4.2).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -190,14 +194,35 @@ class Database:
         )
 
     def add_deleted_log(self, chat_id, user_id, content, reason, admin_id=None):
-        self.execute(
+        # Tenta inserir com admin_id, se falhar (coluna não existe), tenta sem
+        res = self.execute(
             "INSERT INTO deleted_logs(chat_id, user_id, admin_id, content, reason, created_at) VALUES(?,?,?,?,?,?)",
             (int(chat_id), int(user_id), admin_id, content or "[Ação de Sistema]", reason, int(time.time())),
             commit=True
         )
+        if res is None: # Provavelmente erro de admin_id ausente
+            self.execute(
+                "INSERT INTO deleted_logs(chat_id, user_id, content, reason, created_at) VALUES(?,?,?,?,?)",
+                (int(chat_id), int(user_id), content or "[Ação de Sistema]", reason, int(time.time())),
+                commit=True
+            )
 
     def get_latest_logs(self, limit=10):
-        return self.execute("SELECT chat_id, user_id, admin_id, content, reason, created_at FROM deleted_logs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        # Tenta selecionar com admin_id, se falhar, tenta sem
+        res = self.execute("SELECT chat_id, user_id, admin_id, content, reason, created_at FROM deleted_logs ORDER BY created_at DESC LIMIT ?", (limit,))
+        if res: return res.fetchall()
+        
+        res = self.execute("SELECT chat_id, user_id, content, reason, created_at FROM deleted_logs ORDER BY created_at DESC LIMIT ?", (limit,))
+        if res:
+            rows = res.fetchall()
+            # Adiciona admin_id fake para não quebrar o código do comando
+            new_rows = []
+            for r in rows:
+                d = dict(r)
+                d['admin_id'] = None
+                new_rows.append(d)
+            return new_rows
+        return []
 
 db = Database(DB_PATH)
 
@@ -291,27 +316,12 @@ async def global_security_filter(event):
                     await event.delete()
                     raise events.StopPropagation
 
-# --- COMANDOS DO TELETHON (V4.1 - AUTO-DELEÇÃO 2S EM TODOS OS COMANDOS) ---
+# --- COMANDOS DO TELETHON (V4.2 - BLINDAGEM DE BANCO) ---
 
 @client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    text = "🛡️ <b>Jtzin Userbot V4.1 (Blindagem Absoluta)</b>\n\nEquipe Diamond — Segurança total."
+    text = "🛡️ <b>Jtzin Userbot V4.2 (Blindagem Total)</b>\n\nEquipe Diamond — Segurança total."
     await reply_or_edit(event, text, delete_after=2)
-
-@client.on(events.NewMessage(pattern=r'^\.ban', func=lambda e: is_authorized(e.sender_id)))
-async def cmd_ban(event):
-    target_id = await get_target_from_event(event)
-    if not target_id or is_owner(target_id):
-        await reply_or_edit(event, "❌ Alvo inválido.", delete_after=2)
-        return
-    try:
-        await client.edit_permissions(event.chat_id, target_id, view_messages=False)
-        user_info = db.get_user_info(target_id)
-        await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) banido com sucesso.", delete_after=2)
-    except ChatAdminRequiredError:
-        await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=2)
-    except Exception as e:
-        await reply_or_edit(event, f"❌ Erro ao banir: {e}", delete_after=2)
 
 @client.on(events.NewMessage(pattern=r'^\.unban', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unban(event):
@@ -331,21 +341,6 @@ async def cmd_unban(event):
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=2)
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao desbanir: {e}", delete_after=2)
-
-@client.on(events.NewMessage(pattern=r'^\.mute', func=lambda e: is_authorized(e.sender_id)))
-async def cmd_mute(event):
-    target_id = await get_target_from_event(event)
-    if not target_id or is_owner(target_id):
-        await reply_or_edit(event, "❌ Alvo inválido.", delete_after=2)
-        return
-    try:
-        await client.edit_permissions(event.chat_id, target_id, send_messages=False)
-        user_info = db.get_user_info(target_id)
-        await reply_or_edit(event, f"🔇 {user_info} (<code>{target_id}</code>) silenciado.", delete_after=2)
-    except ChatAdminRequiredError:
-        await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=2)
-    except Exception as e:
-        await reply_or_edit(event, f"❌ Erro ao mutar: {e}", delete_after=2)
 
 @client.on(events.NewMessage(pattern=r'^\.unmute', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unmute(event):
@@ -425,14 +420,14 @@ async def cmd_logs(event):
     if not logs:
         await reply_or_edit(event, "📭 Nenhum log registrado recentemente.", delete_after=5)
         return
-    text = "📜 <b>LOGS DE ATIVIDADE (V4.1)</b>\n\n"
+    text = "📜 <b>LOGS DE ATIVIDADE (V4.2)</b>\n\n"
     for log in logs:
         user_info = db.get_user_info(log['user_id'])
         time_str = datetime.fromtimestamp(log['created_at']).strftime('%H:%M:%S')
         content = (log['content'][:30] + '...') if len(log['content']) > 30 else log['content']
         text += f"⏰ <code>{time_str}</code> | 👤 {user_info}\n"
         text += f"🚫 <b>Motivo:</b> {log['reason']}\n"
-        if log['admin_id']:
+        if log.get('admin_id'):
             admin_info = db.get_user_info(log['admin_id'])
             text += f"👮 <b>Admin:</b> {admin_info}\n"
         text += f"💬 <b>Conteúdo:</b> <i>{content}</i>\n"
@@ -476,7 +471,7 @@ async def cmd_autorizar(event):
 @client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V4.1</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V4.2</b>\n\n"
         "🛡️ <b>MODERAÇÃO:</b>\n"
         "• <code>.ban</code> | <code>.unban</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
@@ -592,7 +587,7 @@ async def cmd_chats(event):
         elif r['chat_type'] in ['private', 'User']:
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
-    text = "📡 <b>RELATÓRIO DE CHATS V4.1</b>\n\n"
+    text = "📡 <b>RELATÓRIO DE CHATS V4.2</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
@@ -603,7 +598,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V4.1 (BLINDAGEM & AUTO-DELEÇÃO TOTAL) INICIANDO...")
+    logger.info("JTZIN USERBOT V4.2 (BLINDAGEM & AUTO-DELEÇÃO TOTAL) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE E OPERACIONAL!")
     client.run_until_disconnected()

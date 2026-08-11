@@ -8,7 +8,7 @@ DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "bot.db"
 
 def migrate():
-    print("Iniciando Migração V1.4.2 (Anti-Porn & Permissões)...")
+    print("Iniciando Migração V4.2 (Correção de Colunas)...")
     conn = sqlite3.connect(DB_PATH)
     
     # Tabela de Chats
@@ -95,11 +95,33 @@ def migrate():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id INTEGER,
         user_id INTEGER,
-        admin_id INTEGER, -- ID do admin que executou a ação (opcional)
         content TEXT,
         reason TEXT,
         created_at INTEGER
     )""")
+
+    # --- VERIFICAÇÃO DE COLUNAS FALTANTES (ESSENCIAL) ---
+    cursor = conn.cursor()
+    
+    # Adicionar admin_id na tabela deleted_logs
+    cursor.execute("PRAGMA table_info(deleted_logs)")
+    columns = [column[1] for column in cursor.fetchall()]
+    if 'admin_id' not in columns:
+        print("Adicionando coluna 'admin_id' em 'deleted_logs'...")
+        try:
+            cursor.execute("ALTER TABLE deleted_logs ADD COLUMN admin_id INTEGER")
+        except Exception as e:
+            print(f"Erro ao adicionar admin_id: {e}")
+
+    # Adicionar protect_porn na tabela settings
+    cursor.execute("PRAGMA table_info(settings)")
+    columns = [column[1] for column in cursor.fetchall()]
+    if 'protect_porn' not in columns:
+        print("Adicionando coluna 'protect_porn' em 'settings'...")
+        try:
+            cursor.execute("ALTER TABLE settings ADD COLUMN protect_porn INTEGER DEFAULT 0")
+        except Exception as e:
+            print(f"Erro ao adicionar protect_porn: {e}")
 
     # Índices para performance
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
@@ -108,13 +130,7 @@ def migrate():
 
     conn.commit()
     conn.close()
-    # Adicionar coluna se não existir (para quem já tem o banco)
-    try:
-        conn.execute("ALTER TABLE settings ADD COLUMN protect_porn INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass # Coluna já existe
-
-    print("Migração V1.4.2 concluída com sucesso!")
+    print("Migração V4.2 concluída com sucesso!")
 
 if __name__ == "__main__":
     migrate()
