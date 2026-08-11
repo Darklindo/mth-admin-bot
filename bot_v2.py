@@ -746,14 +746,16 @@ async def cmd_purge(event):
     
     deleted_count = 0
     try:
-        async for msg in client.iter_messages(event.chat_id, limit=300):
+        # Varre o histórico do chat garantindo que qualquer tipo de mensagem (texto, foto, gif, sticker, documento, áudio, vídeo) seja deletada
+        async for msg in client.iter_messages(event.chat_id, limit=500):
             if msg.sender_id == target_id:
                 try:
                     await msg.delete()
                     deleted_count += 1
                     if deleted_count >= limit:
                         break
-                except:
+                except Exception as del_err:
+                    logger.error(f"Erro ao deletar mensagem ID {msg.id}: {del_err}")
                     pass
         await status_msg.edit(f"✅ <b>Limpeza concluída!</b> {deleted_count} mensagens de {info} foram apagadas.", parse_mode='html')
         await asyncio.sleep(2)
