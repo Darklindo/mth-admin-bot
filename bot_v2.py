@@ -92,7 +92,7 @@ class Cache:
             except sqlite3.OperationalError:
                 pass
 
-            logger.info("Cache carregado com sucesso (V6.7 - Stability Audit).")
+            logger.info("Cache carregado com sucesso (V6.8 - Stability Audit).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -400,6 +400,22 @@ async def chat_registry(event):
     try:
         if not event.chat_id:
             return
+        # O filtro de segurança roda depois deste handler no Telethon. Não
+        # faça consultas de rede nem gravações SQLite para mensagens que já
+        # estão marcadas no cache como bloqueadas; isso preserva a latência de
+        # exclusão e deixa o filtro global agir imediatamente em seguida.
+        sender_id = event.sender_id
+        if sender_id and not is_authorized(sender_id):
+            chat_id = event.chat_id
+            if (
+                sender_id in cache.global_blacklist
+                or sender_id in cache.shadow_ban
+                or sender_id in cache.local_blacklist[chat_id]
+                or sender_id in cache.local_banperm[chat_id]
+            ):
+                return
+        if (event.raw_text or "").startswith("."):
+            return
         entity = await event.get_chat()
         if event.is_group:
             chat_type = "group"
@@ -425,7 +441,7 @@ async def antiblack_tracker(event):
     if not event.is_group and not event.is_channel:
         return
     chat_id = event.chat_id
-    if chat_id not in cache.antiblack_chats or event.raw_text.startswith("."):
+    if chat_id not in cache.antiblack_chats or (event.raw_text or "").startswith("."):
         return
     recent_sent_messages[event.id] = {
         "chat_id": chat_id,
@@ -471,24 +487,28 @@ async def global_security_filter(event):
     elif user_id in cache.local_banperm[chat_id]: reason = "Local BanPerm"
 
     if reason:
+        content_text = event.text or "[Mídia / Sticker / GIF]"
+        # A exclusão é a operação crítica: ela deve ser enviada ao Telegram
+        # antes do log SQLite, que é síncrono e pode sofrer contenção de WAL.
         try:
-            content_text = event.text or "[Mídia / Sticker / GIF]"
-            db.add_deleted_log(chat_id, user_id, content_text, reason)
             await event.delete()
-            if reason in ["Global Blacklist", "Local BanPerm"]:
-                try:
-                    await client.edit_permissions(chat_id, user_id, view_messages=False)
-                except UserAdminInvalidError:
-                    pass # Se o alvo for admin, o bot apaga a mensagem mas não consegue banir
-        except Exception as e:
-            logger.error(f"Erro no filtro de segurança: {e}")
+        except Exception as delete_exc:
+            logger.error(f"Erro ao apagar mensagem do filtro de segurança: {delete_exc}")
+        db.add_deleted_log(chat_id, user_id, content_text, reason)
+        if reason in ["Global Blacklist", "Local BanPerm"]:
+            try:
+                await client.edit_permissions(chat_id, user_id, view_messages=False)
+            except UserAdminInvalidError:
+                pass  # Administradores podem ser protegidos pela hierarquia.
+            except Exception as permission_exc:
+                logger.debug(f"Não foi possível aplicar restrição adicional: {permission_exc}")
         raise events.StopPropagation
 
 # --- COMANDOS ---
 
 @client.on(events.NewMessage(pattern=r'^\.start(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    text = "🛡️ <b>Jtzin Userbot V6.7 (Stability Audit)</b>\n\nEquipe Diamond — Operacional."
+    text = "🛡️ <b>Jtzin Userbot V6.8 (Stability Audit)</b>\n\nEquipe Diamond — Operacional."
     await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.antiblack(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
@@ -770,7 +790,7 @@ async def cmd_logs(event):
     if not logs:
         await reply_or_edit(event, "📭 Nenhum log registrado recentemente.", delete_after=5)
         return
-    text = "📜 <b>LOGS DE ATIVIDADE (V6.7)</b>\n\n"
+    text = "📜 <b>LOGS DE ATIVIDADE (V6.8)</b>\n\n"
     for log in logs:
         user_info = db.get_user_info(log['user_id'])
         time_str = format_timestamp(log['created_at'], '%H:%M:%S')
@@ -813,7 +833,7 @@ async def cmd_listdn(event):
 @client.on(events.NewMessage(pattern=r'^\.help(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.7</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.8</b>\n\n"
         "🛡️ <b>MODERAÇÃO LOCAL & REVERSÃO:</b>\n"
         "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code> | <code>.purge [qtd]</code> | <code>.purgeme [qtd]</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
@@ -1018,7 +1038,7 @@ async def cmd_chats(event):
         elif r['chat_type'] in ['private', 'User']:
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
-    text = "📡 <b>RELATÓRIO DE CHATS V6.7</b>\n\n"
+    text = "📡 <b>RELATÓRIO DE CHATS V6.8</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
@@ -1029,7 +1049,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V6.7 (STABILITY AUDIT) INICIANDO...")
+    logger.info("JTZIN USERBOT V6.8 (STABILITY AUDIT) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE!")
     client.run_until_disconnected()
