@@ -75,7 +75,7 @@ class Cache:
             except sqlite3.OperationalError:
                 pass
 
-            logger.info("Cache carregado com sucesso (V6.1 - Purge Edition).")
+            logger.info("Cache carregado com sucesso (V6.2 - Purge Pro Edition).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -333,7 +333,7 @@ async def global_security_filter(event):
 
 @client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    text = "🛡️ <b>Jtzin Userbot V6.1 (Purge Edition)</b>\n\nEquipe Diamond — Operacional."
+    text = "🛡️ <b>Jtzin Userbot V6.2 (Purge Pro Edition)</b>\n\nEquipe Diamond — Operacional."
     await reply_or_edit(event, text, delete_after=2)
 
 @client.on(events.NewMessage(pattern=r'^\.antiblack', func=lambda e: is_authorized(e.sender_id)))
@@ -629,9 +629,9 @@ async def cmd_listdn(event):
 @client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.1</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.2</b>\n\n"
         "🛡️ <b>MODERAÇÃO LOCAL & REVERSÃO:</b>\n"
-        "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code> | <code>.purge [qtd]</code>\n"
+        "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code> | <code>.purge [qtd]</code> | <code>.purgeme [qtd]</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
         "• <code>.blacklist</code> | <code>.unblacklist</code>\n"
         "• <code>.banperm</code> | <code>.unbanperm</code>\n"
@@ -728,7 +728,7 @@ async def cmd_purge(event):
     target_id = await get_target_from_event(event)
     args = event.raw_text.split()
     
-    # Extrair quantidade (máx 100)
+    # Extrair quantidade solicitada (padrão 50, máx 100)
     limit = 50
     for arg in args:
         if arg.isdigit():
@@ -738,17 +738,17 @@ async def cmd_purge(event):
                 break
 
     if not target_id:
-        await reply_or_edit(event, "❌ Responda à mensagem do usuário ou informe @username / ID junto com a quantidade. Ex: <code>.purge 30</code>", delete_after=3)
+        await reply_or_edit(event, "❌ Responda à mensagem do usuário ou informe @username / ID junto com a quantidade. Ex: <code>.purge 10</code>", delete_after=3)
         return
 
     info = db.get_user_info(target_id)
-    status_msg = await event.respond(f"🧹 [Purge] Varrendo até {limit} mensagens recentes de {info}...")
+    status_msg = await event.respond(f"🧹 [Purge] Apagando até {limit} mensagens (qualquer tipo) de {info}...")
     
     deleted_count = 0
     try:
-        # Varre o histórico do chat garantindo que qualquer tipo de mensagem (texto, foto, gif, sticker, documento, áudio, vídeo) seja deletada
-        async for msg in client.iter_messages(event.chat_id, limit=500):
-            if msg.sender_id == target_id:
+        # Varre o histórico iterando e apagando exatamente o número de mensagens solicitadas (texto, gifs, stickers, mídia, etc.)
+        async for msg in client.iter_messages(event.chat_id, limit=300):
+            if msg.sender_id == target_id and msg.id != event.id:
                 try:
                     await msg.delete()
                     deleted_count += 1
@@ -757,11 +757,54 @@ async def cmd_purge(event):
                 except Exception as del_err:
                     logger.error(f"Erro ao deletar mensagem ID {msg.id}: {del_err}")
                     pass
-        await status_msg.edit(f"✅ <b>Limpeza concluída!</b> {deleted_count} mensagens de {info} foram apagadas.", parse_mode='html')
+        await status_msg.edit(f"✅ <b>Purge concluído!</b> {deleted_count} mensagens de {info} foram apagadas.", parse_mode='html')
         await asyncio.sleep(2)
         await status_msg.delete()
     except Exception as e:
         await status_msg.edit(f"❌ Erro ao executar .purge: {e}", parse_mode='html')
+        await asyncio.sleep(4)
+        await status_msg.delete()
+
+    try:
+        await event.delete()
+    except:
+        pass
+
+@client.on(events.NewMessage(pattern=r'^\.purgeme', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_purgeme(event):
+    if not event.is_group and not event.is_channel:
+        await reply_or_edit(event, "❌ Este comando só pode ser usado em grupos ou canais.", delete_after=2)
+        return
+    
+    args = event.raw_text.split()
+    limit = 50
+    for arg in args:
+        if arg.isdigit():
+            val = int(arg)
+            if val > 0:
+                limit = min(val, 100)
+                break
+
+    status_msg = await event.respond(f"🧹 [PurgeMe] Apagando suas últimas {limit} mensagens...")
+    
+    deleted_count = 0
+    me_id = event.sender_id
+    try:
+        async for msg in client.iter_messages(event.chat_id, limit=300):
+            if msg.sender_id == me_id and msg.id != status_msg.id and msg.id != event.id:
+                try:
+                    await msg.delete()
+                    deleted_count += 1
+                    if deleted_count >= limit:
+                        break
+                except Exception as del_err:
+                    logger.error(f"Erro ao apagar mensagem própria ID {msg.id}: {del_err}")
+                    pass
+        await status_msg.edit(f"✅ <b>PurgeMe concluído!</b> {deleted_count} mensagens suas foram apagadas.", parse_mode='html')
+        await asyncio.sleep(2)
+        await status_msg.delete()
+    except Exception as e:
+        await status_msg.edit(f"❌ Erro ao executar .purgeme: {e}", parse_mode='html')
         await asyncio.sleep(4)
         await status_msg.delete()
 
@@ -817,7 +860,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V6.1 (PURGE EDITION) INICIANDO...")
+    logger.info("JTZIN USERBOT V6.2 (PURGE PRO EDITION) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE!")
     client.run_until_disconnected()
