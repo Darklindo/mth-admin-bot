@@ -75,7 +75,7 @@ class Cache:
             except sqlite3.OperationalError:
                 pass
 
-            logger.info("Cache carregado com sucesso (V5.0 - Força Total).")
+            logger.info("Cache carregado com sucesso (V5.1 - AntiSpy).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -317,7 +317,7 @@ async def global_security_filter(event):
 
 @client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    text = "🛡️ <b>Jtzin Userbot V5.0 (Força Total & Fênix Suprema)</b>\n\nEquipe Diamond — Operacional."
+    text = "🛡️ <b>Jtzin Userbot V5.1 (AntiSpy & Fênix Suprema)</b>\n\nEquipe Diamond — Operacional."
     await reply_or_edit(event, text, delete_after=2)
 
 @client.on(events.NewMessage(pattern=r'^\.antiblack', func=lambda e: is_authorized(e.sender_id)))
@@ -613,7 +613,7 @@ async def cmd_listdn(event):
 @client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V5.0</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V5.1</b>\n\n"
         "🛡️ <b>MODERAÇÃO:</b>\n"
         "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
@@ -621,12 +621,55 @@ async def cmd_help(event):
         "• <code>.banperm</code> | <code>.unbanperm</code>\n"
         "• <code>.shadow</code> | <code>.unshadow</code>\n\n"
         "👑 <b>CONTROLE E SEGURANÇA:</b>\n"
-        "• <code>.antiblack on/off</code> (Modo Fênix)\n"
+        "• <code>.antiblack on/off</code> (Modo Fênix)\n• <code>.antispy</code> (Caça-Espiões)\n"
         "• <code>.autorizar</code> | <code>.logs</code>\n"
         "• <code>.allban / .allblack / .unallblack</code>\n"
         "• <code>.msg</code> | <code>.chats</code> | <code>.listdn</code>"
     )
     await reply_or_edit(event, text, delete_after=15)
+
+@client.on(events.NewMessage(pattern=r'^\.antispy', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_antispy(event):
+    if not event.is_group and not event.is_channel:
+        await reply_or_edit(event, "❌ Este comando só pode ser usado em grupos ou canais.", delete_after=2)
+        return
+    bait_msg = await event.respond("🕵️‍♂️ [AntiSpy] Varrendo o chat em busca de espiões... Analisando logs de moderação...")
+    await asyncio.sleep(2)
+    try:
+        result = await client(functions.channels.GetAdminLogRequest(
+            channel=event.chat_id,
+            q='',
+            events_filter=types.ChannelAdminLogEventsFilter(delete=True, edit=True, ban=True, unban=True, kick=True, unkick=True),
+            admins=None, max_id=0, min_id=0, limit=15
+        ))
+        spies = set()
+        for entry in result.events:
+            uid = entry.user_id
+            if uid and uid not in [OWNER_ID, SECOND_OWNER_ID, THIRD_OWNER_ID] and uid not in cache.authorized_users:
+                spies.add(uid)
+        if spies:
+            spy_list = []
+            for uid in spies:
+                info = db.get_user_info(uid)
+                spy_list.append(f"• {info} (<code>{uid}</code>)")
+            text = "🚨 <b>ESPIÕES/BOTS DETECTADOS NESTE GRUPO!</b>\n\n" + "\n".join(spy_list)
+        else:
+            text = "✅ <b>Nenhum espião ou bot desconhecido ativo recentemente.</b>"
+        await bait_msg.edit(text, parse_mode='html')
+        await asyncio.sleep(10)
+        await bait_msg.delete()
+    except ChatAdminRequiredError:
+        await bait_msg.edit("❌ Erro: Preciso ser Administrador com acesso ao Log de Auditoria para detectar espiões.", parse_mode='html')
+        await asyncio.sleep(4)
+        await bait_msg.delete()
+    except Exception as e:
+        await bait_msg.edit(f"❌ Erro na varredura AntiSpy: {e}", parse_mode='html')
+        await asyncio.sleep(4)
+        await bait_msg.delete()
+    try:
+        await event.delete()
+    except:
+        pass
 
 @client.on(events.NewMessage(pattern=r'^\.id', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_id(event):
@@ -664,7 +707,7 @@ async def cmd_chats(event):
         elif r['chat_type'] in ['private', 'User']:
             user_info = db.get_user_info(r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
-    text = "📡 <b>RELATÓRIO DE CHATS V5.0</b>\n\n"
+    text = "📡 <b>RELATÓRIO DE CHATS V5.1</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
@@ -675,7 +718,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V5.0 (FORÇA TOTAL & FÊNIX SUPREMA) INICIANDO...")
+    logger.info("JTZIN USERBOT V5.1 (ANTISPY & FÊNIX SUPREMA) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE!")
     client.run_until_disconnected()
