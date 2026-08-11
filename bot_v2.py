@@ -75,7 +75,7 @@ class Cache:
             except sqlite3.OperationalError:
                 pass
 
-            logger.info("Cache carregado com sucesso (V6.4 - Stable Precision Edition).")
+            logger.info("Cache carregado com sucesso (V6.5 - Auth Suite Edition).")
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -120,6 +120,12 @@ class Database:
     def remove_authorized(self, user_id):
         self.execute("DELETE FROM authorized_users WHERE user_id=?", (int(user_id),), commit=True)
         cache.authorized_users.discard(int(user_id))
+
+    def get_all_authorized(self):
+        res = self.execute("SELECT user_id, created_at FROM authorized_users ORDER BY created_at DESC")
+        if res:
+            return [dict(r) for r in res.fetchall()]
+        return []
 
     def add_local_banperm(self, chat_id, user_id, reason=None):
         self.execute("INSERT OR REPLACE INTO local_banperm(chat_id, user_id, reason, created_at) VALUES(?,?,?,?)", (int(chat_id), int(user_id), reason, int(time.time())), commit=True)
@@ -333,7 +339,7 @@ async def global_security_filter(event):
 
 @client.on(events.NewMessage(pattern=r'^\.start', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
-    text = "🛡️ <b>Jtzin Userbot V6.4 (Stable Precision Edition)</b>\n\nEquipe Diamond — Operacional."
+    text = "🛡️ <b>Jtzin Userbot V6.5 (Auth Suite Edition)</b>\n\nEquipe Diamond — Operacional."
     await reply_or_edit(event, text, delete_after=2)
 
 @client.on(events.NewMessage(pattern=r'^\.antiblack', func=lambda e: is_authorized(e.sender_id)))
@@ -594,6 +600,19 @@ async def cmd_desautorizar(event):
     db.add_deleted_log(event.chat_id, target_id, "Ação: Desautorizar", "Controle", admin_id=event.sender_id)
     await reply_or_edit(event, f"❌ Acesso revogado para {user_info} (<code>{target_id}</code>).", delete_after=5)
 
+@client.on(events.NewMessage(pattern=r'^\.listauth', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_listauth(event):
+    auths = db.get_all_authorized()
+    if not auths:
+        await reply_or_edit(event, "📭 Nenhum usuário autorizado no momento.", delete_after=10)
+        return
+    text = "👥 <b>LISTA DE USUÁRIOS AUTORIZADOS</b>\n\n"
+    for r in auths:
+        info = db.get_user_info(r['user_id'])
+        date_str = datetime.fromtimestamp(r['created_at']).strftime('%d/%m/%Y %H:%M')
+        text += f"• {info} (<code>{r['user_id']}</code>)\n└ 📅 {date_str}\n"
+    await reply_or_edit(event, text, delete_after=15)
+
 @client.on(events.NewMessage(pattern=r'^\.logs', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_logs(event):
     logs = db.get_latest_logs(10)
@@ -640,7 +659,7 @@ async def cmd_listdn(event):
 @client.on(events.NewMessage(pattern=r'^\.help', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.4</b>\n\n"
+        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.5</b>\n\n"
         "🛡️ <b>MODERAÇÃO LOCAL & REVERSÃO:</b>\n"
         "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code> | <code>.purge [qtd]</code> | <code>.purgeme [qtd]</code>\n"
         "• <code>.mute</code> | <code>.unmute</code>\n"
@@ -649,7 +668,7 @@ async def cmd_help(event):
         "• <code>.shadow</code> | <code>.unshadow</code>\n\n"
         "👑 <b>CONTROLE NUCLEAS & GLOBAIS:</b>\n"
         "• <code>.allban</code> | <code>.allblack</code> | <code>.unallblack</code>\n"
-        "• <code>.autorizar</code> | <code>.desautorizar</code> (Gestão de Acessos)\n\n"
+        "• <code>.autorizar</code> | <code>.desautorizar</code> | <code>.listauth</code> (Gestão de Acessos)\n\n"
         "🔍 <b>SEGURANÇA & CONTRA-ESPIONAGEM:</b>\n"
         "• <code>.antiblack on/off</code> (Modo Fênix)\n"
         "• <code>.antispy</code> (Varredura de Espiões)\n"
@@ -871,7 +890,7 @@ async def cmd_chats(event):
 # --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
     cache.load_all(db.conn)
-    logger.info("JTZIN USERBOT V6.4 (STABLE PRECISION EDITION) INICIANDO...")
+    logger.info("JTZIN USERBOT V6.5 (AUTH SUITE EDITION) INICIANDO...")
     client.start()
     logger.info("USERBOT TELETHON ONLINE!")
     client.run_until_disconnected()
