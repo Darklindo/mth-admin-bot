@@ -71,7 +71,7 @@ TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
 TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
 TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.18"
+VERSION = "V6.19"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -970,6 +970,27 @@ async def delete_command_safely(event):
     return await delete_message_safely(event, "mensagem de comando")
 
 
+async def resolve_message_for_delete(event):
+    """Resolve a mensagem respondida ou um ID explícito sem aceitar alvos ambíguos."""
+    try:
+        if getattr(event, "is_reply", False):
+            message = await event.get_reply_message()
+            return message if message is not None else None
+        args = (event.raw_text or "").split()
+        if len(args) < 2 or not args[1].isdigit():
+            return None
+        message = await client.get_messages(event.chat_id, ids=int(args[1]))
+        if isinstance(message, (list, tuple)):
+            return message[0] if message else None
+        return message
+    except (RPCError, ValueError, TypeError) as exc:
+        logger.debug("Falha ao resolver mensagem para exclusão: %s", exc)
+        return None
+    except Exception as exc:
+        logger.debug("Falha inesperada ao resolver mensagem para exclusão: %s", exc)
+        return None
+
+
 async def delete_message_ids_safely(chat_id, message_ids, batch_size=100):
     """Apaga mensagens em lotes e usa fallback individual quando necessário."""
     ids = [int(message_id) for message_id in message_ids if message_id]
@@ -1328,6 +1349,21 @@ async def cmd_pinned(event):
     await reply_or_edit(event, f"📌 Proteção de mensagens fixadas <b>{'ATIVADA' if enabled else 'DESATIVADA'}</b>.", delete_after=DEFAULT_DELETE_AFTER)
 
 
+@client.on(events.NewMessage(pattern=r'^\.del(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_del(event):
+    target = await resolve_message_for_delete(event)
+    if target is None or getattr(target, "id", None) == getattr(event, "id", None):
+        await reply_or_edit(event, "❌ Responda à mensagem que deseja apagar ou use <code>.del ID</code>.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    target_user_id = int(getattr(target, "sender_id", 0) or 0)
+    deleted = await delete_message_safely(target, "mensagem selecionada pelo .del")
+    if deleted:
+        queue_audit_log(event.chat_id, target_user_id, "Ação: Del", "Exclusão manual", admin_id=event.sender_id)
+        await delete_command_safely(event)
+        return
+    await reply_or_edit(event, "❌ Não foi possível apagar a mensagem. Verifique minhas permissões neste chat.", delete_after=DEFAULT_DELETE_AFTER)
+
+
 @client.on(events.NewMessage(pattern=r'^\.warn(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_warn(event):
     target_id = await get_target_from_event(event)
@@ -1354,7 +1390,7 @@ async def cmd_warn(event):
     await reply_or_edit(event, f"⚠️ <b>{db.get_user_info(target_id)}</b> (<code>{target_id}</code>): {result}.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.unwarn(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.(?:unwarn|delwarn)(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unwarn(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -1884,6 +1920,7 @@ async def cmd_help(event):
     text = (
         f"📖 <b>GUIA DE COMANDOS — Jtzin Userbot {VERSION}</b>\n\n"
         "🛡️ <b>MODERAÇÃO LOCAL & REVERSÃO:</b>\n"
+        "• <code>.del</code> (apaga a mensagem respondida)\n"
         "• <code>.kick</code> | <code>.ban [duração] [--purge N]</code> | <code>.unban</code>\n"
         "• <code>.mute [duração] [--purge N]</code> | <code>.unmute</code>\n"
         "• <code>.purge [5-100]</code> | <code>.purgeme [5-100]</code> | <code>.purgeall [1-1000]</code>\n"
@@ -1892,7 +1929,8 @@ async def cmd_help(event):
         "• <code>.shadow [duração]</code> | <code>.unshadow</code> (global)\n\n"
         "⚠️ <b>ADVERTÊNCIAS & ANTISPAM:</b>\n"
         "• <code>.warn @user motivo</code> | <code>.warns</code>\n"
-        "• <code>.unwarn @user</code> | <code>.clearwarns @user</code> (remove advertências)\n"
+        "• <code>.unwarn</code> | <code>.delwarn</code> (remove uma advertência)\n"
+        "• <code>.clearwarns @user</code> (remove todas as advertências)\n"
         "• <code>.antispam on/off</code> | <code>.quarantine on/off</code>\n"
         "• <code>.pinned on/off</code> (protege mensagens fixadas)\n\n"
         "👑 <b>CONTROLE GLOBAL:</b>\n"
