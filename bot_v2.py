@@ -3,6 +3,8 @@ import os
 import sqlite3
 import time
 import asyncio
+import re
+import hashlib
 from collections import defaultdict, deque
 import threading
 from pathlib import Path
@@ -50,6 +52,10 @@ THIRD_OWNER_ID = int(os.getenv("THIRD_OWNER_ID", "7916427095"))
 MIN_PURGE_LIMIT = 5
 MAX_PURGE_LIMIT = 100
 MAX_HISTORY_SCAN = 1000
+MAX_DURATION_SECONDS = 365 * 24 * 60 * 60
+MIN_DURATION_SECONDS = 10
+EXPIRATION_CHECK_INTERVAL = _env_int("EXPIRATION_CHECK_INTERVAL", 30, 10, 300)
+SPAM_STATE_MAX_USERS = _env_int("SPAM_STATE_MAX_USERS", 10000, 100, 100000)
 PURGEALL_MIN_LIMIT = 1
 PURGEALL_MAX_LIMIT = 1000
 PURGEALL_MAX_SCAN = 1200
@@ -65,7 +71,7 @@ TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
 TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
 TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.15.1"
+VERSION = "V6.17"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -193,8 +199,8 @@ class Database:
             return [dict(r) for r in res.fetchall()]
         return []
 
-    def add_local_banperm(self, chat_id, user_id, reason=None):
-        cursor = self.execute("INSERT OR REPLACE INTO local_banperm(chat_id, user_id, reason, created_at) VALUES(?,?,?,?)", (int(chat_id), int(user_id), reason, int(time.time())), commit=True)
+    def add_local_banperm(self, chat_id, user_id, reason=None, expires_at=None):
+        cursor = self.execute("INSERT OR REPLACE INTO local_banperm(chat_id, user_id, reason, created_at, expires_at) VALUES(?,?,?,?,?)", (int(chat_id), int(user_id), reason, int(time.time()), expires_at), commit=True)
         if cursor is not None:
             cache.local_banperm[int(chat_id)].add(int(user_id))
 
@@ -203,8 +209,8 @@ class Database:
         if cursor is not None:
             cache.local_banperm[int(chat_id)].discard(int(user_id))
 
-    def add_local_blacklist(self, chat_id, user_id, reason=None):
-        cursor = self.execute("INSERT OR REPLACE INTO local_blacklist(chat_id, user_id, reason, created_at) VALUES(?,?,?,?)", (int(chat_id), int(user_id), reason, int(time.time())), commit=True)
+    def add_local_blacklist(self, chat_id, user_id, reason=None, expires_at=None):
+        cursor = self.execute("INSERT OR REPLACE INTO local_blacklist(chat_id, user_id, reason, created_at, expires_at) VALUES(?,?,?,?,?)", (int(chat_id), int(user_id), reason, int(time.time()), expires_at), commit=True)
         if cursor is not None:
             cache.local_blacklist[int(chat_id)].add(int(user_id))
 
@@ -213,8 +219,8 @@ class Database:
         if cursor is not None:
             cache.local_blacklist[int(chat_id)].discard(int(user_id))
 
-    def add_global_blacklist(self, user_id, type_name="ban", reason=None):
-        cursor = self.execute("INSERT OR REPLACE INTO global_blacklist(user_id, type, reason, created_at) VALUES(?,?,?,?)", (int(user_id), type_name, reason, int(time.time())), commit=True)
+    def add_global_blacklist(self, user_id, type_name="ban", reason=None, expires_at=None):
+        cursor = self.execute("INSERT OR REPLACE INTO global_blacklist(user_id, type, reason, created_at, expires_at) VALUES(?,?,?,?,?)", (int(user_id), type_name, reason, int(time.time()), expires_at), commit=True)
         if cursor is not None:
             cache.global_blacklist.add(int(user_id))
 
@@ -223,8 +229,8 @@ class Database:
         if cursor is not None:
             cache.global_blacklist.discard(int(user_id))
 
-    def add_shadow_ban(self, user_id, reason=None):
-        cursor = self.execute("INSERT OR REPLACE INTO shadow_ban(user_id, reason, created_at) VALUES(?,?,?)", (int(user_id), reason, int(time.time())), commit=True)
+    def add_shadow_ban(self, user_id, reason=None, expires_at=None):
+        cursor = self.execute("INSERT OR REPLACE INTO shadow_ban(user_id, reason, created_at, expires_at) VALUES(?,?,?,?)", (int(user_id), reason, int(time.time()), expires_at), commit=True)
         if cursor is not None:
             cache.shadow_ban.add(int(user_id))
 
@@ -232,6 +238,111 @@ class Database:
         cursor = self.execute("DELETE FROM shadow_ban WHERE user_id=?", (int(user_id),), commit=True)
         if cursor is not None:
             cache.shadow_ban.discard(int(user_id))
+
+    def set_setting(self, chat_id, key, value):
+        allowed = {
+            "antispam", "quarantine_enabled", "protect_pinned", "warn_threshold",
+            "warn_action", "warn_duration", "spam_window", "spam_limit",
+            "duplicate_limit", "link_limit", "media_limit", "quarantine_duration",
+        }
+        if key not in allowed:
+            return False
+        cursor = self.execute(
+            f"INSERT INTO settings(chat_id, {key}) VALUES(?, ?) "
+            f"ON CONFLICT(chat_id) DO UPDATE SET {key}=excluded.{key}",
+            (int(chat_id), value), commit=True,
+        )
+        if cursor is not None:
+            cache.settings.setdefault(int(chat_id), {})[key] = value
+            return True
+        return False
+
+    def get_settings(self, chat_id):
+        row = self.fetchone("SELECT * FROM settings WHERE chat_id=?", (int(chat_id),))
+        if row is None:
+            self.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (int(chat_id),), commit=True)
+            row = self.fetchone("SELECT * FROM settings WHERE chat_id=?", (int(chat_id),))
+        result = dict(row) if row else {}
+        cache.settings[int(chat_id)] = result
+        return result
+
+    def add_warning(self, chat_id, user_id, now=None):
+        now = int(now or time.time())
+        settings = self.get_settings(chat_id)
+        window = max(60, int(settings.get("spam_window", 10)) * 6)
+        row = self.fetchone("SELECT count, first_at, last_at FROM warnings WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)))
+        if not row or now - int(row["first_at"] or now) > window:
+            count, first_at = 1, now
+        else:
+            count, first_at = int(row["count"]) + 1, int(row["first_at"])
+        self.execute(
+            "INSERT INTO warnings(chat_id,user_id,count,first_at,last_at) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(chat_id,user_id) DO UPDATE SET count=excluded.count, first_at=excluded.first_at, last_at=excluded.last_at",
+            (int(chat_id), int(user_id), count, first_at, now), commit=True,
+        )
+        return count
+
+    def get_warning(self, chat_id, user_id):
+        row = self.fetchone("SELECT count, first_at, last_at FROM warnings WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)))
+        return dict(row) if row else {"count": 0, "first_at": 0, "last_at": 0}
+
+    def clear_warnings(self, chat_id, user_id):
+        self.execute("DELETE FROM warnings WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)), commit=True)
+
+    def add_temporary_punishment(self, chat_id, user_id, action, expires_at, reason=None, admin_id=None):
+        self.execute(
+            "INSERT INTO temporary_punishments(chat_id,user_id,action,expires_at,reason,created_at,admin_id) VALUES(?,?,?,?,?,?,?)",
+            (int(chat_id), int(user_id), str(action), int(expires_at), reason, int(time.time()), admin_id), commit=True,
+        )
+
+    def get_expired_punishments(self, now=None):
+        return self.fetchall("SELECT * FROM temporary_punishments WHERE expires_at<=? ORDER BY expires_at LIMIT 200", (int(now or time.time()),))
+
+    def remove_temporary_punishment(self, punishment_id):
+        self.execute("DELETE FROM temporary_punishments WHERE id=?", (int(punishment_id),), commit=True)
+
+    def expire_local_blacklist(self, now=None):
+        now = int(now or time.time())
+        rows = self.fetchall("SELECT chat_id,user_id FROM local_blacklist WHERE expires_at IS NOT NULL AND expires_at<=?", (now,))
+        if rows:
+            self.execute("DELETE FROM local_blacklist WHERE expires_at IS NOT NULL AND expires_at<=?", (now,), commit=True)
+            for row in rows:
+                cache.local_blacklist[int(row["chat_id"])].discard(int(row["user_id"]))
+        return rows
+
+    def expire_local_banperm(self, now=None):
+        now = int(now or time.time())
+        rows = self.fetchall("SELECT chat_id,user_id FROM local_banperm WHERE expires_at IS NOT NULL AND expires_at<=?", (now,))
+        if rows:
+            self.execute("DELETE FROM local_banperm WHERE expires_at IS NOT NULL AND expires_at<=?", (now,), commit=True)
+            for row in rows:
+                cache.local_banperm[int(row["chat_id"])].discard(int(row["user_id"]))
+        return rows
+
+    def expire_global_blacklist(self, now=None):
+        now = int(now or time.time())
+        rows = self.fetchall("SELECT user_id, type FROM global_blacklist WHERE expires_at IS NOT NULL AND expires_at<=?", (now,))
+        if rows:
+            self.execute("DELETE FROM global_blacklist WHERE expires_at IS NOT NULL AND expires_at<=?", (now,), commit=True)
+            for row in rows:
+                cache.global_blacklist.discard(int(row["user_id"]))
+        return rows
+
+    def expire_shadow(self, now=None):
+        now = int(now or time.time())
+        rows = self.fetchall("SELECT user_id FROM shadow_ban WHERE expires_at IS NOT NULL AND expires_at<=?", (now,))
+        if rows:
+            self.execute("DELETE FROM shadow_ban WHERE expires_at IS NOT NULL AND expires_at<=?", (now,), commit=True)
+            for row in rows:
+                cache.shadow_ban.discard(int(row["user_id"]))
+        return rows
+
+    def get_active_maintenance(self):
+        row = self.fetchone("SELECT value FROM bot_state WHERE key='maintenance'")
+        return bool(row and str(row["value"]) == "1")
+
+    def set_maintenance(self, enabled):
+        return self.execute("INSERT INTO bot_state(key,value) VALUES('maintenance',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", ("1" if enabled else "0",), commit=True) is not None
 
     def fetchone(self, query, params=()):
         cursor = self.execute(query, params)
@@ -356,10 +467,10 @@ class Database:
         safe_limit = max(1, min(int(limit), 100))
         return [dict(r) for r in self.fetchall("SELECT * FROM deleted_logs ORDER BY created_at DESC LIMIT ?", (safe_limit,))]
 
-    def add_detected_spy(self, user_id, chat_id):
+    def add_detected_spy(self, user_id, chat_id, signals="", confidence=0):
         self.execute(
-            "INSERT OR REPLACE INTO detected_spies(user_id, chat_id, detected_at) VALUES(?,?,?)",
-            (int(user_id), int(chat_id), int(time.time())),
+            "INSERT OR REPLACE INTO detected_spies(user_id, chat_id, detected_at, signals, confidence) VALUES(?,?,?,?,?)",
+            (int(user_id), int(chat_id), int(time.time()), str(signals), int(confidence)),
             commit=True
         )
 
@@ -368,6 +479,11 @@ class Database:
 
     def remove_spy(self, user_id):
         self.execute("DELETE FROM detected_spies WHERE user_id = ?", (int(user_id),), commit=True)
+
+    def get_warnings_report(self, chat_id=None):
+        if chat_id is None:
+            return [dict(row) for row in self.fetchall("SELECT * FROM warnings ORDER BY last_at DESC")]
+        return [dict(row) for row in self.fetchall("SELECT * FROM warnings WHERE chat_id=? ORDER BY last_at DESC", (int(chat_id),))]
 
 try:
     from migrate_db import migrate as migrate_database
@@ -675,11 +791,129 @@ async def get_chat_permission_health(chat_id):
         return "⚠️ não foi possível consultar as permissões"
 
 
+def parse_duration_token(token):
+    token = str(token or "").strip().lower()
+    if token in {"perm", "permanent", "permanente"}:
+        return None
+    match = re.fullmatch(r"(\d+)(s|m|h|d|w)", token)
+    if not match:
+        return None
+    amount, unit = int(match.group(1)), match.group(2)
+    multiplier = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[unit]
+    seconds = amount * multiplier
+    if seconds < MIN_DURATION_SECONDS or seconds > MAX_DURATION_SECONDS:
+        return None
+    return seconds
+
+
+def parse_moderation_options(event, allow_purge=False):
+    args = (event.raw_text or "").split()
+    start = 1 if event.is_reply else 2
+    duration = None
+    purge_limit = None
+    reason_tokens = []
+    index = start
+    while index < len(args):
+        token = args[index]
+        lower = token.lower()
+        if allow_purge and lower == "--purge":
+            if index + 1 < len(args) and args[index + 1].isdigit():
+                purge_limit = max(1, min(int(args[index + 1]), MAX_PURGE_LIMIT))
+                index += 2
+                continue
+        if allow_purge and lower.startswith("--purge=") and lower[8:].isdigit():
+            purge_limit = max(1, min(int(lower[8:]), MAX_PURGE_LIMIT))
+            index += 1
+            continue
+        parsed_duration = parse_duration_token(token)
+        if parsed_duration is not None or lower in {"perm", "permanent", "permanente"}:
+            duration = parsed_duration
+        else:
+            reason_tokens.append(token)
+        index += 1
+    return duration, purge_limit, (" ".join(reason_tokens).strip() or None)
+
+
 def get_reason_from_event(event):
-    args = event.raw_text.split()
-    if event.is_reply:
-        return " ".join(args[1:]) if len(args) > 1 else None
-    return " ".join(args[2:]) if len(args) > 2 else None
+    return parse_moderation_options(event, allow_purge=True)[2]
+
+
+def duration_label(seconds):
+    if seconds is None:
+        return "permanente"
+    seconds = int(seconds)
+    for suffix, divisor in (("d", 86400), ("h", 3600), ("m", 60), ("s", 1)):
+        if seconds >= divisor and seconds % divisor == 0:
+            return f"{seconds // divisor}{suffix}"
+    return f"{seconds}s"
+
+
+def include_pinned_requested(event):
+    return "--include-pinned" in (event.raw_text or "").lower().split()
+
+
+async def purge_target_messages(chat_id, target_id, limit, include_pinned=False):
+    message_ids = []
+    scan_limit = min(MAX_HISTORY_SCAN, int(limit) + 20)
+    async for msg in client.iter_messages(chat_id, limit=scan_limit, from_user=target_id):
+        if getattr(msg, "pinned", False) and not include_pinned:
+            continue
+        message_ids.append(msg.id)
+        if len(message_ids) >= int(limit):
+            break
+    return await delete_message_ids_safely(chat_id, message_ids)
+
+
+async def temporary_expiry_loop():
+    while True:
+        try:
+            await asyncio.sleep(EXPIRATION_CHECK_INTERVAL)
+            now = int(time.time())
+            db.expire_local_blacklist(now)
+            expired_local_bans = db.expire_local_banperm(now)
+            expired_global = db.expire_global_blacklist(now)
+            db.expire_shadow(now)
+            for row in expired_local_bans:
+                try:
+                    await client.edit_permissions(row["chat_id"], row["user_id"], view_messages=True, send_messages=True)
+                except Exception as exc:
+                    logger.debug("Falha ao restaurar banperm expirado: %s", exc)
+            for row in expired_global:
+                row_type = str(row["type"] or "").lower()
+                if row_type != "ban":
+                    continue
+                for chat in db.all_chats_detailed():
+                    if chat["chat_type"] in {"private", "User"}:
+                        continue
+                    try:
+                        await client.edit_permissions(chat["chat_id"], row["user_id"], view_messages=True, send_messages=True)
+                    except Exception as exc:
+                        logger.debug("Falha ao restaurar allban expirado: %s", exc)
+            for row in db.get_expired_punishments(now):
+                try:
+                    if row["action"] == "ban":
+                        await client.edit_permissions(row["chat_id"], row["user_id"], view_messages=True, send_messages=True)
+                    elif row["action"] == "mute":
+                        await client.edit_permissions(row["chat_id"], row["user_id"], send_messages=True)
+                    elif row["action"] == "quarantine":
+                        await client.edit_permissions(row["chat_id"], row["user_id"], send_messages=True, send_media=True)
+                except Exception as exc:
+                    logger.debug("Falha ao expirar punição %s: %s", row["id"], exc)
+                finally:
+                    db.remove_temporary_punishment(row["id"])
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.error("Erro no ciclo de expiração: %s", exc)
+
+
+async def maintenance_guard(event):
+    if not db.get_active_maintenance():
+        return False
+    if is_owner(event.sender_id):
+        return False
+    await delete_command_safely(event)
+    return True
 
 
 def parse_purge_limit(event, default=50):
@@ -934,7 +1168,189 @@ async def global_security_filter(event):
         await delete_security_message(event, chat_id, user_id, content_text, reason)
         raise events.StopPropagation
 
+spam_state = {}
+
+
+async def apply_warning_action(chat_id, user_id, action, duration, reason, admin_id):
+    expires_at = int(time.time()) + int(duration)
+    if action == "ban":
+        await client.edit_permissions(chat_id, user_id, view_messages=False)
+    else:
+        await client.edit_permissions(chat_id, user_id, send_messages=False)
+        action = "mute"
+    db.add_temporary_punishment(chat_id, user_id, action, expires_at, reason, admin_id)
+
+
+@client.on(events.NewMessage(incoming=True))
+async def antispam_filter(event):
+    if not event.chat_id or not (event.is_group or event.is_channel) or (event.raw_text or "").startswith("."):
+        return
+    user_id = event.sender_id
+    if not user_id or is_immune(user_id):
+        return
+    settings = cache.settings.get(event.chat_id) or db.get_settings(event.chat_id)
+    if not int(settings.get("antispam", 1)):
+        return
+    now = time.time()
+    key = (int(event.chat_id), int(user_id))
+    state = spam_state.setdefault(key, {"times": deque(), "fingerprints": deque(), "links": deque(), "media": deque()})
+    if len(spam_state) > SPAM_STATE_MAX_USERS:
+        oldest_key = next(iter(spam_state), None)
+        if oldest_key is not None and oldest_key != key:
+            spam_state.pop(oldest_key, None)
+    window = max(5, min(int(settings.get("spam_window", 10)), 120))
+    cutoff = now - window
+    for name in ("times", "fingerprints", "links", "media"):
+        while state[name] and state[name][0][0] < cutoff:
+            state[name].popleft()
+    text = (event.raw_text or "").strip()
+    fingerprint = hashlib.sha1(re.sub(r"\s+", " ", text.lower()).encode("utf-8", "ignore")).hexdigest() if text else ""
+    link_count = len(re.findall(r"(?:https?://|t\.me/|www\.)(?:\S+)", text.lower()))
+    has_media = bool(getattr(event.message, "media", None))
+    state["times"].append((now, event.id))
+    if fingerprint:
+        state["fingerprints"].append((now, fingerprint))
+    for _ in range(link_count):
+        state["links"].append((now, True))
+    if has_media:
+        state["media"].append((now, True))
+    same_text = sum(1 for _, value in state["fingerprints"] if fingerprint and value == fingerprint)
+    signals = []
+    if len(state["times"]) > int(settings.get("spam_limit", 6)):
+        signals.append("frequência")
+    if same_text >= int(settings.get("duplicate_limit", 3)):
+        signals.append("duplicação")
+    if len(state["links"]) >= int(settings.get("link_limit", 3)):
+        signals.append("links repetidos")
+    if len(state["media"]) >= int(settings.get("media_limit", 5)):
+        signals.append("mídia em rajada")
+    if not signals:
+        return
+    reason = "Antispam: " + ", ".join(signals)
+    if int(settings.get("quarantine_enabled", 0)):
+        duration = max(60, min(int(settings.get("quarantine_duration", 600)), MAX_DURATION_SECONDS))
+        try:
+            await delete_security_message(event, event.chat_id, user_id, event.text or "[mídia]", reason)
+            await apply_warning_action(event.chat_id, user_id, "quarantine", duration, reason, OWNER_ID)
+        except Exception as exc:
+            logger.debug("Falha na quarentena antispam: %s", exc)
+        state["times"].clear()
+        return
+    try:
+        await delete_security_message(event, event.chat_id, user_id, event.text or "[mídia]", reason)
+        count = db.add_warning(event.chat_id, user_id)
+        threshold = max(1, min(int(settings.get("warn_threshold", 3)), 20))
+        if count >= threshold:
+            action = str(settings.get("warn_action", "mute")).lower()
+            if action not in {"mute", "ban"}:
+                action = "mute"
+            duration = max(60, min(int(settings.get("warn_duration", 600)), MAX_DURATION_SECONDS))
+            try:
+                await apply_warning_action(event.chat_id, user_id, action, duration, reason, OWNER_ID)
+                db.clear_warnings(event.chat_id, user_id)
+            except Exception as exc:
+                logger.debug("Falha ao aplicar ação após advertências: %s", exc)
+    except Exception as exc:
+        logger.debug("Falha no filtro antispam: %s", exc)
+
+
 # --- COMANDOS ---
+
+@client.on(events.NewMessage(incoming=True, pattern=r'^\.'))
+async def maintenance_filter(event):
+    if not db.get_active_maintenance() or is_owner(event.sender_id):
+        return
+    command = (event.raw_text or "").split(maxsplit=1)[0].lower()
+    if command in {".maintenance", ".status", ".health", ".latency"}:
+        return
+    await delete_command_safely(event)
+    raise events.StopPropagation
+
+
+@client.on(events.NewMessage(pattern=r'^\.maintenance(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+async def cmd_maintenance(event):
+    args = (event.raw_text or "").split()
+    if len(args) < 2 or args[1].lower() not in {"on", "off", "1", "0"}:
+        await reply_or_edit(event, "Use <code>.maintenance on</code> ou <code>.maintenance off</code>.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    enabled = args[1].lower() in {"on", "1"}
+    db.set_maintenance(enabled)
+    await reply_or_edit(event, f"🛠️ Modo manutenção <b>{'ATIVADO' if enabled else 'DESATIVADO'}</b>.", delete_after=DEFAULT_DELETE_AFTER)
+
+
+@client.on(events.NewMessage(pattern=r'^\.quarantine(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_quarantine(event):
+    args = (event.raw_text or "").split()
+    if len(args) < 2 or args[1].lower() not in {"on", "off", "1", "0"}:
+        status = bool(db.get_settings(event.chat_id).get("quarantine_enabled", 0))
+        await reply_or_edit(event, f"Quarentena: <b>{'ATIVADA' if status else 'DESATIVADA'}</b>. Use <code>.quarantine on|off</code>.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    enabled = args[1].lower() in {"on", "1"}
+    db.set_setting(event.chat_id, "quarantine_enabled", int(enabled))
+    await reply_or_edit(event, f"🛡️ Quarentena antispam <b>{'ATIVADA' if enabled else 'DESATIVADA'}</b> neste chat.", delete_after=DEFAULT_DELETE_AFTER)
+
+
+@client.on(events.NewMessage(pattern=r'^\.antispam(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_antispam_new(event):
+    args = (event.raw_text or "").split()
+    if len(args) < 2 or args[1].lower() not in {"on", "off", "1", "0"}:
+        status = bool(db.get_settings(event.chat_id).get("antispam", 1))
+        await reply_or_edit(event, f"Antispam: <b>{'ATIVADO' if status else 'DESATIVADO'}</b>. Use <code>.antispam on|off</code>.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    enabled = args[1].lower() in {"on", "1"}
+    db.set_setting(event.chat_id, "antispam", int(enabled))
+    await reply_or_edit(event, f"🛡️ Antispam <b>{'ATIVADO' if enabled else 'DESATIVADO'}</b> neste chat.", delete_after=DEFAULT_DELETE_AFTER)
+
+
+@client.on(events.NewMessage(pattern=r'^\.pinned(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_pinned(event):
+    args = (event.raw_text or "").split()
+    if len(args) < 2 or args[1].lower() not in {"on", "off", "1", "0"}:
+        status = bool(db.get_settings(event.chat_id).get("protect_pinned", 1))
+        await reply_or_edit(event, f"Proteção de fixadas: <b>{'ATIVADA' if status else 'DESATIVADA'}</b>.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    enabled = args[1].lower() in {"on", "1"}
+    db.set_setting(event.chat_id, "protect_pinned", int(enabled))
+    await reply_or_edit(event, f"📌 Proteção de mensagens fixadas <b>{'ATIVADA' if enabled else 'DESATIVADA'}</b>.", delete_after=DEFAULT_DELETE_AFTER)
+
+
+@client.on(events.NewMessage(pattern=r'^\.warn(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_warn(event):
+    target_id = await get_target_from_event(event)
+    _, _, reason = parse_moderation_options(event)
+    if not target_id or is_immune(target_id):
+        await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    settings = db.get_settings(event.chat_id)
+    count = db.add_warning(event.chat_id, target_id)
+    threshold = max(1, min(int(settings.get("warn_threshold", 3)), 20))
+    action = str(settings.get("warn_action", "mute")).lower()
+    duration = max(60, min(int(settings.get("warn_duration", 600)), MAX_DURATION_SECONDS))
+    if count >= threshold:
+        try:
+            await apply_warning_action(event.chat_id, target_id, action, duration, reason or "Limite de advertências", event.sender_id)
+            db.clear_warnings(event.chat_id, target_id)
+            result = f"limite atingido; {action} aplicado por {duration_label(duration)}"
+        except Exception as exc:
+            logger.debug("Falha na ação de advertência: %s", exc)
+            result = "limite atingido, mas a ação automática falhou"
+    else:
+        result = f"{count}/{threshold} advertências"
+    queue_audit_log(event.chat_id, target_id, "Ação: Warn", reason or "Advertência", admin_id=event.sender_id)
+    await reply_or_edit(event, f"⚠️ <b>{db.get_user_info(target_id)}</b> (<code>{target_id}</code>): {result}.", delete_after=DEFAULT_DELETE_AFTER)
+
+
+@client.on(events.NewMessage(pattern=r'^\.warns(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_warns(event):
+    rows = db.get_warnings_report(event.chat_id)
+    if not rows:
+        await reply_or_edit(event, "📭 Nenhuma advertência ativa neste chat.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    text = "⚠️ <b>ADVERTÊNCIAS ATIVAS</b>\n\n"
+    for row in rows[:30]:
+        text += f"• {db.get_user_info(row['user_id'])} (<code>{row['user_id']}</code>): {row['count']}\n"
+    await reply_or_edit(event, text, delete_after=15)
+
 
 @client.on(events.NewMessage(pattern=r'^\.start(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
@@ -980,14 +1396,20 @@ async def cmd_kick(event):
 @client.on(events.NewMessage(pattern=r'^\.ban(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_ban(event):
     target_id = await get_target_from_event(event)
+    duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
     if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
     try:
         await client.edit_permissions(event.chat_id, target_id, view_messages=False)
+        if purge_limit:
+            await purge_target_messages(event.chat_id, target_id, purge_limit, include_pinned=include_pinned_requested(event))
+        if duration is not None:
+            db.add_temporary_punishment(event.chat_id, target_id, "ban", int(time.time()) + duration, reason, event.sender_id)
         user_info = db.get_user_info(target_id)
         queue_audit_log(event.chat_id, target_id, "Ação: Ban", "Moderação", admin_id=event.sender_id)
-        await reply_or_edit(event, f"🔨 {user_info} (<code>{target_id}</code>) banido do grupo.", delete_after=DEFAULT_DELETE_AFTER)
+        suffix = f" por {duration_label(duration)}" if duration is not None else " permanentemente"
+        await reply_or_edit(event, f"🔨 {user_info} (<code>{target_id}</code>) banido do grupo{suffix}.", delete_after=DEFAULT_DELETE_AFTER)
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
     except UserAdminInvalidError:
@@ -1015,14 +1437,20 @@ async def cmd_unban(event):
 @client.on(events.NewMessage(pattern=r'^\.mute(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_mute(event):
     target_id = await get_target_from_event(event)
+    duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
     if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
     try:
         await client.edit_permissions(event.chat_id, target_id, send_messages=False)
+        if purge_limit:
+            await purge_target_messages(event.chat_id, target_id, purge_limit, include_pinned=include_pinned_requested(event))
+        if duration is not None:
+            db.add_temporary_punishment(event.chat_id, target_id, "mute", int(time.time()) + duration, reason, event.sender_id)
         user_info = db.get_user_info(target_id)
         queue_audit_log(event.chat_id, target_id, "Ação: Mute", "Moderação", admin_id=event.sender_id)
-        await reply_or_edit(event, f"🔇 {user_info} (<code>{target_id}</code>) silenciado.", delete_after=DEFAULT_DELETE_AFTER)
+        suffix = f" por {duration_label(duration)}" if duration is not None else " permanentemente"
+        await reply_or_edit(event, f"🔇 {user_info} (<code>{target_id}</code>) silenciado{suffix}.", delete_after=DEFAULT_DELETE_AFTER)
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
     except UserAdminInvalidError:
@@ -1049,13 +1477,15 @@ async def cmd_unmute(event):
 @client.on(events.NewMessage(pattern=r'^\.blacklist(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_blacklist(event):
     target_id = await get_target_from_event(event)
+    duration, _, reason = parse_moderation_options(event)
     if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    db.add_local_blacklist(event.chat_id, target_id, get_reason_from_event(event))
+    expires_at = int(time.time()) + duration if duration is not None else None
+    db.add_local_blacklist(event.chat_id, target_id, reason, expires_at=expires_at)
     user_info = db.get_user_info(target_id)
     queue_audit_log(event.chat_id, target_id, "Ação: Blacklist Local", "Moderação", admin_id=event.sender_id)
-    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist local (mensagens serão apagadas).", delete_after=DEFAULT_DELETE_AFTER)
+    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist local ({duration_label(duration)}).", delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.unblacklist(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unblacklist(event):
@@ -1071,15 +1501,21 @@ async def cmd_unblacklist(event):
 @client.on(events.NewMessage(pattern=r'^\.banperm(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_banperm(event):
     target_id = await get_target_from_event(event)
+    duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
     if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    db.add_local_banperm(event.chat_id, target_id, get_reason_from_event(event))
+    expires_at = int(time.time()) + duration if duration is not None else None
     try:
         await client.edit_permissions(event.chat_id, target_id, view_messages=False)
+        if purge_limit:
+            await purge_target_messages(event.chat_id, target_id, purge_limit, include_pinned=include_pinned_requested(event))
+        db.add_local_banperm(event.chat_id, target_id, reason, expires_at=expires_at)
+        if duration is not None:
+            db.add_temporary_punishment(event.chat_id, target_id, "banperm", expires_at, reason, event.sender_id)
         user_info = db.get_user_info(target_id)
         queue_audit_log(event.chat_id, target_id, "Ação: BanPerm", "Moderação", admin_id=event.sender_id)
-        await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) banido permanentemente.", delete_after=DEFAULT_DELETE_AFTER)
+        await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) banido por {duration_label(duration)}.", delete_after=DEFAULT_DELETE_AFTER)
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
     except UserAdminInvalidError:
@@ -1107,10 +1543,12 @@ async def cmd_unbanperm(event):
 @client.on(events.NewMessage(pattern=r'^\.shadow(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_shadow(event):
     target_id = await get_target_from_event(event)
+    duration, _, reason = parse_moderation_options(event)
     if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    db.add_shadow_ban(target_id, get_reason_from_event(event))
+    expires_at = int(time.time()) + duration if duration is not None else None
+    db.add_shadow_ban(target_id, reason, expires_at=expires_at)
     user_info = db.get_user_info(target_id)
     queue_audit_log(event.chat_id, target_id, "Ação: Shadow Ban", "Moderação", admin_id=event.sender_id)
     await reply_or_edit(event, f"🌑 {user_info} (<code>{target_id}</code>) em Shadow Ban (mensagens serão apagadas globalmente).", delete_after=DEFAULT_DELETE_AFTER)
@@ -1129,16 +1567,20 @@ async def cmd_unshadow(event):
 @client.on(events.NewMessage(pattern=r'^\.allban(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_allban(event):
     target_id = await get_target_from_event(event)
+    duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
     if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    db.add_global_blacklist(target_id, 'ban', get_reason_from_event(event))
+    expires_at = int(time.time()) + duration if duration is not None else None
+    db.add_global_blacklist(target_id, 'ban', reason, expires_at=expires_at)
     chats = db.all_chats_detailed()
     count = 0
     for chat in chats:
         if chat['chat_type'] not in ['private', 'User']:
             try:
                 await client.edit_permissions(chat['chat_id'], target_id, view_messages=False)
+                if duration is not None:
+                    db.add_temporary_punishment(chat['chat_id'], target_id, "ban", expires_at, reason, event.sender_id)
                 count += 1
                 await asyncio.sleep(0.05)
             except FloodWaitError as e: await asyncio.sleep(e.seconds)
@@ -1152,10 +1594,12 @@ async def cmd_allban(event):
 @client.on(events.NewMessage(pattern=r'^\.allblack(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_allblack(event):
     target_id = await get_target_from_event(event)
+    duration, _, reason = parse_moderation_options(event)
     if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    db.add_global_blacklist(target_id, 'black', get_reason_from_event(event))
+    expires_at = int(time.time()) + duration if duration is not None else None
+    db.add_global_blacklist(target_id, 'black', reason, expires_at=expires_at)
     user_info = db.get_user_info(target_id)
     queue_audit_log(event.chat_id, target_id, "Ação: Allblack Global", "Moderação Global", admin_id=event.sender_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist global.", delete_after=DEFAULT_DELETE_AFTER)
@@ -1387,14 +1831,19 @@ async def cmd_help(event):
     text = (
         f"📖 <b>GUIA DE COMANDOS — Jtzin Userbot {VERSION}</b>\n\n"
         "🛡️ <b>MODERAÇÃO LOCAL & REVERSÃO:</b>\n"
-        "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code> | <code>.purge [5-100]</code> | <code>.purgeme [5-100]</code>\n"
-        "• <code>.purgeall [1-1000]</code> (todos os usuários; somente proprietários)\n"
-        "• <code>.mute</code> | <code>.unmute</code>\n"
-        "• <code>.blacklist</code> | <code>.unblacklist</code> (somente este chat)\n"
-        "• <code>.banperm</code> | <code>.unbanperm</code> (somente este chat)\n"
-        "• <code>.shadow</code> | <code>.unshadow</code> (global)\n\n"
+        "• <code>.kick</code> | <code>.ban [duração] [--purge N]</code> | <code>.unban</code>\n"
+        "• <code>.mute [duração] [--purge N]</code> | <code>.unmute</code>\n"
+        "• <code>.purge [5-100]</code> | <code>.purgeme [5-100]</code> | <code>.purgeall [1-1000]</code>\n"
+        "• <code>.blacklist [duração]</code> | <code>.unblacklist</code> (somente este chat)\n"
+        "• <code>.banperm [duração] [--purge N]</code> | <code>.unbanperm</code>\n"
+        "• <code>.shadow [duração]</code> | <code>.unshadow</code> (global)\n\n"
+        "⚠️ <b>ADVERTÊNCIAS & ANTISPAM:</b>\n"
+        "• <code>.warn @user motivo</code> | <code>.warns</code>\n"
+        "• <code>.antispam on/off</code> | <code>.quarantine on/off</code>\n"
+        "• <code>.pinned on/off</code> (protege mensagens fixadas)\n\n"
         "👑 <b>CONTROLE GLOBAL:</b>\n"
-        "• <code>.allban</code> | <code>.allblack</code> | <code>.unallblack</code>\n"
+        "• <code>.allban [duração] [--purge N]</code> | <code>.allblack [duração]</code> | <code>.unallblack</code>\n"
+        "• <code>.maintenance on/off</code> (somente proprietário)\n"
         "• <code>.autorizar</code> | <code>.desautorizar</code> | <code>.listauth</code> (Gestão de Acessos)\n\n"
         "🔍 <b>SEGURANÇA & CONTRA-ESPIONAGEM:</b>\n"
         "• <code>.antiblack on/off</code> (Modo Fênix)\n"
@@ -1424,20 +1873,35 @@ async def cmd_antispy(event):
             events_filter=types.ChannelAdminLogEventsFilter(delete=True, edit=True, ban=True, unban=True, kick=True, unkick=True),
             admins=None, max_id=0, min_id=0, limit=15
         ))
-        spies = set()
+        evidence = {}
+        action_weights = {
+            "ChannelAdminLogEventActionDeleteMessage": ("exclusão", 20),
+            "ChannelAdminLogEventActionEditMessage": ("edição", 10),
+            "ChannelAdminLogEventActionParticipantBan": ("banimento", 35),
+            "ChannelAdminLogEventActionParticipantUnban": ("reversão de banimento", 15),
+            "ChannelAdminLogEventActionParticipantToggleBan": ("alteração de restrição", 25),
+        }
         for entry in result.events:
             uid = entry.user_id
-            if uid and uid not in [OWNER_ID, SECOND_OWNER_ID, THIRD_OWNER_ID] and uid not in cache.authorized_users:
-                spies.add(uid)
-        if spies:
+            if not uid or uid in [OWNER_ID, SECOND_OWNER_ID, THIRD_OWNER_ID] or uid in cache.authorized_users:
+                continue
+            action_name = type(getattr(entry, "action", None)).__name__
+            label, weight = action_weights.get(action_name, (action_name or "evento administrativo", 5))
+            item = evidence.setdefault(uid, {"signals": set(), "confidence": 0, "events": 0})
+            item["signals"].add(label)
+            item["confidence"] = min(100, item["confidence"] + weight)
+            item["events"] += 1
+        suspects = {uid: item for uid, item in evidence.items() if item["confidence"] >= 20}
+        if suspects:
             spy_list = []
-            for uid in spies:
+            for uid, item in sorted(suspects.items(), key=lambda pair: pair[1]["confidence"], reverse=True):
                 info = db.get_user_info(uid)
-                db.add_detected_spy(uid, event.chat_id)
-                spy_list.append(f"• {info} (<code>{uid}</code>)")
-            text = "🚨 <b>ESPIÕES/BOTS DETECTADOS E SALVOS NA LISTA!</b>\n\n" + "\n".join(spy_list)
+                signals = ", ".join(sorted(item["signals"]))
+                db.add_detected_spy(uid, event.chat_id, signals, item["confidence"])
+                spy_list.append(f"• {info} (<code>{uid}</code>)\n└ Sinais: {escape(signals)} | Confiança: <code>{item['confidence']}%</code> | Eventos: <code>{item['events']}</code>")
+            text = "⚠️ <b>ATIVIDADE ADMINISTRATIVA SUSPEITA REGISTRADA</b>\n\n" + "\n".join(spy_list) + "\n\n<i>Os sinais não provam que a conta usa userbot; exigem confirmação manual.</i>"
         else:
-            text = "✅ <b>Nenhum espião novo detectado neste grupo.</b>"
+            text = "✅ <b>Nenhum conjunto suficiente de sinais foi encontrado neste grupo.</b>\n\n<i>O Telegram não informa diretamente se uma conta utiliza userbot.</i>"
         await bait_msg.edit(text, parse_mode='html')
         await asyncio.sleep(15)
         await bait_msg.delete()
@@ -1461,7 +1925,9 @@ async def cmd_listspy(event):
     for s in spies:
         info = db.get_user_info(s['user_id'])
         date_str = datetime.fromtimestamp(s['detected_at']).strftime('%d/%m/%Y %H:%M')
-        text += f"• {info} (<code>{s['user_id']}</code>)\n└ 🕒 {date_str} | Chat: <code>{s['chat_id']}</code>\n"
+        signals = escape(s.get('signals') or 'não informado')
+        confidence = int(s.get('confidence') or 0)
+        text += f"• {info} (<code>{s['user_id']}</code>)\n└ 🕒 {date_str} | Chat: <code>{s['chat_id']}</code> | Confiança: <code>{confidence}%</code>\n└ Sinais: {signals}\n"
     await reply_or_edit(event, text, delete_after=15)
 
 @client.on(events.NewMessage(pattern=r'^\.delspy(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
@@ -1551,7 +2017,7 @@ async def cmd_purge(event):
         # chamadas individuais sem alterar o limite de 5–100 mensagens.
         scan_limit = min(MAX_HISTORY_SCAN, limit + 2)
         async for msg in client.iter_messages(event.chat_id, limit=scan_limit, from_user=target_id):
-            if msg.id != event.id:
+            if msg.id != event.id and (not getattr(msg, "pinned", False) or include_pinned_requested(event) or not db.get_settings(event.chat_id).get("protect_pinned", 1)):
                 message_ids.append(msg.id)
                 if len(message_ids) >= limit:
                     break
@@ -1584,7 +2050,7 @@ async def cmd_purgeme(event):
     try:
         scan_limit = min(MAX_HISTORY_SCAN, limit + 2)
         async for msg in client.iter_messages(event.chat_id, limit=scan_limit, from_user=me_id):
-            if msg.id != status_msg.id and msg.id != event.id:
+            if msg.id != status_msg.id and msg.id != event.id and (not getattr(msg, "pinned", False) or include_pinned_requested(event) or not db.get_settings(event.chat_id).get("protect_pinned", 1)):
                 message_ids.append(msg.id)
                 if len(message_ids) >= limit:
                     break
@@ -1652,10 +2118,16 @@ if __name__ == "__main__":
     cache.load_all(db.conn)
     logger.info("JTZIN USERBOT %s (STATUS E HEALTH) INICIANDO...", VERSION)
     client.start()
+    expiry_task = client.loop.create_task(temporary_expiry_loop())
     logger.info("USERBOT TELETHON ONLINE!")
     try:
         client.run_until_disconnected()
     finally:
+        try:
+            expiry_task.cancel()
+            client.loop.run_until_complete(expiry_task)
+        except (asyncio.CancelledError, Exception):
+            pass
         try:
             client.loop.run_until_complete(audit_buffer.flush())
         except Exception as exc:
