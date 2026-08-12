@@ -72,7 +72,7 @@ TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
 TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
 TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.21"
+VERSION = "V6.22"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -92,6 +92,7 @@ class Cache:
         self.shadow_ban = set()
         self.link_whitelist = defaultdict(set)
         self.authorized_users = set()
+        self.authorized_expirations = {}
         self.antiblack_chats = set()
         self.settings = {}
 
@@ -104,6 +105,7 @@ class Cache:
             self.shadow_ban.clear()
             self.link_whitelist.clear()
             self.authorized_users.clear()
+            self.authorized_expirations.clear()
             self.antiblack_chats.clear()
             self.settings.clear()
 
@@ -125,8 +127,16 @@ class Cache:
             for row in cursor.fetchall():
                 self.link_whitelist[row[0]].add(row[1])
 
-            cursor = db_conn.execute("SELECT user_id FROM authorized_users")
-            self.authorized_users = {row[0] for row in cursor.fetchall()}
+            try:
+                cursor = db_conn.execute("SELECT user_id, expires_at FROM authorized_users")
+                authorized_rows = cursor.fetchall()
+            except sqlite3.OperationalError:
+                authorized_rows = db_conn.execute("SELECT user_id FROM authorized_users").fetchall()
+            self.authorized_users = {int(row[0]) for row in authorized_rows}
+            self.authorized_expirations = {
+                int(row[0]): (int(row[1]) if len(row) > 1 and row[1] is not None else None)
+                for row in authorized_rows
+            }
             
             try:
                 cursor = db_conn.execute("SELECT chat_id, antiblack FROM settings WHERE antiblack=1")
@@ -184,18 +194,48 @@ class Database:
             else:
                 cache.antiblack_chats.discard(int(chat_id))
 
-    def add_authorized(self, user_id):
-        cursor = self.execute("INSERT OR IGNORE INTO authorized_users(user_id, created_at) VALUES(?,?)", (int(user_id), int(time.time())), commit=True)
+    def add_authorized(self, user_id, expires_at=None):
+        user_id = int(user_id)
+        expires_at = int(expires_at) if expires_at is not None else None
+        cursor = self.execute(
+            "INSERT INTO authorized_users(user_id, created_at, expires_at) VALUES(?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at",
+            (user_id, int(time.time()), expires_at),
+            commit=True,
+        )
         if cursor is not None:
-            cache.authorized_users.add(int(user_id))
+            cache.authorized_users.add(user_id)
+            cache.authorized_expirations[user_id] = expires_at
 
     def remove_authorized(self, user_id):
-        cursor = self.execute("DELETE FROM authorized_users WHERE user_id=?", (int(user_id),), commit=True)
+        user_id = int(user_id)
+        cursor = self.execute("DELETE FROM authorized_users WHERE user_id=?", (user_id,), commit=True)
         if cursor is not None:
-            cache.authorized_users.discard(int(user_id))
+            cache.authorized_users.discard(user_id)
+            cache.authorized_expirations.pop(user_id, None)
+
+    def expire_authorized(self, now=None):
+        now = int(now or time.time())
+        rows = self.fetchall(
+            "SELECT user_id FROM authorized_users WHERE expires_at IS NOT NULL AND expires_at<=?",
+            (now,),
+        )
+        if rows:
+            self.execute(
+                "DELETE FROM authorized_users WHERE expires_at IS NOT NULL AND expires_at<=?",
+                (now,),
+                commit=True,
+            )
+            for row in rows:
+                user_id = int(row["user_id"])
+                cache.authorized_users.discard(user_id)
+                cache.authorized_expirations.pop(user_id, None)
+        return rows
 
     def get_all_authorized(self):
-        res = self.execute("SELECT user_id, created_at FROM authorized_users ORDER BY created_at DESC")
+        res = self.execute("SELECT user_id, created_at, expires_at FROM authorized_users ORDER BY created_at DESC")
+        if res is None:
+            res = self.execute("SELECT user_id, created_at FROM authorized_users ORDER BY created_at DESC")
         if res:
             return [dict(r) for r in res.fetchall()]
         return []
@@ -722,7 +762,13 @@ def is_owner(user_id: int) -> bool:
     return user_id in [OWNER_ID, SECOND_OWNER_ID, THIRD_OWNER_ID]
 
 def is_authorized(user_id: int) -> bool:
-    return is_owner(user_id) or user_id in cache.authorized_users
+    if is_owner(user_id):
+        return True
+    user_id = int(user_id or 0)
+    if user_id not in cache.authorized_users:
+        return False
+    expires_at = cache.authorized_expirations.get(user_id)
+    return expires_at is None or expires_at > int(time.time())
 
 
 ADMIN_CACHE_TTL = _env_int("ADMIN_CACHE_TTL", 60, 10, 600)
@@ -814,6 +860,43 @@ async def get_target_from_event(event):
     except Exception as e:
         logger.error(f"Erro ao extrair alvo: {e}")
     return None
+
+
+async def get_authorization_target_and_expiry(event):
+    """Resolve alvo e duração sem tratar a duração como se fosse um ID."""
+    args = event.raw_text.split()[1:]
+    duration = None
+    duration_index = None
+    for index, token in enumerate(args[:2]):
+        parsed = parse_duration_token(token)
+        if parsed is not None:
+            duration = parsed
+            duration_index = index
+            break
+
+    target_token = next((token for index, token in enumerate(args) if index != duration_index), None)
+    try:
+        reply = await event.get_reply_message()
+        if reply and reply.sender_id:
+            return int(reply.sender_id), duration
+
+        if not target_token:
+            return None, duration
+        raw = target_token.strip()
+        if raw.startswith("@"):
+            try:
+                user = await client.get_entity(raw)
+                if isinstance(user, User):
+                    db.remember_user(user.id, user.username, user.first_name)
+                return int(user.id), duration
+            except (ValueError, RPCError):
+                return db.resolve_username(raw), duration
+        if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
+            return int(raw), duration
+    except Exception as exc:
+        logger.error("Erro ao extrair alvo e duração da autorização: %s", exc)
+    return None, duration
+
 
 def format_timestamp(value, fmt="%d/%m/%Y %H:%M"):
     try:
@@ -969,6 +1052,7 @@ async def temporary_expiry_loop():
         try:
             await asyncio.sleep(EXPIRATION_CHECK_INTERVAL)
             now = int(time.time())
+            db.expire_authorized(now)
             db.expire_local_blacklist(now)
             expired_local_bans = db.expire_local_banperm(now)
             expired_global = db.expire_global_blacklist(now)
@@ -1997,14 +2081,28 @@ async def cmd_unallblack(event):
 
 @client.on(events.NewMessage(pattern=r'^\.autorizar(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_autorizar(event):
-    target_id = await get_target_from_event(event)
+    target_id, duration = await get_authorization_target_and_expiry(event)
     if not target_id:
-        await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=5)
+        await reply_or_edit(event, "❌ Especifique o usuário por resposta, ID ou username.", delete_after=5)
         return
-    db.add_authorized(target_id)
+    if is_immune(target_id):
+        await reply_or_edit(event, "❌ Os proprietários já possuem acesso permanente.", delete_after=5)
+        return
+    expires_at = int(time.time()) + duration if duration is not None else None
+    db.add_authorized(target_id, expires_at=expires_at)
     user_info = db.get_user_info(target_id)
-    queue_audit_log(event.chat_id, target_id, "Ação: Autorizar", "Controle", admin_id=event.sender_id)
-    await reply_or_edit(event, f"✅ Usuário {user_info} (<code>{target_id}</code>) autorizado.", delete_after=5)
+    if expires_at is None:
+        access_text = "permanentemente"
+        audit_reason = "Controle; autorização permanente"
+    else:
+        access_text = f"por <b>{escape(format_duration(duration))}</b> (expira em {format_timestamp(expires_at)})"
+        audit_reason = f"Controle; autorização temporária por {format_duration(duration)}"
+    queue_audit_log(event.chat_id, target_id, "Ação: Autorizar", audit_reason, admin_id=event.sender_id)
+    await reply_or_edit(
+        event,
+        f"✅ Usuário {user_info} (<code>{target_id}</code>) autorizado {access_text}.",
+        delete_after=5,
+    )
 
 @client.on(events.NewMessage(pattern=r'^\.desautorizar(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_desautorizar(event):
@@ -2027,7 +2125,9 @@ async def cmd_listauth(event):
     for r in auths:
         info = db.get_user_info(r['user_id'])
         date_str = format_timestamp(r['created_at'])
-        text += f"• {info} (<code>{r['user_id']}</code>)\n└ 📅 {date_str}\n"
+        expires_at = r.get('expires_at')
+        access_text = "permanente" if not expires_at else f"expira em {format_timestamp(expires_at)}"
+        text += f"• {info} (<code>{r['user_id']}</code>)\n└ 📅 {date_str} | {access_text}\n"
     await reply_or_edit(event, text, delete_after=15)
 
 @client.on(events.NewMessage(pattern=r'^\.logs(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
@@ -2231,7 +2331,7 @@ async def cmd_help(event):
         "👑 <b>CONTROLE GLOBAL:</b>\n"
         "• <code>.allban [duração] [--purge N]</code> | <code>.allblack [duração]</code> | <code>.unallblack</code>\n"
         "• <code>.maintenance on/off</code> (somente proprietário)\n"
-        "• <code>.autorizar</code> | <code>.desautorizar</code> | <code>.listauth</code> (Gestão de Acessos)\n\n"
+        "• <code>.autorizar [duração]</code> | <code>.desautorizar</code> | <code>.listauth</code> (Acessos permanentes ou temporários: 10s, 30m, 10h, 10d)\n\n"
         "🔍 <b>SEGURANÇA & CONTRA-ESPIONAGEM:</b>\n"
         "• <code>.antiblack on/off</code> (Modo Fênix)\n"
         "• <code>.antispy</code> (Varredura de Espiões)\n"
