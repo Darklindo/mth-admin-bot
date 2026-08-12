@@ -1,71 +1,75 @@
-# MTH Admin Bot
+# Jtzin Userbot
 
-Bot de administração para Telegram, pensado para rodar no Termux.
+Userbot profissional de administração para Telegram, desenvolvido com **Telethon** e preparado para execução no Termux. Os comandos usam o prefixo `.` e são processados pela conta de usuário autenticada no MTProto; este projeto não usa `BOT_TOKEN` nem o Bot API.
 
-## Recursos
+## Entrada correta
 
-- Anti-spam com limite configurável no código
-- `/ban` e `/banperm`
-- `/unban`
-- `/kick`
-- `/mute` e `/unmute`
-- `/warn`
-- `/blacklist` — apaga automaticamente novas mensagens de usuários bloqueados
-- `/unblacklist`
-- `/blacklistlist`
-- `/antispam on|off`
-- `/divulgar texto` — somente o OWNER_ID; envia aos grupos/canais que o bot registrou
-- `/chats` — somente o dono
-- SQLite para persistência
-- Logs e tratamento de erros
-- `.env` para manter o token fora do código
+O processo atual deve ser iniciado por `bot_v2.py`, preferencialmente pelo `watchdog.sh`. O arquivo `bot.py` é uma implementação legada baseada no Bot API e não deve ser usado para executar o Userbot atual.
 
-## Importante
+```bash
+python3 migrate_db.py
+python3 bot_v2.py
+```
 
-O Bot API não fornece uma forma de listar todos os grupos/canais onde o bot está. Por isso, o projeto registra chats quando recebe atualizações deles, principalmente quando o bot entra/sai ou quando há atividade.
+Para operação persistente no Termux:
 
-Para moderação, o bot precisa ser administrador e receber as permissões necessárias para apagar mensagens e restringir/banir usuários.
+```bash
+termux-wake-lock
+tmux new-session -d -s mthadmin './watchdog.sh'
+tmux attach -t mthadmin
+```
 
-Para o anti-spam funcionar em grupos, o bot precisa receber as mensagens. Se o Privacy Mode estiver impedindo a entrega das mensagens necessárias, ajuste essa configuração no BotFather.
+Para sair do tmux sem encerrar o processo, use `Ctrl+B` e depois `D`. Para retornar às logs, execute `tmux attach -t mthadmin`.
 
-## Termux
+## Instalação
 
 ```bash
 pkg update -y
 pkg install python git tmux -y
-
-git clone SEU_REPOSITORIO
-cd mth_admin_bot
-
-python -m venv .venv
+git clone https://github.com/Darklindo/mth-admin-bot.git mth-admin
+cd mth-admin
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-
 cp .env.example .env
 nano .env
-
-python bot.py
+python3 migrate_db.py
 ```
 
-Para manter rodando:
+O arquivo `.env` precisa conter `API_ID`, `API_HASH` e `OWNER_ID`. Os IDs `SECOND_OWNER_ID` e `THIRD_OWNER_ID` podem ser configurados para os subproprietários. Nunca publique o `.env`, o arquivo `.session` ou o banco de dados.
+
+## Atualização no Termux
 
 ```bash
-termux-wake-lock
-tmux new -s mthbot
-source .venv/bin/activate
-python bot.py
+cd ~/mth-admin && (tmux kill-session -t mthadmin 2>/dev/null || true) && git pull --ff-only origin master && chmod +x update_bot.sh watchdog.sh && ./update_bot.sh && termux-wake-lock && tmux new-session -d -s mthadmin './watchdog.sh' && sleep 2 && tmux attach -t mthadmin
 ```
 
-Para sair do tmux sem parar o bot:
+O script de atualização interrompe o fluxo em caso de erro, recria o ambiente virtual quando necessário, instala as dependências e executa a migração SQLite antes da inicialização.
 
-`CTRL+B` e depois `D`
+## Recursos principais
 
-Para voltar:
+O Userbot oferece moderação local e global, blacklist, shadow ban, banimentos temporários, sistema de advertências, antispam com pontuação, quarentena, antilink, autorização permanente ou temporária, proteção de mensagens fixadas, purge, relatórios, logs, diagnóstico e modo de manutenção. A documentação operacional completa é exibida pelo comando `.help` depois da autenticação.
 
-```bash
-tmux attach -t mthbot
+Exemplos de autorização temporária:
+
+```text
+.autorizar 10s @usuario
+.autorizar 30m @usuario
+.autorizar 10h 123456789
+.autorizar 10d
+.autorizar @usuario
+.listauth
+.desautorizar @usuario
 ```
+
+Quando o comando é respondido à mensagem de alguém, o alvo pode ser omitido. Sem duração, a autorização é permanente. O prazo mínimo é de 10 segundos; durações aceitas incluem segundos (`s`), minutos (`m`), horas (`h`), dias (`d`) e semanas (`w`).
+
+## Permissões e operação
+
+Para excluir mensagens, restringir usuários e aplicar banimentos, a conta precisa ter as permissões administrativas correspondentes em cada grupo ou canal. A imunidade dos proprietários é aplicada antes das punições, enquanto usuários autorizados recebem acesso aos comandos sem ganhar imunidade automática.
+
+O banco SQLite fica em `data/bot.db`, utiliza WAL e possui migrações idempotentes. O arquivo `migrate_db.py` pode ser executado novamente sem apagar os registros existentes.
 
 ## Segurança
 
-O token do bot é uma credencial secreta. Nunca publique o token no código, GitHub, prints ou mensagens. Se um token já foi exposto, revogue-o no BotFather e gere outro antes de colocar o bot em produção.
+As credenciais MTProto são sensíveis. Não publique `API_HASH`, sessões do Telethon, tokens, banco local ou logs que contenham dados privados. Se uma credencial for exposta, revogue-a ou substitua-a antes de continuar usando o ambiente.
