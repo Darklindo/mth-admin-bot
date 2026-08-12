@@ -71,7 +71,7 @@ TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
 TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
 TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.17"
+VERSION = "V6.18"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -286,8 +286,22 @@ class Database:
         row = self.fetchone("SELECT count, first_at, last_at FROM warnings WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)))
         return dict(row) if row else {"count": 0, "first_at": 0, "last_at": 0}
 
+    def remove_warning(self, chat_id, user_id):
+        row = self.fetchone("SELECT count FROM warnings WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)))
+        current = int(row["count"]) if row else 0
+        if current <= 0:
+            return 0
+        if current == 1:
+            self.execute("DELETE FROM warnings WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)), commit=True)
+            return 0
+        self.execute("UPDATE warnings SET count=count-1 WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)), commit=True)
+        return current - 1
+
     def clear_warnings(self, chat_id, user_id):
+        row = self.fetchone("SELECT count FROM warnings WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)))
+        removed = int(row["count"]) if row else 0
         self.execute("DELETE FROM warnings WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)), commit=True)
+        return removed
 
     def add_temporary_punishment(self, chat_id, user_id, action, expires_at, reason=None, admin_id=None):
         self.execute(
@@ -1340,6 +1354,45 @@ async def cmd_warn(event):
     await reply_or_edit(event, f"⚠️ <b>{db.get_user_info(target_id)}</b> (<code>{target_id}</code>): {result}.", delete_after=DEFAULT_DELETE_AFTER)
 
 
+@client.on(events.NewMessage(pattern=r'^\.unwarn(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_unwarn(event):
+    target_id = await get_target_from_event(event)
+    if not target_id:
+        await reply_or_edit(event, "❌ Responda à mensagem do usuário ou informe o ID/username após <code>.unwarn</code>.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if is_immune(target_id):
+        await reply_or_edit(event, "❌ A conta protegida não pode ser alterada por este comando.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    before = db.get_warning(event.chat_id, target_id)
+    user_info = db.get_user_info(target_id)
+    if int(before.get("count", 0)) <= 0:
+        result = f"ℹ️ {user_info} (<code>{target_id}</code>) não possui advertências ativas neste chat."
+    else:
+        remaining = db.remove_warning(event.chat_id, target_id)
+        result = f"✅ Uma advertência foi removida de {user_info} (<code>{target_id}</code>). Restantes: <code>{remaining}</code>."
+        queue_audit_log(event.chat_id, target_id, "Ação: Unwarn", "Remoção de advertência", admin_id=event.sender_id)
+    await reply_or_edit(event, result, delete_after=DEFAULT_DELETE_AFTER)
+
+
+@client.on(events.NewMessage(pattern=r'^\.clearwarns(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_clearwarns(event):
+    target_id = await get_target_from_event(event)
+    if not target_id:
+        await reply_or_edit(event, "❌ Responda à mensagem do usuário ou informe o ID/username após <code>.clearwarns</code>.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if is_immune(target_id):
+        await reply_or_edit(event, "❌ A conta protegida não pode ser alterada por este comando.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    removed = db.clear_warnings(event.chat_id, target_id)
+    user_info = db.get_user_info(target_id)
+    if removed:
+        text = f"✅ Todas as advertências de {user_info} (<code>{target_id}</code>) foram removidas. Total: <code>{removed}</code>."
+    else:
+        text = f"ℹ️ {user_info} (<code>{target_id}</code>) não possui advertências ativas neste chat."
+    queue_audit_log(event.chat_id, target_id, "Ação: Clearwarns", "Limpeza de advertências", admin_id=event.sender_id)
+    await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
+
+
 @client.on(events.NewMessage(pattern=r'^\.warns(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_warns(event):
     rows = db.get_warnings_report(event.chat_id)
@@ -1839,6 +1892,7 @@ async def cmd_help(event):
         "• <code>.shadow [duração]</code> | <code>.unshadow</code> (global)\n\n"
         "⚠️ <b>ADVERTÊNCIAS & ANTISPAM:</b>\n"
         "• <code>.warn @user motivo</code> | <code>.warns</code>\n"
+        "• <code>.unwarn @user</code> | <code>.clearwarns @user</code> (remove advertências)\n"
         "• <code>.antispam on/off</code> | <code>.quarantine on/off</code>\n"
         "• <code>.pinned on/off</code> (protege mensagens fixadas)\n\n"
         "👑 <b>CONTROLE GLOBAL:</b>\n"
