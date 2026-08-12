@@ -9,7 +9,7 @@ import json
 from collections import defaultdict, deque
 import threading
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape
 
 from dotenv import load_dotenv
@@ -55,6 +55,8 @@ MAX_PURGE_LIMIT = 100
 MAX_HISTORY_SCAN = 1000
 MAX_DURATION_SECONDS = 365 * 24 * 60 * 60
 MIN_DURATION_SECONDS = 10
+# O Telegram trata until_date menor que 30 segundos como banimento permanente.
+MIN_TELEGRAM_TEMP_DURATION_SECONDS = 30
 EXPIRATION_CHECK_INTERVAL = _env_int("EXPIRATION_CHECK_INTERVAL", 30, 10, 300)
 SPAM_STATE_MAX_USERS = _env_int("SPAM_STATE_MAX_USERS", 10000, 100, 100000)
 SPAM_ACTION_COOLDOWN = _env_int("SPAM_ACTION_COOLDOWN", 30, 5, 300)
@@ -73,7 +75,7 @@ TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
 TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
 TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.26"
+VERSION = "V6.27"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -178,7 +180,7 @@ class Cache:
                 cursor = db_conn.execute("SELECT chat_id FROM settings WHERE locked=1")
                 self.locked_chats = {int(row[0]) for row in cursor.fetchall()}
             except sqlite3.OperationalError:
-                # Compatibilidade defensiva com banco anterior à migração V6.26.
+                # Compatibilidade defensiva com bancos de versões anteriores.
                 pass
 
             logger.info("Cache carregado com sucesso (%s - filtros de baixa latência).", VERSION)
@@ -1235,25 +1237,39 @@ PERMISSION_EDIT_FIELDS = {
 }
 
 
+PERMISSION_SNAPSHOT_VERSION = 2
+
+
 async def capture_permission_snapshot(chat_id, user_id):
-    """Captura apenas permissões banidas antes de uma restrição temporária."""
+    """Captura permissões permitidas antes de uma restrição temporária.
+
+    O Telethon expõe ``banned_rights`` como direitos revogados, enquanto
+    ``client.edit_permissions`` recebe permissões permitidas. O snapshot V2
+    guarda a forma permitida para que a restauração não inverta o estado.
+    """
     try:
         permissions = await client.get_permissions(chat_id, user_id)
-        banned_rights = getattr(permissions, "banned_rights", None)
+        participant = getattr(permissions, "participant", permissions)
+        banned_rights = getattr(participant, "banned_rights", None)
+        if banned_rights is None:
+            # Compatibilidade com fakes/versões antigas que expõem o campo
+            # diretamente no objeto retornado por get_permissions.
+            banned_rights = getattr(permissions, "banned_rights", None)
         if banned_rights is None:
             return "{}"
-        snapshot = {
-            field: bool(getattr(banned_rights, field, False))
+        allowed = {
+            field: not bool(getattr(banned_rights, field, False))
             for field in PERMISSION_SNAPSHOT_FIELDS
             if hasattr(banned_rights, field)
         }
-        until_date = getattr(permissions, "until_date", None)
+        snapshot = {"version": PERMISSION_SNAPSHOT_VERSION, "permissions": allowed}
+        until_date = getattr(banned_rights, "until_date", None) or getattr(permissions, "until_date", None)
         if until_date:
             if isinstance(until_date, datetime):
                 until_timestamp = int(until_date.timestamp())
             else:
                 until_timestamp = int(until_date)
-            if until_timestamp > 0:
+            if until_timestamp > int(time.time()):
                 snapshot["until_date"] = until_timestamp
         return json.dumps(snapshot, separators=(",", ":"), sort_keys=True)
     except Exception as exc:
@@ -1262,27 +1278,33 @@ async def capture_permission_snapshot(chat_id, user_id):
 
 
 async def restore_permission_snapshot(chat_id, user_id, snapshot=None, action=None):
-    """Restaura o snapshot; usa fallback conservador para registros antigos."""
+    """Restaura o snapshot V2 e converte snapshots legados com segurança."""
     kwargs = {}
     if snapshot:
         try:
             data = json.loads(snapshot) if isinstance(snapshot, str) else snapshot
             if isinstance(data, dict):
-                kwargs = {}
+                version = int(data.get("version", 1))
+                source = data.get("permissions") if version >= PERMISSION_SNAPSHOT_VERSION else data
+                if not isinstance(source, dict):
+                    raise ValueError("permissões ausentes no snapshot")
                 raw_until_date = data.get("until_date")
                 if raw_until_date:
                     try:
                         until_timestamp = int(raw_until_date)
                         if until_timestamp > int(time.time()):
-                            kwargs["until_date"] = datetime.fromtimestamp(until_timestamp)
+                            kwargs["until_date"] = telegram_datetime(until_timestamp)
                     except (TypeError, ValueError, OverflowError, OSError):
                         logger.warning("Prazo inválido no snapshot de permissões para %s/%s", chat_id, user_id)
                 for field in PERMISSION_SNAPSHOT_FIELDS:
-                    if field not in data or data[field] is None:
+                    if field not in source or source[field] is None:
                         continue
                     edit_field = "embed_link_previews" if field == "embed_links" else field
-                    if edit_field in PERMISSION_EDIT_FIELDS or edit_field == "embed_link_previews":
-                        kwargs[edit_field] = bool(data[field])
+                    if edit_field not in PERMISSION_EDIT_FIELDS and edit_field != "embed_link_previews":
+                        continue
+                    # V1 armazenava direitos banidos; V2 armazena permissões
+                    # permitidas. A conversão mantém bancos antigos seguros.
+                    kwargs[edit_field] = bool(source[field]) if version >= PERMISSION_SNAPSHOT_VERSION else not bool(source[field])
         except (TypeError, ValueError, json.JSONDecodeError):
             logger.warning("Snapshot de permissões inválido para %s/%s", chat_id, user_id)
     if not kwargs:
@@ -1498,6 +1520,11 @@ def parse_moderation_options(event, allow_purge=False):
 
 def get_reason_from_event(event):
     return parse_moderation_options(event, allow_purge=True)[2]
+
+
+def telegram_datetime(timestamp):
+    """Retorna datetime UTC para a serialização de prazos do Telethon."""
+    return datetime.fromtimestamp(int(timestamp), tz=timezone.utc)
 
 
 def duration_label(seconds):
@@ -2544,12 +2571,33 @@ async def cmd_ban(event):
     if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
+    # .ban é temporário por definição. O comando permanente é .banperm;
+    # nunca permitir que a ausência de duração caia silenciosamente no ban eterno.
+    if duration is None:
+        await reply_or_edit(
+            event,
+            "❌ O <code>.ban</code> exige uma duração, por exemplo <code>.ban 30m</code>. Para banir permanentemente, use <code>.banperm</code>.",
+            delete_after=DEFAULT_DELETE_AFTER,
+        )
+        return
+    if duration < MIN_TELEGRAM_TEMP_DURATION_SECONDS:
+        await reply_or_edit(event, "❌ A duração mínima de um ban temporário é de 30 segundos. Durações menores podem ser tratadas pelo Telegram como permanentes.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    expires_at = int(time.time()) + duration
     try:
         snapshot = await capture_permission_snapshot(event.chat_id, target_id)
-        await client.edit_permissions(event.chat_id, target_id, view_messages=False)
+        if snapshot is None:
+            await reply_or_edit(event, "❌ Não foi possível capturar as permissões anteriores; o ban não foi aplicado.", delete_after=DEFAULT_DELETE_AFTER)
+            return
+        await client.edit_permissions(
+            event.chat_id,
+            target_id,
+            until_date=telegram_datetime(expires_at),
+            view_messages=False,
+        )
         if purge_limit:
             await purge_target_messages(event.chat_id, target_id, purge_limit, include_pinned=include_pinned_requested(event))
-        if duration is not None and not db.add_temporary_punishment(event.chat_id, target_id, "ban", int(time.time()) + duration, reason, event.sender_id, previous_permissions=snapshot):
+        if not db.add_temporary_punishment(event.chat_id, target_id, "ban", expires_at, reason, event.sender_id, previous_permissions=snapshot):
             try:
                 await restore_permission_snapshot(event.chat_id, target_id, snapshot, "ban")
             except Exception as restore_exc:
@@ -2558,8 +2606,7 @@ async def cmd_ban(event):
             return
         user_info = db.get_user_info(target_id)
         queue_audit_log(event.chat_id, target_id, "Ação: Ban", "Moderação", admin_id=event.sender_id)
-        suffix = f" por {duration_label(duration)}" if duration is not None else " permanentemente"
-        await reply_or_edit(event, f"🔨 {user_info} (<code>{target_id}</code>) banido do grupo{suffix}.", delete_after=DEFAULT_DELETE_AFTER)
+        await reply_or_edit(event, f"🔨 {user_info} (<code>{target_id}</code>) banido do grupo por <b>{duration_label(duration)}</b>.", delete_after=DEFAULT_DELETE_AFTER)
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
     except UserAdminInvalidError:
@@ -2614,9 +2661,16 @@ async def cmd_mute(event):
     if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
+    if duration is not None and duration < MIN_TELEGRAM_TEMP_DURATION_SECONDS:
+        await reply_or_edit(event, "❌ A duração mínima de um mute temporário é de 30 segundos.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    expires_at = int(time.time()) + duration if duration is not None else None
     try:
         snapshot = await capture_permission_snapshot(event.chat_id, target_id)
-        await client.edit_permissions(event.chat_id, target_id, send_messages=False)
+        permission_kwargs = {"send_messages": False}
+        if expires_at is not None:
+            permission_kwargs["until_date"] = telegram_datetime(expires_at)
+        await client.edit_permissions(event.chat_id, target_id, **permission_kwargs)
         if purge_limit:
             await purge_target_messages(event.chat_id, target_id, purge_limit, include_pinned=include_pinned_requested(event))
         if duration is not None and not db.add_temporary_punishment(event.chat_id, target_id, "mute", int(time.time()) + duration, reason, event.sender_id, previous_permissions=snapshot):
@@ -2692,10 +2746,16 @@ async def cmd_banperm(event):
     if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
+    if duration is not None and duration < MIN_TELEGRAM_TEMP_DURATION_SECONDS:
+        await reply_or_edit(event, "❌ A duração mínima de um ban temporário é de 30 segundos.", delete_after=DEFAULT_DELETE_AFTER)
+        return
     expires_at = int(time.time()) + duration if duration is not None else None
     try:
         snapshot = await capture_permission_snapshot(event.chat_id, target_id)
-        await client.edit_permissions(event.chat_id, target_id, view_messages=False)
+        permission_kwargs = {"view_messages": False}
+        if expires_at is not None:
+            permission_kwargs["until_date"] = telegram_datetime(expires_at)
+        await client.edit_permissions(event.chat_id, target_id, **permission_kwargs)
         if purge_limit:
             await purge_target_messages(event.chat_id, target_id, purge_limit, include_pinned=include_pinned_requested(event))
         if not db.add_local_banperm(event.chat_id, target_id, reason, expires_at=expires_at, previous_permissions=snapshot):
@@ -2793,6 +2853,9 @@ async def cmd_allban(event):
     if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
         return
+    if duration is not None and duration < MIN_TELEGRAM_TEMP_DURATION_SECONDS:
+        await reply_or_edit(event, "❌ A duração mínima de um allban temporário é de 30 segundos.", delete_after=DEFAULT_DELETE_AFTER)
+        return
     expires_at = int(time.time()) + duration if duration is not None else None
     previous_global = db.get_global_blacklist_record(target_id)
     if not db.add_global_blacklist(target_id, 'ban', reason, expires_at=expires_at):
@@ -2817,7 +2880,13 @@ async def cmd_allban(event):
             continue
         try:
             snapshot = await capture_permission_snapshot(chat['chat_id'], target_id)
-            await client.edit_permissions(chat['chat_id'], target_id, view_messages=False)
+            if snapshot is None:
+                logger.warning("Snapshot indisponível; allban não aplicado no chat %s/%s", chat['chat_id'], target_id)
+                continue
+            permission_kwargs = {"view_messages": False}
+            if duration is not None:
+                permission_kwargs["until_date"] = telegram_datetime(expires_at)
+            await client.edit_permissions(chat['chat_id'], target_id, **permission_kwargs)
             if not db.add_global_ban_snapshot(target_id, chat['chat_id'], snapshot):
                 try:
                     await restore_permission_snapshot(chat['chat_id'], target_id, snapshot, "ban")
@@ -2950,12 +3019,12 @@ async def cmd_logs(event):
     for log in logs:
         user_info = db.get_user_info(log['user_id'])
         time_str = format_timestamp(log['created_at'], '%H:%M:%S')
-        raw_content = str(log.get('content') or '[sem conteúdo]')
+        raw_content = str(log['content'] or '[sem conteúdo]')
         content = (raw_content[:30] + '...') if len(raw_content) > 30 else raw_content
         content = escape(content)
         text += f"⏰ <code>{time_str}</code> | 👤 {user_info}\n"
-        text += f"🚫 <b>Motivo:</b> {escape(str(log.get('reason') or 'não informado'))}\n"
-        if log.get('admin_id'):
+        text += f"🚫 <b>Motivo:</b> {escape(str(log['reason'] or 'não informado'))}\n"
+        if log['admin_id']:
             admin_info = db.get_user_info(log['admin_id'])
             text += f"👮 <b>Admin:</b> {admin_info}\n"
         text += f"💬 <b>Conteúdo:</b> <i>{content}</i>\n"
