@@ -65,7 +65,7 @@ TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
 TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
 TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.15"
+VERSION = "V6.15.1"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -557,6 +557,8 @@ def get_performance_snapshot():
         "audit_enqueued": audit_buffer.enqueued,
         "audit_persisted": audit_buffer.persisted,
         "audit_failed": audit_buffer.failed,
+        # Alias mantido para evitar quebra em instalações com o nome antigo.
+        "delete_failed": queue_stats.get("failed", 0),
     }
 
 
@@ -1308,6 +1310,7 @@ async def cmd_latency(event):
         api_ms = 0.0
         api_state = f"⚠️ falhou: {escape(str(exc)[:120])}"
     performance = get_performance_snapshot()
+    delete_failures = performance.get("failed", performance.get("delete_failed", 0))
     elapsed_ms = (time.perf_counter() - started) * 1000
     text = (
         f"⚡ <b>DIAGNÓSTICO DE LATÊNCIA {VERSION}</b>\n\n"
@@ -1316,7 +1319,7 @@ async def cmd_latency(event):
         f"• Maior RPC observado: <code>{performance['max_delete_ms']:.0f} ms</code>\n"
         f"• Exclusões imediatas: <code>{performance['immediate']}</code>\n"
         f"• Mensagens agrupadas: <code>{performance['batched']}</code>\n"
-        f"• Falhas/overflow: <code>{performance['delete_failed']}/{performance['overflow']}</code>\n"
+        f"• Falhas/overflow: <code>{delete_failures}/{performance.get('overflow', 0)}</code>\n"
         f"• Auditoria pendente: <code>{performance['audit_pending']}</code> | "
         f"persistida: <code>{performance['audit_persisted']}</code>\n"
         f"• Diagnóstico concluído em: <code>{elapsed_ms:.0f} ms</code>"
