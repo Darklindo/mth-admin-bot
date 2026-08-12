@@ -6,6 +6,7 @@ import asyncio
 import re
 import hashlib
 import json
+import logging
 from collections import defaultdict, deque
 import threading
 from pathlib import Path
@@ -75,7 +76,7 @@ TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
 TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
 TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.27"
+VERSION = "V6.28"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -1036,7 +1037,11 @@ _admin_status_cache = {}
 
 def is_immune(user_id: int) -> bool:
     """Somente os proprietários ficam imunes às punições do Userbot."""
-    return bool(user_id) and is_owner(int(user_id))
+    try:
+        normalized_id = int(user_id or 0)
+    except (TypeError, ValueError):
+        return False
+    return normalized_id != 0 and is_owner(normalized_id)
 
 
 async def is_chat_admin(chat_id, user_id, use_cache=True):
@@ -1333,15 +1338,30 @@ def message_contains_link(message, text=None):
 
 
 async def get_target_from_event(event):
+    """Resolve alvo por reply, ID ou username sem confundir o autor do comando."""
     try:
         reply = await event.get_reply_message()
-        if reply:
-            if reply.sender_id:
-                return reply.sender_id
-            if reply.forward and reply.forward.sender_id:
-                return reply.forward.sender_id
+        if reply is not None and getattr(reply, "id", None) != getattr(event, "id", None):
+            sender_id = getattr(reply, "sender_id", None)
+            if sender_id:
+                return int(sender_id)
 
-        args = event.raw_text.split()
+            # Algumas mensagens de mídia/serviço não expõem sender_id diretamente.
+            # Tenta a entidade real antes de considerar o alvo inválido.
+            try:
+                sender = await reply.get_sender()
+                entity_id = getattr(sender, "id", None)
+                if entity_id:
+                    return int(entity_id)
+            except Exception as sender_exc:
+                logger.debug("Não foi possível resolver o remetente da resposta: %s", sender_exc)
+
+            forward = getattr(reply, "forward", None)
+            forward_sender_id = getattr(forward, "sender_id", None)
+            if forward_sender_id:
+                return int(forward_sender_id)
+
+        args = (event.raw_text or "").split()
         if len(args) > 1:
             raw = args[1].strip()
             if raw.startswith("@"):
@@ -1349,14 +1369,36 @@ async def get_target_from_event(event):
                     user = await client.get_entity(raw)
                     if isinstance(user, User):
                         db.remember_user(user.id, user.username, user.first_name)
-                    return user.id
+                    return int(user.id)
                 except (ValueError, RPCError):
-                    return db.resolve_username(raw)
+                    resolved = db.resolve_username(raw)
+                    return int(resolved) if resolved else None
             if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
                 return int(raw)
-    except Exception as e:
-        logger.error(f"Erro ao extrair alvo: {e}")
+    except (TypeError, ValueError, RPCError) as exc:
+        logger.debug("Erro ao extrair alvo: %s", exc)
+    except Exception as exc:
+        logger.exception("Erro inesperado ao extrair alvo: %s", exc)
     return None
+
+
+async def reject_moderation_target(event, target_id):
+    """Informa claramente se o alvo não foi resolvido ou é realmente imune."""
+    if not target_id:
+        await reply_or_edit(
+            event,
+            "❌ Não encontrei o alvo. Responda à mensagem do usuário ou informe um ID/@username válido.",
+            delete_after=DEFAULT_DELETE_AFTER,
+        )
+        return True
+    if is_immune(target_id):
+        await reply_or_edit(
+            event,
+            "❌ Este usuário é protegido e não pode ser punido pelo Userbot.",
+            delete_after=DEFAULT_DELETE_AFTER,
+        )
+        return True
+    return False
 
 
 async def get_authorization_target_and_expiry(event):
@@ -2389,8 +2431,7 @@ async def cmd_del(event):
 async def cmd_warn(event):
     target_id = await get_target_from_event(event)
     _, _, reason = parse_moderation_options(event)
-    if not target_id or is_immune(target_id):
-        await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
+    if await reject_moderation_target(event, target_id):
         return
     settings = db.get_settings(event.chat_id)
     count = db.add_warning(event.chat_id, target_id)
@@ -2549,8 +2590,7 @@ async def cmd_antiblack(event):
 @client.on(events.NewMessage(pattern=r'^\.kick(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_kick(event):
     target_id = await get_target_from_event(event)
-    if not target_id or is_immune(target_id):
-        await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
+    if await reject_moderation_target(event, target_id):
         return
     try:
         await client.kick_participant(event.chat_id, target_id)
@@ -2568,8 +2608,7 @@ async def cmd_kick(event):
 async def cmd_ban(event):
     target_id = await get_target_from_event(event)
     duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
-    if not target_id or is_immune(target_id):
-        await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
+    if await reject_moderation_target(event, target_id):
         return
     # .ban é temporário por definição. O comando permanente é .banperm;
     # nunca permitir que a ausência de duração caia silenciosamente no ban eterno.
@@ -2658,8 +2697,7 @@ async def cmd_unban(event):
 async def cmd_mute(event):
     target_id = await get_target_from_event(event)
     duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
-    if not target_id or is_immune(target_id):
-        await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
+    if await reject_moderation_target(event, target_id):
         return
     if duration is not None and duration < MIN_TELEGRAM_TEMP_DURATION_SECONDS:
         await reply_or_edit(event, "❌ A duração mínima de um mute temporário é de 30 segundos.", delete_after=DEFAULT_DELETE_AFTER)
@@ -2715,8 +2753,7 @@ async def cmd_unmute(event):
 async def cmd_blacklist(event):
     target_id = await get_target_from_event(event)
     duration, _, reason = parse_moderation_options(event)
-    if not target_id or is_immune(target_id):
-        await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
+    if await reject_moderation_target(event, target_id):
         return
     expires_at = int(time.time()) + duration if duration is not None else None
     if not db.add_local_blacklist(event.chat_id, target_id, reason, expires_at=expires_at):
@@ -2743,8 +2780,7 @@ async def cmd_unblacklist(event):
 async def cmd_banperm(event):
     target_id = await get_target_from_event(event)
     duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
-    if not target_id or is_immune(target_id):
-        await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
+    if await reject_moderation_target(event, target_id):
         return
     if duration is not None and duration < MIN_TELEGRAM_TEMP_DURATION_SECONDS:
         await reply_or_edit(event, "❌ A duração mínima de um ban temporário é de 30 segundos.", delete_after=DEFAULT_DELETE_AFTER)
@@ -2822,8 +2858,7 @@ async def cmd_unbanperm(event):
 async def cmd_shadow(event):
     target_id = await get_target_from_event(event)
     duration, _, reason = parse_moderation_options(event)
-    if not target_id or is_immune(target_id):
-        await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
+    if await reject_moderation_target(event, target_id):
         return
     expires_at = int(time.time()) + duration if duration is not None else None
     if not db.add_shadow_ban(target_id, reason, expires_at=expires_at):
@@ -2850,8 +2885,7 @@ async def cmd_unshadow(event):
 async def cmd_allban(event):
     target_id = await get_target_from_event(event)
     duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
-    if not target_id or is_immune(target_id):
-        await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
+    if await reject_moderation_target(event, target_id):
         return
     if duration is not None and duration < MIN_TELEGRAM_TEMP_DURATION_SECONDS:
         await reply_or_edit(event, "❌ A duração mínima de um allban temporário é de 30 segundos.", delete_after=DEFAULT_DELETE_AFTER)
@@ -2917,8 +2951,7 @@ async def cmd_allban(event):
 async def cmd_allblack(event):
     target_id = await get_target_from_event(event)
     duration, _, reason = parse_moderation_options(event)
-    if not target_id or is_immune(target_id):
-        await reply_or_edit(event, "❌ Alvo inválido ou protegido.", delete_after=DEFAULT_DELETE_AFTER)
+    if await reject_moderation_target(event, target_id):
         return
     expires_at = int(time.time()) + duration if duration is not None else None
     if not db.add_global_blacklist(target_id, 'black', reason, expires_at=expires_at):
