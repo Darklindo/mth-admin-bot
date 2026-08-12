@@ -76,7 +76,7 @@ TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
 TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
 TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.28"
+VERSION = "V6.29"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -1787,7 +1787,56 @@ async def delete_security_message(event, chat_id, user_id, content_text, reason)
         asyncio.create_task(apply_security_restriction(chat_id, user_id))
 
 
+_response_cleanup_tasks = set()
+
+
+async def _cleanup_response_later(message, event, delay, label):
+    try:
+        await asyncio.sleep(max(0, float(delay)))
+        same_message = (
+            message is not None
+            and getattr(message, "id", None) == getattr(event, "id", None)
+        )
+        if message is not None and message is not event and not same_message:
+            await delete_message_safely(message, label)
+        await delete_command_safely(event)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.debug("Falha na limpeza assíncrona de resposta: %s", exc)
+
+
+def schedule_response_cleanup(message, event, delay, label="resposta automática"):
+    """Agenda a exclusão sem bloquear o handler por DEFAULT_DELETE_AFTER segundos."""
+    if not delay:
+        return
+    task = asyncio.create_task(_cleanup_response_later(message, event, delay, label))
+    _response_cleanup_tasks.add(task)
+    task.add_done_callback(_response_cleanup_tasks.discard)
+
+
+async def _edit_response_now(message, text):
+    if message is None:
+        return False
+    try:
+        await message.edit(text, parse_mode="html")
+        return True
+    except MessageNotModifiedError:
+        return True
+    except Exception as exc:
+        logger.warning("Resposta HTML falhou; tentando texto simples: %s", exc)
+        try:
+            await message.edit(text, parse_mode=None)
+            return True
+        except MessageNotModifiedError:
+            return True
+        except Exception as fallback_exc:
+            logger.error("Erro ao editar resposta: %s", fallback_exc)
+            return False
+
+
 async def reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER):
+    """Responde sem bloquear o handler durante o período de autoexclusão."""
     msg = None
     try:
         if event.out:
@@ -1810,13 +1859,45 @@ async def reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER):
         except Exception as fallback_exc:
             logger.error(f"Erro ao enviar/editar resposta: {fallback_exc}")
 
-    if delete_after:
-        await asyncio.sleep(delete_after)
-        # Quando a conta envia o comando, a edição e a confirmação têm o
-        # mesmo ID; quando outro usuário autorizado envia, são mensagens distintas.
-        if msg is not None and msg is not event and getattr(msg, "id", None) != getattr(event, "id", None):
-            await delete_message_safely(msg, "resposta automática")
-        await delete_command_safely(event)
+    if msg is not None:
+        schedule_response_cleanup(msg, event, delete_after)
+    elif delete_after:
+        schedule_response_cleanup(None, event, delete_after)
+    return msg
+
+
+async def begin_fast_response(event, text, label="status de moderação"):
+    """Mostra o processamento imediatamente, editando o comando quando possível."""
+    try:
+        if event.out:
+            return await event.edit(text, parse_mode="html")
+        return await event.respond(text, parse_mode="html")
+    except MessageNotModifiedError:
+        return event
+    except Exception as exc:
+        logger.warning("Falha ao mostrar %s: %s", label, exc)
+        try:
+            if event.out:
+                return await event.edit(text, parse_mode=None)
+            return await event.respond(text, parse_mode=None)
+        except Exception as fallback_exc:
+            logger.error("Falha no fallback de %s: %s", label, fallback_exc)
+            return None
+
+
+async def finish_fast_response(event, status_message, text, delete_after=DEFAULT_DELETE_AFTER, label="resposta de moderação"):
+    """Edita a confirmação e agenda sua exclusão sem segurar o loop assíncrono."""
+    if status_message is None:
+        return await reply_or_edit(event, text, delete_after=delete_after)
+    edited = await _edit_response_now(status_message, text)
+    if not edited:
+        # Evita deixar o usuário sem resultado quando a edição da mensagem de
+        # status falhar; a resposta alternativa também será autoexcluída.
+        await reply_or_edit(event, text, delete_after=delete_after)
+        schedule_response_cleanup(status_message, event, delete_after, label)
+        return None
+    schedule_response_cleanup(status_message, event, delete_after, label)
+    return status_message
 
 
 async def send_status_safely(event, text, label="mensagem de status"):
@@ -2606,27 +2687,73 @@ async def cmd_kick(event):
 
 @client.on(events.NewMessage(pattern=r'^\.ban(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_ban(event):
-    target_id = await get_target_from_event(event)
-    duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
-    if await reject_moderation_target(event, target_id):
+    # O status é mostrado antes da resolução de reply/username, que também pode
+    # exigir um RPC. Assim o usuário recebe retorno visual imediatamente.
+    status_message = await begin_fast_response(
+        event,
+        "⏳ Localizando o alvo e preparando o ban temporário...",
+        label="status do ban",
+    )
+    try:
+        target_id = await get_target_from_event(event)
+        duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
+    except Exception as exc:
+        logger.exception("Erro ao interpretar o comando .ban")
+        await finish_fast_response(
+            event,
+            status_message,
+            f"❌ Não foi possível interpretar o comando: {exc}",
+            label="erro ao interpretar o ban",
+        )
+        return
+    if not target_id:
+        await finish_fast_response(
+            event,
+            status_message,
+            "❌ Não encontrei o alvo. Responda à mensagem do usuário ou informe um ID/@username válido.",
+            label="resultado do ban",
+        )
+        return
+    if is_immune(target_id):
+        await finish_fast_response(
+            event,
+            status_message,
+            "❌ Este usuário é protegido e não pode ser punido pelo Userbot.",
+            label="resultado do ban",
+        )
         return
     # .ban é temporário por definição. O comando permanente é .banperm;
     # nunca permitir que a ausência de duração caia silenciosamente no ban eterno.
     if duration is None:
-        await reply_or_edit(
+        await finish_fast_response(
             event,
+            status_message,
             "❌ O <code>.ban</code> exige uma duração, por exemplo <code>.ban 30m</code>. Para banir permanentemente, use <code>.banperm</code>.",
-            delete_after=DEFAULT_DELETE_AFTER,
+            label="resultado do ban",
         )
         return
     if duration < MIN_TELEGRAM_TEMP_DURATION_SECONDS:
-        await reply_or_edit(event, "❌ A duração mínima de um ban temporário é de 30 segundos. Durações menores podem ser tratadas pelo Telegram como permanentes.", delete_after=DEFAULT_DELETE_AFTER)
+        await finish_fast_response(
+            event,
+            status_message,
+            "❌ A duração mínima de um ban temporário é de 30 segundos. Durações menores podem ser tratadas pelo Telegram como permanentes.",
+            label="resultado do ban",
+        )
         return
+
+    # A captura do snapshot e o EditBanned RPC podem levar alguns segundos;
+    # o status acima já foi mostrado antes dessas operações.
+    await _edit_response_now(status_message, "⏳ Aplicando ban temporário e salvando o estado anterior...")
     expires_at = int(time.time()) + duration
     try:
         snapshot = await capture_permission_snapshot(event.chat_id, target_id)
         if snapshot is None:
-            await reply_or_edit(event, "❌ Não foi possível capturar as permissões anteriores; o ban não foi aplicado.", delete_after=DEFAULT_DELETE_AFTER)
+            await finish_fast_response(
+                event,
+                status_message,
+                "❌ Não foi possível capturar as permissões anteriores; o ban não foi aplicado.",
+                label="resultado do ban",
+            )
             return
         await client.edit_permissions(
             event.chat_id,
@@ -2641,17 +2768,28 @@ async def cmd_ban(event):
                 await restore_permission_snapshot(event.chat_id, target_id, snapshot, "ban")
             except Exception as restore_exc:
                 logger.error("Falha ao desfazer ban temporário não persistido em %s/%s: %s", event.chat_id, target_id, restore_exc)
-            await reply_or_edit(event, "❌ O banimento foi aplicado no Telegram, mas o prazo não pôde ser registrado; a ação foi revertida quando possível.", delete_after=DEFAULT_DELETE_AFTER)
+            await finish_fast_response(
+                event,
+                status_message,
+                "❌ O banimento foi aplicado no Telegram, mas o prazo não pôde ser registrado; a ação foi revertida quando possível.",
+                label="resultado de erro do ban",
+            )
             return
         user_info = db.get_user_info(target_id)
         queue_audit_log(event.chat_id, target_id, "Ação: Ban", "Moderação", admin_id=event.sender_id)
-        await reply_or_edit(event, f"🔨 {user_info} (<code>{target_id}</code>) banido do grupo por <b>{duration_label(duration)}</b>.", delete_after=DEFAULT_DELETE_AFTER)
+        await finish_fast_response(
+            event,
+            status_message,
+            f"🔨 {user_info} (<code>{target_id}</code>) banido do grupo por <b>{duration_label(duration)}</b>.",
+            label="resultado do ban",
+        )
     except ChatAdminRequiredError:
-        await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
+        await finish_fast_response(event, status_message, "❌ Erro: Não tenho permissão de administrador.", label="erro do ban")
     except UserAdminInvalidError:
-        await reply_or_edit(event, "❌ Erro: Não é possível banir outro administrador (hierarquia).", delete_after=DEFAULT_DELETE_AFTER)
+        await finish_fast_response(event, status_message, "❌ Erro: Não é possível banir outro administrador (hierarquia).", label="erro do ban")
     except Exception as e:
-        await reply_or_edit(event, f"❌ Erro ao banir: {e}", delete_after=DEFAULT_DELETE_AFTER)
+        logger.exception("Erro ao aplicar .ban")
+        await finish_fast_response(event, status_message, f"❌ Erro ao banir: {e}", label="erro do ban")
 
 @client.on(events.NewMessage(pattern=r'^\.unban(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unban(event):
