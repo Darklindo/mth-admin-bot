@@ -73,7 +73,7 @@ TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
 TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
 TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.24"
+VERSION = "V6.25"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -2906,7 +2906,9 @@ async def cmd_help(event):
         "• <code>.chats</code> (Lista de Chats)\n"
         "• <code>.listdn</code> (Punições Globais)\n"
         "• <code>.logs</code> (Auditoria de Deleções)\n"
-        "• <code>.id</code> | <code>.help</code>"
+        "• <code>.id</code> (Mostra o ID do usuário)\n"
+        "• <code>.infojt</code> (Informações detalhadas por reply, ID ou username)\n"
+        "• <code>.help</code>"
     )
     await reply_or_edit(event, text, delete_after=15)
 
@@ -3145,6 +3147,138 @@ async def cmd_purgeme(event):
 async def cmd_id(event):
     target_id = await get_target_from_event(event) or event.sender_id
     await reply_or_edit(event, f"🆔 ID: <code>{target_id}</code>", delete_after=DEFAULT_DELETE_AFTER)
+
+@client.on(events.NewMessage(pattern=r'^\.infojt(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_infojt(event):
+    """Exibe informações detalhadas de um usuário por reply, ID ou username."""
+    target_id = await get_target_from_event(event)
+    if not target_id:
+        await reply_or_edit(
+            event,
+            "❌ Informe o usuário respondendo à mensagem ou usando um ID/@username.",
+            delete_after=DEFAULT_DELETE_AFTER,
+        )
+        return
+
+    target_id = int(target_id)
+    display_name = "—"
+    display_name_is_html = False
+    username = None
+    bot_label = "—"
+    deleted = False
+
+    try:
+        entity = await client.get_entity(target_id)
+        if isinstance(entity, User):
+            db.remember_user(entity.id, entity.username, entity.first_name)
+            first_name = entity.first_name or ""
+            last_name = entity.last_name or ""
+            display_name = (f"{first_name} {last_name}").strip() or "—"
+            username = entity.username
+            bot_label = "Sim" if bool(getattr(entity, "bot", False)) else "Não"
+            deleted = bool(getattr(entity, "deleted", False))
+        else:
+            display_name = getattr(entity, "title", None) or getattr(entity, "first_name", None) or str(target_id)
+            username = getattr(entity, "username", None)
+    except Exception as exc:
+        logger.debug("Não foi possível resolver a entidade do .infojt para %s: %s", target_id, exc)
+        display_name = db.get_user_info(target_id) or str(target_id)
+        display_name_is_html = True
+
+    name_html = display_name if display_name_is_html else escape(str(display_name))
+    username_html = escape(f"@{username}" if username else "—")
+    deleted_suffix = " <i>(conta excluída)</i>" if deleted else ""
+
+    lines = [
+        "👤 <b>Informações do Usuário</b>",
+        "",
+        f"🆔 <b>ID:</b> <code>{target_id}</code>",
+        f"📛 <b>Nome:</b> {name_html}{deleted_suffix}",
+        f"🌐 <b>Username:</b> {username_html}",
+        f"🤖 <b>Bot:</b> {bot_label}",
+    ]
+
+    is_chat = bool(event.is_group or event.is_channel)
+    if is_chat:
+        chat_status = "Indisponível"
+        join_label = "Indisponível"
+        try:
+            permissions = await client.get_permissions(event.chat_id, target_id)
+            participant = getattr(permissions, "participant", None)
+            participant_type = type(participant).__name__
+            if bool(getattr(permissions, "is_creator", False)) or participant_type == "ChannelParticipantCreator":
+                chat_status = "Criador"
+            elif bool(getattr(permissions, "is_admin", False)) or participant_type == "ChannelParticipantAdmin":
+                chat_status = "Administrador"
+            elif bool(getattr(permissions, "is_banned", False)) or participant_type in {
+                "ChannelParticipantBanned",
+                "ChannelParticipantLeft",
+            }:
+                chat_status = "Banido"
+            elif getattr(permissions, "send_messages", True) is False:
+                chat_status = "Silenciado"
+            else:
+                chat_status = "Membro"
+
+            joined_at = getattr(participant, "date", None)
+            if isinstance(joined_at, datetime):
+                join_label = joined_at.strftime("%d/%m/%Y %H:%M")
+            elif joined_at:
+                join_label = format_timestamp(joined_at)
+        except Exception as exc:
+            logger.debug("Não foi possível consultar permissões do .infojt para %s/%s: %s", event.chat_id, target_id, exc)
+
+        warning_data = db.get_warning(event.chat_id, target_id)
+        settings = db.get_settings(event.chat_id) or {}
+        try:
+            threshold = max(1, min(int(settings.get("warn_threshold", 3)), 20))
+        except (TypeError, ValueError):
+            threshold = 3
+        if warning_data is None:
+            warning_label = "Erro ao consultar"
+        else:
+            try:
+                warning_count = max(0, int(warning_data.get("count", 0)))
+            except (TypeError, ValueError):
+                warning_count = 0
+            warning_label = f"{warning_count}/{threshold}"
+
+        chat_id = event.chat_id
+        local_blacklisted = target_id in cache.local_blacklist.get(chat_id, ())
+        local_banperm = target_id in cache.local_banperm.get(chat_id, ())
+        global_type = cache.global_blacklist_types.get(target_id) if target_id in cache.global_blacklist else None
+        shadow_banned = target_id in cache.shadow_ban
+
+        lines.extend([
+            "",
+            "📊 <b>Status no Chat:</b>",
+            f"• Situação: {chat_status}",
+            f"• Advertências: {warning_label}",
+            f"• Entrada: {join_label}",
+            "",
+            "🛡️ <b>Punições Ativas:</b>",
+            f"• Blacklist Local: {'✅ Sim' if local_blacklisted else '❌ Não'}",
+            f"• Ban Permanente Local: {'✅ Sim' if local_banperm else '❌ Não'}",
+            f"• Blacklist Global: {'✅ Sim (' + escape(str(global_type).lower()) + ')' if global_type else '❌ Não'}",
+            f"• Shadow Ban: {'✅ Sim' if shadow_banned else '❌ Não'}",
+        ])
+
+    if is_owner(target_id):
+        authorization_label = "Proprietário (imune)"
+    elif target_id in cache.authorized_users:
+        expires_at = cache.authorized_expirations.get(target_id)
+        if expires_at is None:
+            authorization_label = "Sim (permanente)"
+        elif int(expires_at) > int(time.time()):
+            authorization_label = f"Sim (expira em {format_timestamp(expires_at)})"
+        else:
+            authorization_label = "Expirada"
+    else:
+        authorization_label = "Não"
+
+    lines.extend(["", f"🔑 <b>Autorização:</b> {authorization_label}"])
+    await reply_or_edit(event, "\n".join(lines), delete_after=15)
+
 
 @client.on(events.NewMessage(pattern=r'^\.msg(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_msg(event):
