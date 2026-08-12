@@ -73,7 +73,7 @@ TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
 TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
 TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.25"
+VERSION = "V6.26"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -96,6 +96,7 @@ class Cache:
         self.authorized_users = set()
         self.authorized_expirations = {}
         self.antiblack_chats = set()
+        self.locked_chats = set()
         self.settings = {}
 
     def load_all(self, db_conn):
@@ -110,6 +111,7 @@ class Cache:
             self.authorized_users.clear()
             self.authorized_expirations.clear()
             self.antiblack_chats.clear()
+            self.locked_chats.clear()
             self.settings.clear()
 
             now = int(time.time())
@@ -170,6 +172,13 @@ class Cache:
                 for row in cursor.fetchall():
                     self.antiblack_chats.add(row[0])
             except sqlite3.OperationalError:
+                pass
+
+            try:
+                cursor = db_conn.execute("SELECT chat_id FROM settings WHERE locked=1")
+                self.locked_chats = {int(row[0]) for row in cursor.fetchall()}
+            except sqlite3.OperationalError:
+                # Compatibilidade defensiva com banco anterior à migração V6.26.
                 pass
 
             logger.info("Cache carregado com sucesso (%s - filtros de baixa latência).", VERSION)
@@ -471,6 +480,38 @@ class Database:
         result = dict(row) if row else {}
         cache.settings[int(chat_id)] = result
         return result
+
+    def get_chat_lock(self, chat_id):
+        row = self.fetchone("SELECT locked, lock_snapshot FROM settings WHERE chat_id=?", (int(chat_id),))
+        if row is None:
+            self.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (int(chat_id),), commit=True)
+            row = self.fetchone("SELECT locked, lock_snapshot FROM settings WHERE chat_id=?", (int(chat_id),))
+        return dict(row) if row is not None else None
+
+    def set_chat_lock(self, chat_id, snapshot):
+        cursor = self.execute(
+            "INSERT INTO settings(chat_id, locked, lock_snapshot) VALUES(?,?,?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET locked=excluded.locked, lock_snapshot=excluded.lock_snapshot",
+            (int(chat_id), 1, snapshot),
+            commit=True,
+        )
+        if cursor is not None:
+            cache.locked_chats.add(int(chat_id))
+            cache.settings.setdefault(int(chat_id), {}).update({"locked": 1, "lock_snapshot": snapshot})
+            return True
+        return False
+
+    def clear_chat_lock(self, chat_id):
+        cursor = self.execute(
+            "UPDATE settings SET locked=0, lock_snapshot=NULL WHERE chat_id=?",
+            (int(chat_id),),
+            commit=True,
+        )
+        if cursor is not None:
+            cache.locked_chats.discard(int(chat_id))
+            cache.settings.setdefault(int(chat_id), {}).update({"locked": 0, "lock_snapshot": None})
+            return True
+        return False
 
     def add_warning(self, chat_id, user_id, now=None):
         now = int(now or time.time())
@@ -1035,6 +1076,102 @@ async def can_manage_chat(event):
     return await is_chat_admin(event.chat_id, event.sender_id)
 
 
+async def require_chat_admin(event, action):
+    if not (event.is_group or event.is_channel):
+        await reply_or_edit(event, f"❌ O comando para {action} só pode ser usado em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
+        return False
+    if not await can_manage_chat(event):
+        await reply_or_edit(event, f"❌ Somente administradores deste grupo podem {action}.", delete_after=DEFAULT_DELETE_AFTER)
+        return False
+    return True
+
+
+_CHAT_RIGHT_FIELDS = (
+    "view_messages", "send_messages", "send_media", "send_stickers", "send_gifs",
+    "send_games", "send_inline", "embed_links", "send_polls", "change_info",
+    "invite_users", "pin_messages", "manage_topics", "send_photos", "send_videos",
+    "send_roundvideos", "send_audios", "send_voices", "send_docs", "send_plain",
+    "edit_rank", "send_reactions",
+)
+
+
+def serialize_chat_default_rights(rights):
+    """Converte ChatBannedRights em JSON sem depender de objetos TL serializáveis."""
+    if rights is None:
+        return json.dumps({"rights": None}, separators=(",", ":"))
+    payload = {}
+    for field in _CHAT_RIGHT_FIELDS:
+        value = getattr(rights, field, None)
+        payload[field] = bool(value) if value is not None else None
+    until_date = getattr(rights, "until_date", None)
+    payload["until_date"] = int(until_date.timestamp()) if isinstance(until_date, datetime) else None
+    return json.dumps({"rights": payload}, separators=(",", ":"), sort_keys=True)
+
+
+def deserialize_chat_default_rights(snapshot):
+    """Reconstrói permissões padrão; snapshots inválidos interrompem o rollback."""
+    if not snapshot:
+        raise ValueError("snapshot de permissões ausente")
+    payload = json.loads(snapshot)
+    values = payload.get("rights")
+    if values is None:
+        return types.ChatBannedRights(until_date=None)
+    if not isinstance(values, dict):
+        raise ValueError("snapshot de permissões inválido")
+    until_date = values.get("until_date")
+    if until_date is not None:
+        until_date = datetime.fromtimestamp(int(until_date))
+    kwargs = {
+        field: values[field]
+        for field in _CHAT_RIGHT_FIELDS
+        if field in values and values[field] is not None
+    }
+    return types.ChatBannedRights(until_date=until_date, **kwargs)
+
+
+async def capture_chat_default_rights(chat_id):
+    """Obtém as permissões padrão atuais do grupo/canal para permitir unlock sem perda de configuração."""
+    entity = await client.get_entity(chat_id)
+    if isinstance(entity, types.Channel):
+        result = await client(functions.channels.GetFullChannelRequest(channel=entity))
+    elif isinstance(entity, types.Chat):
+        result = await client(functions.messages.GetFullChatRequest(chat_id=entity))
+    else:
+        raise ValueError("o destino não é um grupo ou canal compatível")
+    full_chat = getattr(result, "full_chat", None)
+    return serialize_chat_default_rights(getattr(full_chat, "default_banned_rights", None))
+
+
+async def apply_chat_default_rights(chat_id, rights):
+    await client(functions.messages.EditChatDefaultBannedRightsRequest(
+        peer=chat_id,
+        banned_rights=rights,
+    ))
+
+
+def locked_chat_rights():
+    """Bloqueia texto, mídia, links, stickers, GIFs, arquivos e reações de membros."""
+    return types.ChatBannedRights(
+        until_date=None,
+        send_messages=True,
+        send_media=True,
+        send_stickers=True,
+        send_gifs=True,
+        send_games=True,
+        send_inline=True,
+        embed_links=True,
+        send_polls=True,
+        send_photos=True,
+        send_videos=True,
+        send_roundvideos=True,
+        send_audios=True,
+        send_voices=True,
+        send_docs=True,
+        send_plain=True,
+        send_reactions=True,
+    )
+
+
 async def restore_global_ban(user_id):
     """Restaura somente os chats atingidos; usa fallback para registros antigos."""
     snapshots = db.get_global_ban_snapshots(user_id)
@@ -1278,6 +1415,7 @@ def get_cache_counts():
         "shadow": len(cache.shadow_ban),
         "authorized": len(cache.authorized_users),
         "antiblack_chats": len(cache.antiblack_chats),
+        "locked_chats": len(cache.locked_chats),
     }
 
 
@@ -1760,6 +1898,29 @@ async def global_security_filter(event):
         raise events.StopPropagation
 
 @client.on(events.NewMessage(incoming=True))
+async def chat_lock_filter(event):
+    """Camada redundante: o Telegram bloqueia no servidor; este filtro cobre eventos residuais."""
+    if not event.chat_id or not (event.is_group or event.is_channel):
+        return
+    if int(event.chat_id) not in cache.locked_chats:
+        return
+    user_id = event.sender_id
+    if not user_id or is_immune(user_id):
+        return
+    if await is_chat_admin(event.chat_id, user_id):
+        return
+    try:
+        await delete_security_message(
+            event, event.chat_id, user_id,
+            event.text or "[mensagem bloqueada durante o lock]",
+            "Chat Lock",
+        )
+    except Exception as exc:
+        logger.debug("Falha no filtro redundante de lock: %s", exc)
+    raise events.StopPropagation
+
+
+@client.on(events.NewMessage(incoming=True))
 async def antilink_filter(event):
     """Remove links de não administradores sem consultar permissões repetidamente."""
     if not event.chat_id or not (event.is_group or event.is_channel):
@@ -1966,8 +2127,86 @@ async def cmd_maintenance(event):
     await reply_or_edit(event, f"🛠️ Modo manutenção <b>{'ATIVADO' if enabled else 'DESATIVADO'}</b>.", delete_after=DEFAULT_DELETE_AFTER)
 
 
+@client.on(events.NewMessage(pattern=r'^\.lock(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_lock(event):
+    if not (event.is_group or event.is_channel):
+        await reply_or_edit(event, "❌ O lock só pode ser usado em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if not await can_manage_chat(event):
+        await reply_or_edit(event, "❌ Somente administradores deste grupo podem usar o lock.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    state = db.get_chat_lock(event.chat_id)
+    if state is None:
+        await reply_or_edit(event, "❌ Não foi possível consultar o estado do lock no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if int(state.get("locked", 0)):
+        await reply_or_edit(event, "ℹ️ Este grupo já está bloqueado. Apenas administradores podem enviar mensagens.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    try:
+        snapshot = await capture_chat_default_rights(event.chat_id)
+        await apply_chat_default_rights(event.chat_id, locked_chat_rights())
+        if not db.set_chat_lock(event.chat_id, snapshot):
+            try:
+                await apply_chat_default_rights(event.chat_id, deserialize_chat_default_rights(snapshot))
+            except Exception as rollback_exc:
+                logger.error("Falha ao desfazer lock não persistido em %s: %s", event.chat_id, rollback_exc)
+            await reply_or_edit(event, "❌ O grupo foi bloqueado no Telegram, mas o estado não pôde ser salvo; a ação foi revertida quando possível.", delete_after=DEFAULT_DELETE_AFTER)
+            return
+        queue_audit_log(event.chat_id, event.sender_id, "Ação: Lock", "Mensagens restritas para membros", admin_id=event.sender_id)
+        await reply_or_edit(event, "🔒 <b>Grupo bloqueado.</b> Somente administradores poderão enviar mensagens.", delete_after=DEFAULT_DELETE_AFTER)
+    except ChatAdminRequiredError:
+        await reply_or_edit(event, "❌ Não tenho permissão de administrador para alterar as permissões padrão deste grupo.", delete_after=DEFAULT_DELETE_AFTER)
+    except RPCError as exc:
+        logger.warning("Falha RPC ao bloquear o chat %s: %s", event.chat_id, exc)
+        await reply_or_edit(event, "❌ O Telegram recusou o lock. Confirme que sou administrador com permissão para restringir membros.", delete_after=DEFAULT_DELETE_AFTER)
+    except Exception as exc:
+        logger.error("Erro inesperado no .lock para %s: %s", event.chat_id, exc)
+        await reply_or_edit(event, "❌ Não foi possível bloquear o grupo com segurança.", delete_after=DEFAULT_DELETE_AFTER)
+
+
+@client.on(events.NewMessage(pattern=r'^\.unlock(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_unlock(event):
+    if not (event.is_group or event.is_channel):
+        await reply_or_edit(event, "❌ O unlock só pode ser usado em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if not await can_manage_chat(event):
+        await reply_or_edit(event, "❌ Somente administradores deste grupo podem usar o unlock.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    state = db.get_chat_lock(event.chat_id)
+    if state is None:
+        await reply_or_edit(event, "❌ Não foi possível consultar o estado do lock no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if not int(state.get("locked", 0)):
+        await reply_or_edit(event, "ℹ️ Este grupo já está desbloqueado.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    try:
+        previous_rights = deserialize_chat_default_rights(state.get("lock_snapshot"))
+        await apply_chat_default_rights(event.chat_id, previous_rights)
+        if not db.clear_chat_lock(event.chat_id):
+            try:
+                await apply_chat_default_rights(event.chat_id, locked_chat_rights())
+            except Exception as rollback_exc:
+                logger.critical("Falha ao restaurar lock após erro de banco em %s: %s", event.chat_id, rollback_exc)
+            await reply_or_edit(event, "⚠️ As permissões foram restauradas, mas o estado não pôde ser limpo; o lock foi mantido quando possível.", delete_after=DEFAULT_DELETE_AFTER)
+            return
+        queue_audit_log(event.chat_id, event.sender_id, "Ação: Unlock", "Permissões padrão restauradas", admin_id=event.sender_id)
+        await reply_or_edit(event, "🔓 <b>Grupo desbloqueado.</b> As permissões anteriores foram restauradas.", delete_after=DEFAULT_DELETE_AFTER)
+    except ValueError:
+        await reply_or_edit(event, "❌ O snapshot anterior do lock está inválido. O unlock foi interrompido para não remover restrições existentes.", delete_after=DEFAULT_DELETE_AFTER)
+    except ChatAdminRequiredError:
+        await reply_or_edit(event, "❌ Não tenho permissão de administrador para restaurar as permissões padrão deste grupo.", delete_after=DEFAULT_DELETE_AFTER)
+    except RPCError as exc:
+        logger.warning("Falha RPC ao desbloquear o chat %s: %s", event.chat_id, exc)
+        await reply_or_edit(event, "❌ O Telegram recusou o unlock. Confirme minhas permissões de administrador.", delete_after=DEFAULT_DELETE_AFTER)
+    except Exception as exc:
+        logger.error("Erro inesperado no .unlock para %s: %s", event.chat_id, exc)
+        await reply_or_edit(event, "❌ Não foi possível desbloquear o grupo com segurança.", delete_after=DEFAULT_DELETE_AFTER)
+
+
 @client.on(events.NewMessage(pattern=r'^\.quarantine(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_quarantine(event):
+    if not await require_chat_admin(event, "alterar a quarentena"):
+        return
     args = (event.raw_text or "").split()
     if len(args) < 2 or args[1].lower() not in {"on", "off", "1", "0"}:
         status = bool(db.get_settings(event.chat_id).get("quarantine_enabled", 0))
@@ -1982,6 +2221,8 @@ async def cmd_quarantine(event):
 
 @client.on(events.NewMessage(pattern=r'^\.antispam(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_antispam_new(event):
+    if not await require_chat_admin(event, "alterar o antispam"):
+        return
     args = (event.raw_text or "").split()
     if len(args) < 2 or args[1].lower() not in {"on", "off", "1", "0"}:
         status = bool(db.get_settings(event.chat_id).get("antispam", 1))
@@ -1996,6 +2237,8 @@ async def cmd_antispam_new(event):
 
 @client.on(events.NewMessage(pattern=r'^\.pinned(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_pinned(event):
+    if not await require_chat_admin(event, "alterar a proteção de mensagens fixadas"):
+        return
     args = (event.raw_text or "").split()
     if len(args) < 2 or args[1].lower() not in {"on", "off", "1", "0"}:
         status = bool(db.get_settings(event.chat_id).get("protect_pinned", 1))
@@ -2254,6 +2497,8 @@ async def cmd_start(event):
 
 @client.on(events.NewMessage(pattern=r'^\.antiblack(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_antiblack(event):
+    if not await require_chat_admin(event, "alterar o Modo Fênix"):
+        return
     args = event.raw_text.split()
     if len(args) < 2:
         status = "ATIVADO 🛡️" if event.chat_id in cache.antiblack_chats else "DESATIVADO ❌"
@@ -2769,6 +3014,7 @@ async def cmd_status(event):
         f"• Conta: <code>{identity}</code>\n"
         f"• Uptime: <code>{format_duration(time.time() - STARTED_AT)}</code>\n"
         f"• Chats registrados: <code>{len(chats)}</code> | Ativos: <code>{active_chats}</code>\n"
+        f"• Chats bloqueados: <code>{counts['locked_chats']}</code>\n"
         f"• Autorizados: <code>{counts['authorized']}</code>\n"
         f"• Blacklists: local <code>{counts['local_blacklist']}</code> | global <code>{counts['global_blacklist']}</code>\n"
         f"• Banimentos locais: <code>{counts['local_banperm']}</code> | Shadow: <code>{counts['shadow']}</code>\n"
@@ -2876,6 +3122,7 @@ async def cmd_help(event):
         f"📖 <b>GUIA DE COMANDOS — Jtzin Userbot {VERSION}</b>\n\n"
         "🛡️ <b>MODERAÇÃO LOCAL & REVERSÃO:</b>\n"
         "• <code>.del</code> (apaga a mensagem respondida)\n"
+        "• <code>.lock</code> | <code>.unlock</code> (somente administradores; restaura permissões anteriores)\n"
         "• <code>.kick</code> | <code>.ban [duração] [--purge N]</code> | <code>.unban</code>\n"
         "• <code>.mute [duração] [--purge N]</code> | <code>.unmute</code>\n"
         "• <code>.purge [5-100]</code> | <code>.purgeme [5-100]</code> | <code>.purgeall [1-1000]</code>\n"

@@ -14,7 +14,7 @@ def ensure_column(conn, table, column, definition):
 
 
 def migrate():
-    print("Iniciando Migração V6.25 (autorização temporária e antilink inteligente)...")
+    print("Iniciando Migração V6.26 (lock de grupos e reforço de confiabilidade)...")
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
@@ -24,7 +24,7 @@ def migrate():
             """
             CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY, title TEXT NOT NULL DEFAULT '', chat_type TEXT NOT NULL DEFAULT 'unknown', active INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT);
-            CREATE TABLE IF NOT EXISTS settings (chat_id INTEGER PRIMARY KEY, antispam INTEGER NOT NULL DEFAULT 1, antilink INTEGER NOT NULL DEFAULT 0, captcha_enabled INTEGER NOT NULL DEFAULT 0, protect_porn INTEGER NOT NULL DEFAULT 0, antiblack INTEGER NOT NULL DEFAULT 0, quarantine_enabled INTEGER NOT NULL DEFAULT 0, protect_pinned INTEGER NOT NULL DEFAULT 1, warn_threshold INTEGER NOT NULL DEFAULT 3, warn_action TEXT NOT NULL DEFAULT 'mute', warn_duration INTEGER NOT NULL DEFAULT 600, spam_window INTEGER NOT NULL DEFAULT 10, spam_limit INTEGER NOT NULL DEFAULT 6, duplicate_limit INTEGER NOT NULL DEFAULT 3, link_limit INTEGER NOT NULL DEFAULT 3, media_limit INTEGER NOT NULL DEFAULT 5, quarantine_duration INTEGER NOT NULL DEFAULT 600, spam_score_threshold INTEGER NOT NULL DEFAULT 4, quarantine_score_threshold INTEGER NOT NULL DEFAULT 6);
+            CREATE TABLE IF NOT EXISTS settings (chat_id INTEGER PRIMARY KEY, antispam INTEGER NOT NULL DEFAULT 1, antilink INTEGER NOT NULL DEFAULT 0, captcha_enabled INTEGER NOT NULL DEFAULT 0, protect_porn INTEGER NOT NULL DEFAULT 0, antiblack INTEGER NOT NULL DEFAULT 0, quarantine_enabled INTEGER NOT NULL DEFAULT 0, protect_pinned INTEGER NOT NULL DEFAULT 1, locked INTEGER NOT NULL DEFAULT 0, lock_snapshot TEXT, warn_threshold INTEGER NOT NULL DEFAULT 3, warn_action TEXT NOT NULL DEFAULT 'mute', warn_duration INTEGER NOT NULL DEFAULT 600, spam_window INTEGER NOT NULL DEFAULT 10, spam_limit INTEGER NOT NULL DEFAULT 6, duplicate_limit INTEGER NOT NULL DEFAULT 3, link_limit INTEGER NOT NULL DEFAULT 3, media_limit INTEGER NOT NULL DEFAULT 5, quarantine_duration INTEGER NOT NULL DEFAULT 600, spam_score_threshold INTEGER NOT NULL DEFAULT 4, quarantine_score_threshold INTEGER NOT NULL DEFAULT 6);
             CREATE TABLE IF NOT EXISTS local_banperm (chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, reason TEXT, created_at INTEGER NOT NULL DEFAULT 0, expires_at INTEGER, previous_permissions TEXT, PRIMARY KEY (chat_id, user_id));
             CREATE TABLE IF NOT EXISTS local_blacklist (chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, reason TEXT, created_at INTEGER NOT NULL DEFAULT 0, expires_at INTEGER, PRIMARY KEY (chat_id, user_id));
             CREATE TABLE IF NOT EXISTS global_blacklist (user_id INTEGER PRIMARY KEY, type TEXT NOT NULL DEFAULT 'black', reason TEXT, created_at INTEGER NOT NULL DEFAULT 0, expires_at INTEGER);
@@ -53,6 +53,8 @@ def migrate():
             ("settings", "antiblack", "INTEGER NOT NULL DEFAULT 0"),
             ("settings", "quarantine_enabled", "INTEGER NOT NULL DEFAULT 0"),
             ("settings", "protect_pinned", "INTEGER NOT NULL DEFAULT 1"),
+            ("settings", "locked", "INTEGER NOT NULL DEFAULT 0"),
+            ("settings", "lock_snapshot", "TEXT"),
             ("settings", "warn_threshold", "INTEGER NOT NULL DEFAULT 3"),
             ("settings", "warn_action", "TEXT NOT NULL DEFAULT 'mute'"),
             ("settings", "warn_duration", "INTEGER NOT NULL DEFAULT 600"),
@@ -122,7 +124,7 @@ def migrate():
                 """
             )
         conn.commit()
-        print("Migração V6.25 concluída com sucesso!")
+        print("Migração V6.26 concluída com sucesso.")
     finally:
         conn.close()
 
