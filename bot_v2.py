@@ -56,6 +56,7 @@ MAX_DURATION_SECONDS = 365 * 24 * 60 * 60
 MIN_DURATION_SECONDS = 10
 EXPIRATION_CHECK_INTERVAL = _env_int("EXPIRATION_CHECK_INTERVAL", 30, 10, 300)
 SPAM_STATE_MAX_USERS = _env_int("SPAM_STATE_MAX_USERS", 10000, 100, 100000)
+SPAM_ACTION_COOLDOWN = _env_int("SPAM_ACTION_COOLDOWN", 30, 5, 300)
 PURGEALL_MIN_LIMIT = 1
 PURGEALL_MAX_LIMIT = 1000
 PURGEALL_MAX_SCAN = 1200
@@ -71,7 +72,7 @@ TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
 TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
 TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.20"
+VERSION = "V6.21"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -239,11 +240,36 @@ class Database:
         if cursor is not None:
             cache.shadow_ban.discard(int(user_id))
 
+    def add_link_authorized(self, chat_id, user_id):
+        chat_id, user_id = int(chat_id), int(user_id)
+        cursor = self.execute(
+            "INSERT OR IGNORE INTO link_whitelist(chat_id, user_id) VALUES(?, ?)",
+            (chat_id, user_id), commit=True,
+        )
+        if cursor is not None:
+            cache.link_whitelist[chat_id].add(user_id)
+            return True
+        return False
+
+    def remove_link_authorized(self, chat_id, user_id):
+        chat_id, user_id = int(chat_id), int(user_id)
+        cursor = self.execute(
+            "DELETE FROM link_whitelist WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id), commit=True,
+        )
+        if cursor is not None:
+            cache.link_whitelist[chat_id].discard(user_id)
+            return True
+        return False
+
+    def is_link_authorized(self, chat_id, user_id):
+        return int(user_id) in cache.link_whitelist.get(int(chat_id), set())
+
     def set_setting(self, chat_id, key, value):
         allowed = {
-            "antispam", "quarantine_enabled", "protect_pinned", "warn_threshold",
+            "antispam", "antilink", "quarantine_enabled", "protect_pinned", "warn_threshold",
             "warn_action", "warn_duration", "spam_window", "spam_limit",
-            "duplicate_limit", "link_limit", "media_limit", "quarantine_duration",
+            "duplicate_limit", "link_limit", "media_limit", "quarantine_duration", "spam_score_threshold", "quarantine_score_threshold",
         }
         if key not in allowed:
             return False
@@ -699,9 +725,69 @@ def is_authorized(user_id: int) -> bool:
     return is_owner(user_id) or user_id in cache.authorized_users
 
 
+ADMIN_CACHE_TTL = _env_int("ADMIN_CACHE_TTL", 60, 10, 600)
+_admin_status_cache = {}
+
+
 def is_immune(user_id: int) -> bool:
     """Somente os proprietários ficam imunes às punições do Userbot."""
     return bool(user_id) and is_owner(int(user_id))
+
+
+async def is_chat_admin(chat_id, user_id, use_cache=True):
+    """Consulta o cargo no chat com cache curto para não atrasar cada mensagem."""
+    if not chat_id or not user_id:
+        return False
+    user_id = int(user_id)
+    if is_owner(user_id):
+        return True
+    key = (int(chat_id), user_id)
+    now = time.monotonic()
+    cached = _admin_status_cache.get(key)
+    if use_cache and cached and now - cached[1] < ADMIN_CACHE_TTL:
+        return cached[0]
+    try:
+        permissions = await client.get_permissions(chat_id, user_id)
+        allowed = bool(
+            getattr(permissions, "is_admin", False)
+            or getattr(permissions, "is_creator", False)
+            or type(getattr(permissions, "participant", None)).__name__ in {
+                "ChannelParticipantAdmin", "ChannelParticipantCreator",
+            }
+        )
+    except (RPCError, ValueError, TypeError):
+        allowed = False
+    except Exception as exc:
+        logger.debug("Falha ao verificar cargo no chat %s: %s", chat_id, exc)
+        allowed = False
+    _admin_status_cache[key] = (allowed, now)
+    if len(_admin_status_cache) > 20000:
+        oldest = min(_admin_status_cache, key=lambda item: _admin_status_cache[item][1])
+        _admin_status_cache.pop(oldest, None)
+    return allowed
+
+
+async def can_manage_chat(event):
+    if is_owner(event.sender_id):
+        return True
+    return await is_chat_admin(event.chat_id, event.sender_id)
+
+
+LINK_PATTERN = re.compile(
+    r"(?i)(?<![\w@])(?:https?://|www\.|t\.me/|telegram\.me/|telegram\.dog/|tg://)[^\s<>()]+"
+)
+
+
+def message_contains_link(message, text=None):
+    """Detecta URLs visíveis e links ocultos em MessageEntityTextUrl."""
+    text = text if text is not None else getattr(message, "raw_text", "") or ""
+    if LINK_PATTERN.search(text):
+        return True
+    for entity in getattr(message, "entities", None) or ():
+        if type(entity).__name__ in {"MessageEntityUrl", "MessageEntityTextUrl"}:
+            return True
+    return False
+
 
 async def get_target_from_event(event):
     try:
@@ -1203,13 +1289,44 @@ async def global_security_filter(event):
         await delete_security_message(event, chat_id, user_id, content_text, reason)
         raise events.StopPropagation
 
+@client.on(events.NewMessage(incoming=True))
+async def antilink_filter(event):
+    """Remove links de não administradores sem consultar permissões repetidamente."""
+    if not event.chat_id or not (event.is_group or event.is_channel):
+        return
+    user_id = event.sender_id
+    if not user_id or is_immune(user_id):
+        return
+    settings = cache.settings.get(event.chat_id) or db.get_settings(event.chat_id)
+    if not int(settings.get("antilink", 0)):
+        return
+    if not message_contains_link(event.message, event.raw_text or ""):
+        return
+    if db.is_link_authorized(event.chat_id, user_id):
+        return
+    if await is_chat_admin(event.chat_id, user_id):
+        return
+    try:
+        await delete_security_message(
+            event, event.chat_id, user_id,
+            event.text or "[link oculto ou mídia com URL]",
+            "AntiLink",
+        )
+    except Exception as exc:
+        logger.debug("Falha no filtro antilink: %s", exc)
+    raise events.StopPropagation
+
+
 spam_state = {}
 
 
 async def apply_warning_action(chat_id, user_id, action, duration, reason, admin_id):
     expires_at = int(time.time()) + int(duration)
+    action = str(action or "mute").lower()
     if action == "ban":
         await client.edit_permissions(chat_id, user_id, view_messages=False)
+    elif action == "quarantine":
+        await client.edit_permissions(chat_id, user_id, send_messages=False, send_media=False)
     else:
         await client.edit_permissions(chat_id, user_id, send_messages=False)
         action = "mute"
@@ -1218,17 +1335,25 @@ async def apply_warning_action(chat_id, user_id, action, duration, reason, admin
 
 @client.on(events.NewMessage(incoming=True))
 async def antispam_filter(event):
+    """Detecta padrões combinados para reduzir falsos positivos."""
     if not event.chat_id or not (event.is_group or event.is_channel) or (event.raw_text or "").startswith("."):
         return
     user_id = event.sender_id
     if not user_id or is_immune(user_id):
+        return
+    # Administradores não entram no antispam: o antilink também possui a
+    # mesma exceção e não deve haver punição automática de moderadores.
+    if await is_chat_admin(event.chat_id, user_id):
         return
     settings = cache.settings.get(event.chat_id) or db.get_settings(event.chat_id)
     if not int(settings.get("antispam", 1)):
         return
     now = time.time()
     key = (int(event.chat_id), int(user_id))
-    state = spam_state.setdefault(key, {"times": deque(), "fingerprints": deque(), "links": deque(), "media": deque()})
+    state = spam_state.setdefault(
+        key,
+        {"times": deque(), "fingerprints": deque(), "links": deque(), "media": deque(), "last_action_at": 0.0},
+    )
     if len(spam_state) > SPAM_STATE_MAX_USERS:
         oldest_key = next(iter(spam_state), None)
         if oldest_key is not None and oldest_key != key:
@@ -1239,38 +1364,81 @@ async def antispam_filter(event):
         while state[name] and state[name][0][0] < cutoff:
             state[name].popleft()
     text = (event.raw_text or "").strip()
-    fingerprint = hashlib.sha1(re.sub(r"\s+", " ", text.lower()).encode("utf-8", "ignore")).hexdigest() if text else ""
-    link_count = len(re.findall(r"(?:https?://|t\.me/|www\.)(?:\S+)", text.lower()))
+    fingerprint = hashlib.sha1(
+        re.sub(r"\s+", " ", text.lower()).encode("utf-8", "ignore")
+    ).hexdigest() if text else ""
+    link_count = len(re.findall(r"(?:https?://|t\.me/|www\.)[^\s<>()]+", text.lower()))
     has_media = bool(getattr(event.message, "media", None))
     state["times"].append((now, event.id))
     if fingerprint:
         state["fingerprints"].append((now, fingerprint))
-    for _ in range(link_count):
+    for _ in range(min(link_count, 20)):
         state["links"].append((now, True))
     if has_media:
         state["media"].append((now, True))
+
+    frequency_limit = max(2, min(int(settings.get("spam_limit", 6)), 100))
+    duplicate_limit = max(2, min(int(settings.get("duplicate_limit", 3)), 20))
+    link_limit = max(2, min(int(settings.get("link_limit", 3)), 20))
+    media_limit = max(2, min(int(settings.get("media_limit", 5)), 50))
     same_text = sum(1 for _, value in state["fingerprints"] if fingerprint and value == fingerprint)
+    frequency_count = len(state["times"])
+    link_count_window = len(state["links"])
+    media_count_window = len(state["media"])
+
     signals = []
-    if len(state["times"]) > int(settings.get("spam_limit", 6)):
-        signals.append("frequência")
-    if same_text >= int(settings.get("duplicate_limit", 3)):
-        signals.append("duplicação")
-    if len(state["links"]) >= int(settings.get("link_limit", 3)):
-        signals.append("links repetidos")
-    if len(state["media"]) >= int(settings.get("media_limit", 5)):
-        signals.append("mídia em rajada")
-    if not signals:
+    score = 0
+    if frequency_count > frequency_limit:
+        excess = frequency_count - frequency_limit
+        score += min(4, 2 + excess // max(1, frequency_limit // 2))
+        signals.append(f"frequência ({frequency_count}/{frequency_limit})")
+    if same_text >= duplicate_limit:
+        score += min(4, 2 + max(0, same_text - duplicate_limit))
+        signals.append(f"duplicação ({same_text})")
+    if link_count_window >= link_limit:
+        score += min(4, 2 + max(0, link_count_window - link_limit))
+        signals.append(f"links repetidos ({link_count_window})")
+    if media_count_window >= media_limit:
+        score += min(4, 2 + max(0, media_count_window - media_limit))
+        signals.append(f"mídia em rajada ({media_count_window})")
+
+    score_threshold = max(2, min(int(settings.get("spam_score_threshold", 4)), 12))
+    quarantine_threshold = max(score_threshold, min(int(settings.get("quarantine_score_threshold", 6)), 16))
+    if not signals or score < score_threshold:
         return
-    reason = "Antispam: " + ", ".join(signals)
+    # Uma única ocorrência acima do limite não basta para quarentena. Exigimos
+    # dois sinais independentes ou uma rajada claramente anormal.
+    strong_pattern = (
+        len(signals) >= 2
+        or frequency_count >= frequency_limit * 2
+        or same_text >= duplicate_limit + 2
+        or media_count_window >= media_limit * 2
+    )
+    # Um sinal isolado pode representar uso normal (por exemplo, várias
+    # imagens legítimas). Nenhuma ação automática ocorre sem padrão forte.
+    if not strong_pattern:
+        return
+    reason = f"Antispam ({score} pontos): " + ", ".join(signals)
+    if now - float(state.get("last_action_at", 0.0)) < SPAM_ACTION_COOLDOWN:
+        return
+
     if int(settings.get("quarantine_enabled", 0)):
+        if score < quarantine_threshold:
+            # Mantém o evento sem punição quando a evidência combinada ainda
+            # não atingiu o patamar de quarentena.
+            logger.debug("Sinal antispam abaixo da quarentena em %s/%s: %s", event.chat_id, user_id, reason)
+            return
         duration = max(60, min(int(settings.get("quarantine_duration", 600)), MAX_DURATION_SECONDS))
         try:
             await delete_security_message(event, event.chat_id, user_id, event.text or "[mídia]", reason)
             await apply_warning_action(event.chat_id, user_id, "quarantine", duration, reason, OWNER_ID)
+            state["last_action_at"] = now
+            for name in ("times", "fingerprints", "links", "media"):
+                state[name].clear()
         except Exception as exc:
             logger.debug("Falha na quarentena antispam: %s", exc)
-        state["times"].clear()
         return
+
     try:
         await delete_security_message(event, event.chat_id, user_id, event.text or "[mídia]", reason)
         count = db.add_warning(event.chat_id, user_id)
@@ -1285,6 +1453,9 @@ async def antispam_filter(event):
                 db.clear_warnings(event.chat_id, user_id)
             except Exception as exc:
                 logger.debug("Falha ao aplicar ação após advertências: %s", exc)
+        state["last_action_at"] = now
+        for name in ("times", "fingerprints", "links", "media"):
+            state[name].clear()
     except Exception as exc:
         logger.debug("Falha no filtro antispam: %s", exc)
 
@@ -1347,6 +1518,92 @@ async def cmd_pinned(event):
     enabled = args[1].lower() in {"on", "1"}
     db.set_setting(event.chat_id, "protect_pinned", int(enabled))
     await reply_or_edit(event, f"📌 Proteção de mensagens fixadas <b>{'ATIVADA' if enabled else 'DESATIVADA'}</b>.", delete_after=DEFAULT_DELETE_AFTER)
+
+
+@client.on(events.NewMessage(pattern=r'^\.antilink(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_antilink(event):
+    if not (event.is_group or event.is_channel):
+        await reply_or_edit(event, "❌ O antilink só pode ser configurado em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if not await can_manage_chat(event):
+        await reply_or_edit(event, "❌ Somente administradores deste grupo podem alterar o antilink.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    args = (event.raw_text or "").split()
+    if len(args) < 2 or args[1].lower() not in {"on", "off", "1", "0"}:
+        status = bool(db.get_settings(event.chat_id).get("antilink", 0))
+        await reply_or_edit(
+            event,
+            f"🔗 Antilink: <b>{'ATIVADO' if status else 'DESATIVADO'}</b>. Use <code>.antilink on|off</code>.",
+            delete_after=DEFAULT_DELETE_AFTER,
+        )
+        return
+    enabled = args[1].lower() in {"on", "1"}
+    db.set_setting(event.chat_id, "antilink", int(enabled))
+    await reply_or_edit(
+        event,
+        f"🔗 Antilink <b>{'ATIVADO' if enabled else 'DESATIVADO'}</b>. Links ficam permitidos para administradores e usuários autorizados.",
+        delete_after=DEFAULT_DELETE_AFTER,
+    )
+
+
+@client.on(events.NewMessage(pattern=r'^\.autorizarlink(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_autorizarlink(event):
+    if not (event.is_group or event.is_channel):
+        await reply_or_edit(event, "❌ A autorização de links só pode ser configurada em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if not await can_manage_chat(event):
+        await reply_or_edit(event, "❌ Somente administradores deste grupo podem autorizar links.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    target_id = await get_target_from_event(event)
+    if not target_id or is_immune(target_id):
+        await reply_or_edit(event, "❌ Informe um usuário válido por resposta, ID ou username.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    db.add_link_authorized(event.chat_id, target_id)
+    queue_audit_log(event.chat_id, target_id, "Ação: AutorizarLink", "Usuário autorizado a enviar links", admin_id=event.sender_id)
+    await reply_or_edit(
+        event,
+        f"✅ <b>{db.get_user_info(target_id)}</b> (<code>{target_id}</code>) poderá enviar links neste chat.",
+        delete_after=DEFAULT_DELETE_AFTER,
+    )
+
+
+@client.on(events.NewMessage(pattern=r'^\.desautorizarlink(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_desautorizarlink(event):
+    if not (event.is_group or event.is_channel):
+        await reply_or_edit(event, "❌ A autorização de links só pode ser configurada em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if not await can_manage_chat(event):
+        await reply_or_edit(event, "❌ Somente administradores deste grupo podem remover autorizações de links.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    target_id = await get_target_from_event(event)
+    if not target_id:
+        await reply_or_edit(event, "❌ Informe um usuário por resposta, ID ou username.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    db.remove_link_authorized(event.chat_id, target_id)
+    queue_audit_log(event.chat_id, target_id, "Ação: DesautorizarLink", "Autorização de links removida", admin_id=event.sender_id)
+    await reply_or_edit(
+        event,
+        f"✅ Autorização de links removida de <b>{db.get_user_info(target_id)}</b> (<code>{target_id}</code>).",
+        delete_after=DEFAULT_DELETE_AFTER,
+    )
+
+
+@client.on(events.NewMessage(pattern=r'^\.listlinkauth(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_listlinkauth(event):
+    if not (event.is_group or event.is_channel):
+        await reply_or_edit(event, "❌ A whitelist de links só pode ser consultada em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if not await can_manage_chat(event):
+        await reply_or_edit(event, "❌ Somente administradores deste grupo podem consultar a whitelist de links.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    users = sorted(cache.link_whitelist.get(int(event.chat_id), set()))
+    if not users:
+        text = "🔗 Nenhum usuário autorizado a enviar links neste chat."
+    else:
+        rows = [f"• {escape(db.get_user_info(user_id))} (<code>{user_id}</code>)" for user_id in users[:100]]
+        suffix = f"\n\nExibindo 100 de {len(users)}." if len(users) > 100 else ""
+        text = "🔗 <b>Usuários autorizados a enviar links</b>\n" + "\n".join(rows) + suffix
+    await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
 
 
 @client.on(events.NewMessage(pattern=r'^\.del(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
@@ -1965,8 +2222,12 @@ async def cmd_help(event):
         "• <code>.warn @user motivo</code> | <code>.warns</code>\n"
         "• <code>.unwarn</code> (remove uma advertência) | <code>.delwarn</code> (apaga e adverte)\n"
         "• <code>.clearwarns @user</code> (remove todas as advertências)\n"
-        "• <code>.antispam on/off</code> | <code>.quarantine on/off</code>\n"
+        "• <code>.antispam on/off</code> (pontuação adaptativa, mídia, links e duplicação)\n"
+        "• <code>.quarantine on/off</code> (só pune com padrão forte)\n"
         "• <code>.pinned on/off</code> (protege mensagens fixadas)\n\n"
+        "🔗 <b>CONTROLE DE LINKS:</b>\n"
+        "• <code>.antilink on/off</code> (links somente para admins e autorizados)\n"
+        "• <code>.autorizarlink</code> | <code>.desautorizarlink</code> | <code>.listlinkauth</code>\n\n"
         "👑 <b>CONTROLE GLOBAL:</b>\n"
         "• <code>.allban [duração] [--purge N]</code> | <code>.allblack [duração]</code> | <code>.unallblack</code>\n"
         "• <code>.maintenance on/off</code> (somente proprietário)\n"
