@@ -3,7 +3,8 @@ import os
 import sqlite3
 import time
 import asyncio
-from collections import defaultdict
+from collections import defaultdict, deque
+import threading
 from pathlib import Path
 from datetime import datetime
 from html import escape
@@ -27,6 +28,15 @@ def _required_env(name: str) -> str:
     return value
 
 
+def _env_int(name: str, default: int, minimum: int = 0, maximum: int | None = None) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    value = max(minimum, value)
+    return min(value, maximum) if maximum is not None else value
+
+
 try:
     API_ID = int(_required_env("API_ID"))
     API_HASH = _required_env("API_HASH")
@@ -45,14 +55,24 @@ PURGEALL_MAX_LIMIT = 1000
 PURGEALL_MAX_SCAN = 1200
 PURGEALL_BATCH_SIZE = 50
 DEFAULT_DELETE_AFTER = 5
+# A primeira mensagem de cada chat é apagada imediatamente. Mensagens que
+# chegam enquanto o RPC está em andamento são agrupadas em lotes posteriores.
+SECURITY_DELETE_BATCH_SIZE = _env_int("SECURITY_DELETE_BATCH_SIZE", 100, 1, 100)
+SECURITY_MAX_PENDING_PER_CHAT = _env_int("SECURITY_MAX_PENDING_PER_CHAT", 10000, 100, 50000)
+AUDIT_FLUSH_DELAY = _env_int("AUDIT_FLUSH_DELAY_MS", 25, 1, 1000) / 1000
+AUDIT_BATCH_SIZE = _env_int("AUDIT_BATCH_SIZE", 100, 1, 500)
+TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
+TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
+TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.14"
+VERSION = "V6.15"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
 )
 logger = logging.getLogger("jtzin-telethon")
 
@@ -118,20 +138,26 @@ cache = Cache()
 class Database:
     def __init__(self, path: Path):
         self.path = path
+        self._db_lock = threading.RLock()
         self._connect()
 
     def _connect(self):
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA temp_store=MEMORY")
+        self.conn.execute("PRAGMA cache_size=-8192")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA busy_timeout=5000")
 
     def execute(self, query, params=(), commit=False):
         try:
-            cursor = self.conn.execute(query, params)
-            if commit: self.conn.commit()
-            return cursor
+            with self._db_lock:
+                cursor = self.conn.execute(query, params)
+                if commit:
+                    self.conn.commit()
+                return cursor
         except Exception as e:
             logger.error(f"DB Error: {e} | Query: {query}")
             return None
@@ -271,32 +297,60 @@ class Database:
             commit=True
         )
 
-    def add_deleted_log(self, chat_id, user_id, content, reason, admin_id=None):
-        values = (int(chat_id), int(user_id), admin_id, content or "[Mídia / Ação]", reason, int(time.time()))
-        try:
-            self.conn.execute(
-                "INSERT INTO deleted_logs(chat_id, user_id, admin_id, content, reason, created_at) VALUES(?,?,?,?,?,?)",
-                values,
+    def add_deleted_logs_batch(self, records):
+        """Persiste vários eventos de auditoria com apenas uma transação."""
+        if not records:
+            return 0
+        values = [
+            (
+                int(chat_id),
+                int(user_id),
+                admin_id,
+                content or "[Mídia / Ação]",
+                reason,
+                int(created_at or time.time()),
             )
-            self.conn.commit()
-            return True
-        except sqlite3.OperationalError as exc:
-            if "admin_id" not in str(exc):
-                logger.error(f"DB Error ao registrar log: {exc}")
-                return False
-            try:
-                self.conn.execute(
-                    "INSERT INTO deleted_logs(chat_id, user_id, content, reason, created_at) VALUES(?,?,?,?,?)",
-                    (int(chat_id), int(user_id), content or "[Mídia / Ação]", reason, int(time.time())),
+            for chat_id, user_id, admin_id, content, reason, created_at in records
+        ]
+        try:
+            with self._db_lock:
+                self.conn.executemany(
+                    "INSERT INTO deleted_logs(chat_id, user_id, admin_id, content, reason, created_at) VALUES(?,?,?,?,?,?)",
+                    values,
                 )
                 self.conn.commit()
-                return True
+            return len(values)
+        except sqlite3.OperationalError as exc:
+            if "admin_id" not in str(exc):
+                logger.error(f"DB Error ao registrar lote de logs: {exc}")
+                return 0
+            try:
+                with self._db_lock:
+                    self.conn.rollback()
+                    self.conn.executemany(
+                        "INSERT INTO deleted_logs(chat_id, user_id, content, reason, created_at) VALUES(?,?,?,?,?)",
+                        [
+                            (chat_id, user_id, content, reason, created_at)
+                            for chat_id, user_id, _admin_id, content, reason, created_at in values
+                        ],
+                    )
+                    self.conn.commit()
+                return len(values)
             except sqlite3.Error as fallback_exc:
-                logger.error(f"DB Error no fallback de log: {fallback_exc}")
-                return False
+                logger.error(f"DB Error no fallback de lote: {fallback_exc}")
+                return 0
         except sqlite3.Error as exc:
-            logger.error(f"DB Error ao registrar log: {exc}")
-            return False
+            logger.error(f"DB Error ao registrar lote de logs: {exc}")
+            try:
+                with self._db_lock:
+                    self.conn.rollback()
+            except sqlite3.Error:
+                pass
+            return 0
+
+    def add_deleted_log(self, chat_id, user_id, content, reason, admin_id=None):
+        record = (chat_id, user_id, admin_id, content, reason, int(time.time()))
+        return self.add_deleted_logs_batch([record]) == 1
 
     def get_latest_logs(self, limit=10):
         safe_limit = max(1, min(int(limit), 100))
@@ -324,7 +378,187 @@ except Exception as exc:
 db = Database(DB_PATH)
 
 # --- CLIENTE TELETHON ---
-client = TelegramClient("jtzin_session", API_ID, API_HASH)
+client = TelegramClient(
+    "jtzin_session",
+    API_ID,
+    API_HASH,
+    timeout=TELEGRAM_TIMEOUT,
+    request_retries=TELEGRAM_REQUEST_RETRIES,
+    connection_retries=TELEGRAM_CONNECTION_RETRIES,
+    retry_delay=1,
+    auto_reconnect=True,
+    sequential_updates=False,
+    flood_sleep_threshold=60,
+    entity_cache_limit=10000,
+    device_model="Jtzin Userbot",
+    app_version=VERSION,
+)
+
+
+class AuditBuffer:
+    """Agrupa logs e grava-os sem bloquear o event loop do Telethon."""
+
+    def __init__(self, database):
+        self.database = database
+        self.records = deque()
+        self.flush_task = None
+        self.flush_lock = asyncio.Lock()
+        self.enqueued = 0
+        self.persisted = 0
+        self.failed = 0
+
+    def enqueue(self, chat_id, user_id, content, reason, admin_id=None):
+        record = (chat_id, user_id, admin_id, content, reason, int(time.time()))
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.failed += 1
+            self.database.add_deleted_log(
+                chat_id, user_id, content, reason, admin_id=admin_id
+            )
+            return
+        self.records.append(record)
+        self.enqueued += 1
+        if self.flush_task is None or self.flush_task.done():
+            self.flush_task = loop.create_task(self._flush_after_delay())
+
+    async def _flush_after_delay(self):
+        try:
+            await asyncio.sleep(AUDIT_FLUSH_DELAY)
+            await self.flush()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.failed += 1
+            logger.error("Falha no buffer de auditoria: %s", exc)
+
+    async def flush(self):
+        async with self.flush_lock:
+            while self.records:
+                batch = []
+                while self.records and len(batch) < AUDIT_BATCH_SIZE:
+                    batch.append(self.records.popleft())
+                try:
+                    persisted = await asyncio.to_thread(
+                        self.database.add_deleted_logs_batch, batch
+                    )
+                    self.persisted += persisted
+                    self.failed += len(batch) - persisted
+                except Exception as exc:
+                    self.failed += len(batch)
+                    logger.error("Falha ao persistir lote de auditoria: %s", exc)
+
+    def pending_count(self):
+        return len(self.records)
+
+
+class SecurityDeleteQueue:
+    """Apaga a primeira mensagem imediatamente e agrupa as seguintes por chat."""
+
+    def __init__(self, telegram_client):
+        self.telegram_client = telegram_client
+        self.pending = defaultdict(deque)
+        self.running_chats = set()
+        self.immediate = 0
+        self.batched = 0
+        self.deleted = 0
+        self.failed = 0
+        self.overflow = 0
+        self.last_delete_ms = 0.0
+        self.max_delete_ms = 0.0
+
+    async def _delete_rpc(self, chat_id, items):
+        if not items:
+            return
+        entity = items[0][0] or chat_id
+        message_ids = [message_id for _entity, message_id in items]
+        started = time.perf_counter()
+        try:
+            await self.telegram_client.delete_messages(entity, message_ids, revoke=True)
+            self.deleted += len(message_ids)
+        except FloodWaitError as exc:
+            await asyncio.sleep(exc.seconds)
+            try:
+                await self.telegram_client.delete_messages(entity, message_ids, revoke=True)
+                self.deleted += len(message_ids)
+            except Exception as retry_exc:
+                self.failed += len(message_ids)
+                logger.error("Falha ao apagar lote após FloodWait: %s", retry_exc)
+        except Exception as exc:
+            self.failed += len(message_ids)
+            logger.debug("Falha no lote de exclusão no chat %s: %s", chat_id, exc)
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            self.last_delete_ms = elapsed_ms
+            self.max_delete_ms = max(self.max_delete_ms, elapsed_ms)
+
+    async def _drain_chat(self, chat_id):
+        try:
+            while self.pending[chat_id]:
+                batch = []
+                while self.pending[chat_id] and len(batch) < SECURITY_DELETE_BATCH_SIZE:
+                    batch.append(self.pending[chat_id].popleft())
+                if batch:
+                    self.batched += len(batch)
+                    await self._delete_rpc(chat_id, batch)
+                await asyncio.sleep(0)
+        finally:
+            self.pending.pop(chat_id, None)
+            self.running_chats.discard(chat_id)
+
+    async def submit(self, chat_id, entity, message_id):
+        item = (entity, int(message_id))
+        if chat_id in self.running_chats:
+            if len(self.pending[chat_id]) >= SECURITY_MAX_PENDING_PER_CHAT:
+                self.overflow += 1
+                await self._delete_rpc(chat_id, [item])
+            else:
+                self.pending[chat_id].append(item)
+            return
+
+        self.running_chats.add(chat_id)
+        self.immediate += 1
+        await self._delete_rpc(chat_id, [item])
+
+        if self.pending.get(chat_id):
+            # Mantém o chat marcado como ocupado até o dreno terminar, para
+            # preservar a ordem e evitar duas requisições simultâneas.
+            asyncio.create_task(self._drain_chat(chat_id))
+        else:
+            self.running_chats.discard(chat_id)
+
+    def snapshot(self):
+        return {
+            "pending": sum(len(items) for items in self.pending.values()),
+            "immediate": self.immediate,
+            "batched": self.batched,
+            "deleted": self.deleted,
+            "failed": self.failed,
+            "overflow": self.overflow,
+            "last_delete_ms": self.last_delete_ms,
+            "max_delete_ms": self.max_delete_ms,
+        }
+
+
+# Inicializados após a criação do cliente para permitir testes offline e substituição controlada.
+audit_buffer = AuditBuffer(db)
+security_delete_queue = SecurityDeleteQueue(client)
+
+
+def queue_audit_log(chat_id, user_id, content, reason, admin_id=None):
+    audit_buffer.enqueue(chat_id, user_id, content, reason, admin_id=admin_id)
+
+
+def get_performance_snapshot():
+    queue_stats = security_delete_queue.snapshot()
+    return {
+        **queue_stats,
+        "audit_pending": audit_buffer.pending_count(),
+        "audit_enqueued": audit_buffer.enqueued,
+        "audit_persisted": audit_buffer.persisted,
+        "audit_failed": audit_buffer.failed,
+    }
+
 
 def is_owner(user_id: int) -> bool:
     return user_id in [OWNER_ID, SECOND_OWNER_ID, THIRD_OWNER_ID]
@@ -514,12 +748,11 @@ async def delete_message_ids_safely(chat_id, message_ids, batch_size=100):
 
 
 async def log_deleted_in_background(chat_id, user_id, content, reason, admin_id=None):
-    """Registra auditoria depois da exclusão sem atrasar a operação crítica."""
+    """Compatibilidade para chamadas antigas, encaminhando ao buffer."""
     try:
-        await asyncio.sleep(0)
-        db.add_deleted_log(chat_id, user_id, content, reason, admin_id=admin_id)
+        queue_audit_log(chat_id, user_id, content, reason, admin_id=admin_id)
     except Exception as exc:
-        logger.error(f"Falha ao registrar log assíncrono: {exc}")
+        logger.error(f"Falha ao enfileirar log assíncrono: {exc}")
 
 
 async def apply_security_restriction(chat_id, user_id):
@@ -533,18 +766,15 @@ async def apply_security_restriction(chat_id, user_id):
 
 
 async def delete_security_message(event, chat_id, user_id, content_text, reason):
-    """Exclui primeiro; auditoria e restrições rodam fora do caminho crítico."""
+    """Exclui pela fila híbrida; auditoria e restrições seguem em segundo plano."""
     try:
-        # Mensagens recebidas normalmente já carregam input_chat. Usá-lo evita
-        # a busca de diálogos feita por Message.delete() antes do RPC de delete.
+        # input_chat evita resolução adicional da entidade no primeiro RPC.
         delete_entity = getattr(event.message, "input_chat", None) or chat_id
-        await client.delete_messages(delete_entity, event.id, revoke=True)
+        await security_delete_queue.submit(chat_id, delete_entity, event.id)
     except Exception as delete_exc:
-        logger.error(f"Erro ao apagar mensagem do filtro de segurança: {delete_exc}")
+        logger.error(f"Erro ao encaminhar mensagem para exclusão: {delete_exc}")
     finally:
-        asyncio.create_task(
-            log_deleted_in_background(chat_id, user_id, content_text, reason)
-        )
+        queue_audit_log(chat_id, user_id, content_text, reason)
 
     if reason in ("Global Blacklist", "Local BanPerm"):
         asyncio.create_task(apply_security_restriction(chat_id, user_id))
@@ -736,7 +966,7 @@ async def cmd_kick(event):
     try:
         await client.kick_participant(event.chat_id, target_id)
         user_info = db.get_user_info(target_id)
-        db.add_deleted_log(event.chat_id, target_id, "Ação: Kick", "Moderação", admin_id=event.sender_id)
+        queue_audit_log(event.chat_id, target_id, "Ação: Kick", "Moderação", admin_id=event.sender_id)
         await reply_or_edit(event, f"👢 {user_info} (<code>{target_id}</code>) foi expulso.", delete_after=DEFAULT_DELETE_AFTER)
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
@@ -754,7 +984,7 @@ async def cmd_ban(event):
     try:
         await client.edit_permissions(event.chat_id, target_id, view_messages=False)
         user_info = db.get_user_info(target_id)
-        db.add_deleted_log(event.chat_id, target_id, "Ação: Ban", "Moderação", admin_id=event.sender_id)
+        queue_audit_log(event.chat_id, target_id, "Ação: Ban", "Moderação", admin_id=event.sender_id)
         await reply_or_edit(event, f"🔨 {user_info} (<code>{target_id}</code>) banido do grupo.", delete_after=DEFAULT_DELETE_AFTER)
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
@@ -772,7 +1002,7 @@ async def cmd_unban(event):
     try:
         await client.edit_permissions(event.chat_id, target_id, view_messages=True, send_messages=True)
         db.remove_local_banperm(event.chat_id, target_id)
-        db.add_deleted_log(event.chat_id, target_id, "Ação: Unban Local", "Reversão", admin_id=event.sender_id)
+        queue_audit_log(event.chat_id, target_id, "Ação: Unban Local", "Reversão", admin_id=event.sender_id)
         user_info = db.get_user_info(target_id)
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) desbanido totalmente.", delete_after=DEFAULT_DELETE_AFTER)
     except ChatAdminRequiredError:
@@ -789,7 +1019,7 @@ async def cmd_mute(event):
     try:
         await client.edit_permissions(event.chat_id, target_id, send_messages=False)
         user_info = db.get_user_info(target_id)
-        db.add_deleted_log(event.chat_id, target_id, "Ação: Mute", "Moderação", admin_id=event.sender_id)
+        queue_audit_log(event.chat_id, target_id, "Ação: Mute", "Moderação", admin_id=event.sender_id)
         await reply_or_edit(event, f"🔇 {user_info} (<code>{target_id}</code>) silenciado.", delete_after=DEFAULT_DELETE_AFTER)
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
@@ -806,7 +1036,7 @@ async def cmd_unmute(event):
         return
     try:
         await client.edit_permissions(event.chat_id, target_id, send_messages=True)
-        db.add_deleted_log(event.chat_id, target_id, "Ação: Unmute", "Reversão", admin_id=event.sender_id)
+        queue_audit_log(event.chat_id, target_id, "Ação: Unmute", "Reversão", admin_id=event.sender_id)
         user_info = db.get_user_info(target_id)
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) pode falar novamente.", delete_after=DEFAULT_DELETE_AFTER)
     except ChatAdminRequiredError:
@@ -822,7 +1052,7 @@ async def cmd_blacklist(event):
         return
     db.add_local_blacklist(event.chat_id, target_id, get_reason_from_event(event))
     user_info = db.get_user_info(target_id)
-    db.add_deleted_log(event.chat_id, target_id, "Ação: Blacklist Local", "Moderação", admin_id=event.sender_id)
+    queue_audit_log(event.chat_id, target_id, "Ação: Blacklist Local", "Moderação", admin_id=event.sender_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist local (mensagens serão apagadas).", delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.unblacklist(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
@@ -832,7 +1062,7 @@ async def cmd_unblacklist(event):
         await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=DEFAULT_DELETE_AFTER)
         return
     db.remove_local_blacklist(event.chat_id, target_id)
-    db.add_deleted_log(event.chat_id, target_id, "Ação: Unblacklist Local", "Reversão", admin_id=event.sender_id)
+    queue_audit_log(event.chat_id, target_id, "Ação: Unblacklist Local", "Reversão", admin_id=event.sender_id)
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido da blacklist local deste chat.", delete_after=DEFAULT_DELETE_AFTER)
 
@@ -846,7 +1076,7 @@ async def cmd_banperm(event):
     try:
         await client.edit_permissions(event.chat_id, target_id, view_messages=False)
         user_info = db.get_user_info(target_id)
-        db.add_deleted_log(event.chat_id, target_id, "Ação: BanPerm", "Moderação", admin_id=event.sender_id)
+        queue_audit_log(event.chat_id, target_id, "Ação: BanPerm", "Moderação", admin_id=event.sender_id)
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) banido permanentemente.", delete_after=DEFAULT_DELETE_AFTER)
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
@@ -864,7 +1094,7 @@ async def cmd_unbanperm(event):
     try:
         await client.edit_permissions(event.chat_id, target_id, view_messages=True, send_messages=True)
         db.remove_local_banperm(event.chat_id, target_id)
-        db.add_deleted_log(event.chat_id, target_id, "Ação: UnbanPerm Local", "Reversão", admin_id=event.sender_id)
+        queue_audit_log(event.chat_id, target_id, "Ação: UnbanPerm Local", "Reversão", admin_id=event.sender_id)
         user_info = db.get_user_info(target_id)
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) perdoado neste chat.", delete_after=DEFAULT_DELETE_AFTER)
     except ChatAdminRequiredError:
@@ -880,7 +1110,7 @@ async def cmd_shadow(event):
         return
     db.add_shadow_ban(target_id, get_reason_from_event(event))
     user_info = db.get_user_info(target_id)
-    db.add_deleted_log(event.chat_id, target_id, "Ação: Shadow Ban", "Moderação", admin_id=event.sender_id)
+    queue_audit_log(event.chat_id, target_id, "Ação: Shadow Ban", "Moderação", admin_id=event.sender_id)
     await reply_or_edit(event, f"🌑 {user_info} (<code>{target_id}</code>) em Shadow Ban (mensagens serão apagadas globalmente).", delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.unshadow(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
@@ -890,7 +1120,7 @@ async def cmd_unshadow(event):
         await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=DEFAULT_DELETE_AFTER)
         return
     db.remove_shadow_ban(target_id)
-    db.add_deleted_log(event.chat_id, target_id, "Ação: Unshadow Global", "Reversão", admin_id=event.sender_id)
+    queue_audit_log(event.chat_id, target_id, "Ação: Unshadow Global", "Reversão", admin_id=event.sender_id)
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) saiu das sombras.", delete_after=DEFAULT_DELETE_AFTER)
 
@@ -914,7 +1144,7 @@ async def cmd_allban(event):
                 logger.debug(f"Falha ao aplicar ação global no chat: {exc}")
                 continue
     user_info = db.get_user_info(target_id)
-    db.add_deleted_log(event.chat_id, target_id, f"Ação: Allban ({count} chats)", "Moderação Global", admin_id=event.sender_id)
+    queue_audit_log(event.chat_id, target_id, f"Ação: Allban ({count} chats)", "Moderação Global", admin_id=event.sender_id)
     await reply_or_edit(event, f"☢️ {user_info} (<code>{target_id}</code>) BANIDO GLOBALMENTE ({count} chats).", delete_after=5)
 
 @client.on(events.NewMessage(pattern=r'^\.allblack(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
@@ -925,7 +1155,7 @@ async def cmd_allblack(event):
         return
     db.add_global_blacklist(target_id, 'black', get_reason_from_event(event))
     user_info = db.get_user_info(target_id)
-    db.add_deleted_log(event.chat_id, target_id, "Ação: Allblack Global", "Moderação Global", admin_id=event.sender_id)
+    queue_audit_log(event.chat_id, target_id, "Ação: Allblack Global", "Moderação Global", admin_id=event.sender_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist global.", delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.unallblack(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
@@ -935,7 +1165,7 @@ async def cmd_unallblack(event):
         await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=DEFAULT_DELETE_AFTER)
         return
     db.remove_global_blacklist(target_id)
-    db.add_deleted_log(event.chat_id, target_id, "Ação: Unallblack Global", "Reversão Global", admin_id=event.sender_id)
+    queue_audit_log(event.chat_id, target_id, "Ação: Unallblack Global", "Reversão Global", admin_id=event.sender_id)
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido da blacklist global.", delete_after=DEFAULT_DELETE_AFTER)
 
@@ -947,7 +1177,7 @@ async def cmd_autorizar(event):
         return
     db.add_authorized(target_id)
     user_info = db.get_user_info(target_id)
-    db.add_deleted_log(event.chat_id, target_id, "Ação: Autorizar", "Controle", admin_id=event.sender_id)
+    queue_audit_log(event.chat_id, target_id, "Ação: Autorizar", "Controle", admin_id=event.sender_id)
     await reply_or_edit(event, f"✅ Usuário {user_info} (<code>{target_id}</code>) autorizado.", delete_after=5)
 
 @client.on(events.NewMessage(pattern=r'^\.desautorizar(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
@@ -958,7 +1188,7 @@ async def cmd_desautorizar(event):
         return
     db.remove_authorized(target_id)
     user_info = db.get_user_info(target_id)
-    db.add_deleted_log(event.chat_id, target_id, "Ação: Desautorizar", "Controle", admin_id=event.sender_id)
+    queue_audit_log(event.chat_id, target_id, "Ação: Desautorizar", "Controle", admin_id=event.sender_id)
     await reply_or_edit(event, f"❌ Acesso revogado para {user_info} (<code>{target_id}</code>).", delete_after=5)
 
 @client.on(events.NewMessage(pattern=r'^\.listauth(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
@@ -976,6 +1206,7 @@ async def cmd_listauth(event):
 
 @client.on(events.NewMessage(pattern=r'^\.logs(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_logs(event):
+    await audit_buffer.flush()
     logs = db.get_latest_logs(10)
     if not logs:
         await reply_or_edit(event, "📭 Nenhum log registrado recentemente.", delete_after=5)
@@ -1053,8 +1284,43 @@ async def cmd_status(event):
         f"• Banimentos locais: <code>{counts['local_banperm']}</code> | Shadow: <code>{counts['shadow']}</code>\n"
         f"• Logs: <code>{db_counts['deleted_logs']}</code> | Banco: <code>{format_bytes(db.get_db_size_bytes())}</code>"
     )
+    performance = get_performance_snapshot()
+    text += (
+        f"\n• Fila exclusão: <code>{performance['pending']}</code> pendentes | "
+        f"RPC último/máx.: <code>{performance['last_delete_ms']:.0f}/{performance['max_delete_ms']:.0f} ms</code>"
+        f"\n• Auditoria: <code>{performance['audit_pending']}</code> pendentes | "
+        f"persistidos: <code>{performance['audit_persisted']}</code>"
+    )
     elapsed = (time.perf_counter() - started) * 1000
     text += f"\n• Diagnóstico concluído em: <code>{elapsed:.0f} ms</code>"
+    await reply_or_edit(event, text, delete_after=15)
+
+
+@client.on(events.NewMessage(pattern=r'^\.latency(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_latency(event):
+    started = time.perf_counter()
+    try:
+        api_started = time.perf_counter()
+        await client.get_me()
+        api_ms = (time.perf_counter() - api_started) * 1000
+        api_state = "✅ disponível"
+    except Exception as exc:
+        api_ms = 0.0
+        api_state = f"⚠️ falhou: {escape(str(exc)[:120])}"
+    performance = get_performance_snapshot()
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    text = (
+        f"⚡ <b>DIAGNÓSTICO DE LATÊNCIA {VERSION}</b>\n\n"
+        f"• API Telegram: <b>{api_state}</b> | <code>{api_ms:.0f} ms</code>\n"
+        f"• Último RPC de exclusão: <code>{performance['last_delete_ms']:.0f} ms</code>\n"
+        f"• Maior RPC observado: <code>{performance['max_delete_ms']:.0f} ms</code>\n"
+        f"• Exclusões imediatas: <code>{performance['immediate']}</code>\n"
+        f"• Mensagens agrupadas: <code>{performance['batched']}</code>\n"
+        f"• Falhas/overflow: <code>{performance['delete_failed']}/{performance['overflow']}</code>\n"
+        f"• Auditoria pendente: <code>{performance['audit_pending']}</code> | "
+        f"persistida: <code>{performance['audit_persisted']}</code>\n"
+        f"• Diagnóstico concluído em: <code>{elapsed_ms:.0f} ms</code>"
+    )
     await reply_or_edit(event, text, delete_after=15)
 
 
@@ -1132,7 +1398,7 @@ async def cmd_help(event):
         "• <code>.antispy</code> (Varredura de Espiões)\n"
         "• <code>.listspy</code> | <code>.delspy</code> (Gestão de Espiões)\n\n"
         "🛠️ <b>UTILITÁRIOS & RELATÓRIOS:</b>\n"
-        "• <code>.status</code> | <code>.health</code> (Diagnóstico rápido)\n"
+        "• <code>.status</code> | <code>.health</code> | <code>.latency</code> (Diagnóstico rápido)\n"
         "• <code>.msg</code> (Broadcast Global)\n"
         "• <code>.chats</code> (Lista de Chats)\n"
         "• <code>.listdn</code> (Punições Globais)\n"
@@ -1384,4 +1650,10 @@ if __name__ == "__main__":
     logger.info("JTZIN USERBOT %s (STATUS E HEALTH) INICIANDO...", VERSION)
     client.start()
     logger.info("USERBOT TELETHON ONLINE!")
-    client.run_until_disconnected()
+    try:
+        client.run_until_disconnected()
+    finally:
+        try:
+            client.loop.run_until_complete(audit_buffer.flush())
+        except Exception as exc:
+            logger.error("Falha no flush final da auditoria: %s", exc)
