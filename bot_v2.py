@@ -46,7 +46,7 @@ PURGEALL_MAX_SCAN = 1200
 PURGEALL_BATCH_SIZE = 50
 DEFAULT_DELETE_AFTER = 5
 STARTED_AT = time.time()
-VERSION = "V6.13"
+VERSION = "V6.14"
 
 DB_PATH = DATA_DIR / "bot.db"
 
@@ -108,7 +108,7 @@ class Cache:
             except sqlite3.OperationalError:
                 pass
 
-            logger.info("Cache carregado com sucesso (V6.12 - Status e Health).")
+            logger.info("Cache carregado com sucesso (%s - filtros de baixa latência).", VERSION)
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
 
@@ -522,22 +522,32 @@ async def log_deleted_in_background(chat_id, user_id, content, reason, admin_id=
         logger.error(f"Falha ao registrar log assíncrono: {exc}")
 
 
-async def delete_security_message(event, chat_id, user_id, content_text, reason):
-    """Exclui e audita uma mensagem bloqueada fora do handler crítico."""
+async def apply_security_restriction(chat_id, user_id):
+    """Aplica a restrição secundária sem atrasar a exclusão da mensagem."""
     try:
-        await event.delete()
+        await client.edit_permissions(chat_id, user_id, view_messages=False)
+    except UserAdminInvalidError:
+        pass
+    except Exception as permission_exc:
+        logger.debug(f"Não foi possível aplicar restrição adicional: {permission_exc}")
+
+
+async def delete_security_message(event, chat_id, user_id, content_text, reason):
+    """Exclui primeiro; auditoria e restrições rodam fora do caminho crítico."""
+    try:
+        # Mensagens recebidas normalmente já carregam input_chat. Usá-lo evita
+        # a busca de diálogos feita por Message.delete() antes do RPC de delete.
+        delete_entity = getattr(event.message, "input_chat", None) or chat_id
+        await client.delete_messages(delete_entity, event.id, revoke=True)
     except Exception as delete_exc:
         logger.error(f"Erro ao apagar mensagem do filtro de segurança: {delete_exc}")
     finally:
-        asyncio.create_task(log_deleted_in_background(chat_id, user_id, content_text, reason))
+        asyncio.create_task(
+            log_deleted_in_background(chat_id, user_id, content_text, reason)
+        )
 
     if reason in ("Global Blacklist", "Local BanPerm"):
-        try:
-            await client.edit_permissions(chat_id, user_id, view_messages=False)
-        except UserAdminInvalidError:
-            pass
-        except Exception as permission_exc:
-            logger.debug(f"Não foi possível aplicar restrição adicional: {permission_exc}")
+        asyncio.create_task(apply_security_restriction(chat_id, user_id))
 
 
 async def reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER):
@@ -687,9 +697,9 @@ async def global_security_filter(event):
 
     if reason:
         content_text = event.text or "[Mídia / Sticker / GIF]"
-        # A exclusão é disparada imediatamente e o handler não espera por
-        # SQLite nem pela aplicação de restrições administrativas adicionais.
-        asyncio.create_task(delete_security_message(event, chat_id, user_id, content_text, reason))
+        # O RPC de exclusão começa neste mesmo handler: não há uma tarefa
+        # intermediária aguardando a próxima rodada do event loop.
+        await delete_security_message(event, chat_id, user_id, content_text, reason)
         raise events.StopPropagation
 
 # --- COMANDOS ---
@@ -1106,7 +1116,7 @@ async def cmd_health(event):
 @client.on(events.NewMessage(pattern=r'^\.help(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
-        "📖 <b>GUIA DE COMANDOS — Jtzin Userbot V6.13</b>\n\n"
+        f"📖 <b>GUIA DE COMANDOS — Jtzin Userbot {VERSION}</b>\n\n"
         "🛡️ <b>MODERAÇÃO LOCAL & REVERSÃO:</b>\n"
         "• <code>.kick</code> | <code>.ban</code> | <code>.unban</code> | <code>.purge [5-100]</code> | <code>.purgeme [5-100]</code>\n"
         "• <code>.purgeall [1-1000]</code> (todos os usuários; somente proprietários)\n"
