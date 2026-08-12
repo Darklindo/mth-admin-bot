@@ -71,7 +71,7 @@ TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
 TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
 TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.19"
+VERSION = "V6.20"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -1390,7 +1390,41 @@ async def cmd_warn(event):
     await reply_or_edit(event, f"⚠️ <b>{db.get_user_info(target_id)}</b> (<code>{target_id}</code>): {result}.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.(?:unwarn|delwarn)(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.delwarn(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_delwarn(event):
+    target = await event.get_reply_message() if getattr(event, "is_reply", False) else None
+    target_id = int(getattr(target, "sender_id", 0) or 0) if target is not None else 0
+    if target is None or not target_id:
+        await reply_or_edit(event, "❌ Responda diretamente à mensagem que deseja apagar e advertir o autor.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if is_immune(target_id):
+        await reply_or_edit(event, "❌ A conta protegida não pode ser advertida.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    deleted = await delete_message_safely(target, "mensagem selecionada pelo .delwarn")
+    if not deleted:
+        await reply_or_edit(event, "❌ Não foi possível apagar a mensagem; a advertência não foi aplicada.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    reason = " ".join((event.raw_text or "").split()[1:]).strip() or "Mensagem removida por moderação"
+    settings = db.get_settings(event.chat_id)
+    count = db.add_warning(event.chat_id, target_id)
+    threshold = max(1, min(int(settings.get("warn_threshold", 3)), 20))
+    action = str(settings.get("warn_action", "mute")).lower()
+    duration = max(60, min(int(settings.get("warn_duration", 600)), MAX_DURATION_SECONDS))
+    if count >= threshold:
+        try:
+            await apply_warning_action(event.chat_id, target_id, action, duration, reason, event.sender_id)
+            db.clear_warnings(event.chat_id, target_id)
+            result = f"limite atingido; {action} aplicado por {duration_label(duration)}"
+        except Exception as exc:
+            logger.debug("Falha na ação automática do .delwarn: %s", exc)
+            result = "limite atingido, mas a ação automática falhou"
+    else:
+        result = f"{count}/{threshold} advertências"
+    queue_audit_log(event.chat_id, target_id, "Ação: Delwarn", reason, admin_id=event.sender_id)
+    await reply_or_edit(event, f"🗑️⚠️ Mensagem de <b>{db.get_user_info(target_id)}</b> apagada e advertência aplicada: {result}.", delete_after=DEFAULT_DELETE_AFTER)
+
+
+@client.on(events.NewMessage(pattern=r'^\.unwarn(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unwarn(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -1929,7 +1963,7 @@ async def cmd_help(event):
         "• <code>.shadow [duração]</code> | <code>.unshadow</code> (global)\n\n"
         "⚠️ <b>ADVERTÊNCIAS & ANTISPAM:</b>\n"
         "• <code>.warn @user motivo</code> | <code>.warns</code>\n"
-        "• <code>.unwarn</code> | <code>.delwarn</code> (remove uma advertência)\n"
+        "• <code>.unwarn</code> (remove uma advertência) | <code>.delwarn</code> (apaga e adverte)\n"
         "• <code>.clearwarns @user</code> (remove todas as advertências)\n"
         "• <code>.antispam on/off</code> | <code>.quarantine on/off</code>\n"
         "• <code>.pinned on/off</code> (protege mensagens fixadas)\n\n"
