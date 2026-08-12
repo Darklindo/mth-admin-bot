@@ -76,7 +76,7 @@ TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
 TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
 TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.29"
+VERSION = "V6.30"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -1401,6 +1401,27 @@ async def reject_moderation_target(event, target_id):
     return False
 
 
+async def reject_fast_moderation_target(event, status_message, target_id, label="resultado da moderação"):
+    """Aplica a validação de alvo sem abandonar a mensagem de status rápido."""
+    if not target_id:
+        await finish_fast_response(
+            event,
+            status_message,
+            "❌ Não encontrei o alvo. Responda à mensagem do usuário ou informe um ID/@username válido.",
+            label=label,
+        )
+        return True
+    if is_immune(target_id):
+        await finish_fast_response(
+            event,
+            status_message,
+            "❌ Este usuário é protegido e não pode ser punido pelo Userbot.",
+            label=label,
+        )
+        return True
+    return False
+
+
 async def get_authorization_target_and_expiry(event):
     """Resolve alvo e duração sem tratar a duração como se fosse um ID."""
     args = event.raw_text.split()[1:]
@@ -2670,20 +2691,42 @@ async def cmd_antiblack(event):
 
 @client.on(events.NewMessage(pattern=r'^\.kick(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_kick(event):
-    target_id = await get_target_from_event(event)
-    if await reject_moderation_target(event, target_id):
+    status_message = await begin_fast_response(
+        event,
+        "⏳ Localizando o alvo e preparando a expulsão...",
+        label="status do kick",
+    )
+    try:
+        target_id = await get_target_from_event(event)
+    except Exception as exc:
+        logger.exception("Erro ao interpretar o comando .kick")
+        await finish_fast_response(
+            event,
+            status_message,
+            f"❌ Não foi possível interpretar o comando: {exc}",
+            label="erro ao interpretar o kick",
+        )
+        return
+    if await reject_fast_moderation_target(event, status_message, target_id, "resultado do kick"):
         return
     try:
+        await _edit_response_now(status_message, "⏳ Aplicando a expulsão...")
         await client.kick_participant(event.chat_id, target_id)
         user_info = db.get_user_info(target_id)
         queue_audit_log(event.chat_id, target_id, "Ação: Kick", "Moderação", admin_id=event.sender_id)
-        await reply_or_edit(event, f"👢 {user_info} (<code>{target_id}</code>) foi expulso.", delete_after=DEFAULT_DELETE_AFTER)
+        await finish_fast_response(
+            event,
+            status_message,
+            f"👢 {user_info} (<code>{target_id}</code>) foi expulso.",
+            label="resultado do kick",
+        )
     except ChatAdminRequiredError:
-        await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
+        await finish_fast_response(event, status_message, "❌ Erro: Não tenho permissão de administrador.", label="erro do kick")
     except UserAdminInvalidError:
-        await reply_or_edit(event, "❌ Erro: Não é possível expulsar outro administrador (hierarquia).", delete_after=DEFAULT_DELETE_AFTER)
-    except Exception as e:
-        await reply_or_edit(event, f"❌ Erro ao expulsar: {e}", delete_after=DEFAULT_DELETE_AFTER)
+        await finish_fast_response(event, status_message, "❌ Erro: Não é possível expulsar outro administrador (hierarquia).", label="erro do kick")
+    except Exception as exc:
+        logger.exception("Erro ao aplicar .kick")
+        await finish_fast_response(event, status_message, f"❌ Erro ao expulsar: {exc}", label="erro do kick")
 
 @client.on(events.NewMessage(pattern=r'^\.ban(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_ban(event):
@@ -2833,39 +2876,79 @@ async def cmd_unban(event):
 
 @client.on(events.NewMessage(pattern=r'^\.mute(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_mute(event):
-    target_id = await get_target_from_event(event)
-    duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
-    if await reject_moderation_target(event, target_id):
+    status_message = await begin_fast_response(
+        event,
+        "⏳ Localizando o alvo e preparando o silêncio...",
+        label="status do mute",
+    )
+    try:
+        target_id = await get_target_from_event(event)
+        duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
+    except Exception as exc:
+        logger.exception("Erro ao interpretar o comando .mute")
+        await finish_fast_response(
+            event,
+            status_message,
+            f"❌ Não foi possível interpretar o comando: {exc}",
+            label="erro ao interpretar o mute",
+        )
+        return
+    if await reject_fast_moderation_target(event, status_message, target_id, "resultado do mute"):
         return
     if duration is not None and duration < MIN_TELEGRAM_TEMP_DURATION_SECONDS:
-        await reply_or_edit(event, "❌ A duração mínima de um mute temporário é de 30 segundos.", delete_after=DEFAULT_DELETE_AFTER)
+        await finish_fast_response(
+            event,
+            status_message,
+            "❌ A duração mínima de um mute temporário é de 30 segundos.",
+            label="resultado do mute",
+        )
         return
     expires_at = int(time.time()) + duration if duration is not None else None
     try:
+        await _edit_response_now(status_message, "⏳ Salvando permissões anteriores e aplicando o silêncio...")
         snapshot = await capture_permission_snapshot(event.chat_id, target_id)
+        if snapshot is None:
+            await finish_fast_response(
+                event,
+                status_message,
+                "❌ Não foi possível capturar as permissões anteriores; o mute não foi aplicado.",
+                label="erro de snapshot do mute",
+            )
+            return
         permission_kwargs = {"send_messages": False}
         if expires_at is not None:
             permission_kwargs["until_date"] = telegram_datetime(expires_at)
         await client.edit_permissions(event.chat_id, target_id, **permission_kwargs)
         if purge_limit:
             await purge_target_messages(event.chat_id, target_id, purge_limit, include_pinned=include_pinned_requested(event))
-        if duration is not None and not db.add_temporary_punishment(event.chat_id, target_id, "mute", int(time.time()) + duration, reason, event.sender_id, previous_permissions=snapshot):
+        if duration is not None and not db.add_temporary_punishment(event.chat_id, target_id, "mute", expires_at, reason, event.sender_id, previous_permissions=snapshot):
             try:
                 await restore_permission_snapshot(event.chat_id, target_id, snapshot, "mute")
             except Exception as restore_exc:
                 logger.error("Falha ao desfazer mute temporário não persistido em %s/%s: %s", event.chat_id, target_id, restore_exc)
-            await reply_or_edit(event, "❌ O mute foi aplicado no Telegram, mas o prazo não pôde ser registrado; a ação foi revertida quando possível.", delete_after=DEFAULT_DELETE_AFTER)
+            await finish_fast_response(
+                event,
+                status_message,
+                "❌ O mute foi aplicado no Telegram, mas o prazo não pôde ser registrado; a ação foi revertida quando possível.",
+                label="erro de registro do mute",
+            )
             return
         user_info = db.get_user_info(target_id)
         queue_audit_log(event.chat_id, target_id, "Ação: Mute", "Moderação", admin_id=event.sender_id)
         suffix = f" por {duration_label(duration)}" if duration is not None else " permanentemente"
-        await reply_or_edit(event, f"🔇 {user_info} (<code>{target_id}</code>) silenciado{suffix}.", delete_after=DEFAULT_DELETE_AFTER)
+        await finish_fast_response(
+            event,
+            status_message,
+            f"🔇 {user_info} (<code>{target_id}</code>) silenciado{suffix}.",
+            label="resultado do mute",
+        )
     except ChatAdminRequiredError:
-        await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
+        await finish_fast_response(event, status_message, "❌ Erro: Não tenho permissão de administrador.", label="erro do mute")
     except UserAdminInvalidError:
-        await reply_or_edit(event, "❌ Erro: Não é possível silenciar outro administrador (hierarquia).", delete_after=DEFAULT_DELETE_AFTER)
-    except Exception as e:
-        await reply_or_edit(event, f"❌ Erro ao silenciar: {e}", delete_after=DEFAULT_DELETE_AFTER)
+        await finish_fast_response(event, status_message, "❌ Erro: Não é possível silenciar outro administrador (hierarquia).", label="erro do mute")
+    except Exception as exc:
+        logger.exception("Erro ao aplicar .mute")
+        await finish_fast_response(event, status_message, f"❌ Erro ao silenciar: {exc}", label="erro do mute")
 
 @client.on(events.NewMessage(pattern=r'^\.unmute(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unmute(event):
