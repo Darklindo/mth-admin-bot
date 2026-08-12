@@ -76,7 +76,7 @@ TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
 TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
 TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.30"
+VERSION = "V6.31"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -101,6 +101,10 @@ class Cache:
         self.antiblack_chats = set()
         self.locked_chats = set()
         self.settings = {}
+        # Evita leituras e gravações SQLite nos filtros de alta frequência.
+        self.settings_loaded = set()
+        self.maintenance_enabled = False
+        self.maintenance_loaded = False
 
     def load_all(self, db_conn):
         try:
@@ -116,6 +120,9 @@ class Cache:
             self.antiblack_chats.clear()
             self.locked_chats.clear()
             self.settings.clear()
+            self.settings_loaded.clear()
+            self.maintenance_enabled = False
+            self.maintenance_loaded = False
 
             now = int(time.time())
             cursor = db_conn.execute(
@@ -178,11 +185,29 @@ class Cache:
                 pass
 
             try:
+                cursor = db_conn.execute("SELECT * FROM settings")
+                for row in cursor.fetchall():
+                    chat_id = int(row["chat_id"])
+                    self.settings[chat_id] = dict(row)
+                    self.settings_loaded.add(chat_id)
+            except (sqlite3.OperationalError, TypeError, KeyError):
+                # Compatibilidade defensiva com bancos de versões anteriores.
+                pass
+
+            try:
                 cursor = db_conn.execute("SELECT chat_id FROM settings WHERE locked=1")
                 self.locked_chats = {int(row[0]) for row in cursor.fetchall()}
             except sqlite3.OperationalError:
                 # Compatibilidade defensiva com bancos de versões anteriores.
                 pass
+
+            try:
+                row = db_conn.execute("SELECT value FROM bot_state WHERE key='maintenance'").fetchone()
+                self.maintenance_enabled = bool(row and str(row[0]) == "1")
+                self.maintenance_loaded = True
+            except sqlite3.OperationalError:
+                self.maintenance_enabled = False
+                self.maintenance_loaded = True
 
             logger.info("Cache carregado com sucesso (%s - filtros de baixa latência).", VERSION)
         except Exception as e:
@@ -471,18 +496,24 @@ class Database:
             (int(chat_id), value), commit=True,
         )
         if cursor is not None:
-            cache.settings.setdefault(int(chat_id), {})[key] = value
+            chat_id = int(chat_id)
+            cache.settings.setdefault(chat_id, {})[key] = value
+            cache.settings_loaded.add(chat_id)
             return True
         return False
 
     def get_settings(self, chat_id):
-        row = self.fetchone("SELECT * FROM settings WHERE chat_id=?", (int(chat_id),))
+        chat_id = int(chat_id)
+        if chat_id in cache.settings_loaded:
+            return dict(cache.settings.get(chat_id, {}))
+        row = self.fetchone("SELECT * FROM settings WHERE chat_id=?", (chat_id,))
         if row is None:
-            self.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (int(chat_id),), commit=True)
-            row = self.fetchone("SELECT * FROM settings WHERE chat_id=?", (int(chat_id),))
+            self.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (chat_id,), commit=True)
+            row = self.fetchone("SELECT * FROM settings WHERE chat_id=?", (chat_id,))
         result = dict(row) if row else {}
-        cache.settings[int(chat_id)] = result
-        return result
+        cache.settings[chat_id] = result
+        cache.settings_loaded.add(chat_id)
+        return dict(result)
 
     def get_chat_lock(self, chat_id):
         row = self.fetchone("SELECT locked, lock_snapshot FROM settings WHERE chat_id=?", (int(chat_id),))
@@ -660,11 +691,23 @@ class Database:
         return rows
 
     def get_active_maintenance(self):
+        if cache.maintenance_loaded:
+            return bool(cache.maintenance_enabled)
         row = self.fetchone("SELECT value FROM bot_state WHERE key='maintenance'")
-        return bool(row and str(row["value"]) == "1")
+        cache.maintenance_enabled = bool(row and str(row["value"]) == "1")
+        cache.maintenance_loaded = True
+        return cache.maintenance_enabled
 
     def set_maintenance(self, enabled):
-        return self.execute("INSERT INTO bot_state(key,value) VALUES('maintenance',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", ("1" if enabled else "0",), commit=True) is not None
+        success = self.execute(
+            "INSERT INTO bot_state(key,value) VALUES('maintenance',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("1" if enabled else "0",), commit=True,
+        ) is not None
+        if success:
+            cache.maintenance_enabled = bool(enabled)
+            cache.maintenance_loaded = True
+        return success
 
     def fetchone(self, query, params=()):
         cursor = self.execute(query, params)
@@ -1679,7 +1722,7 @@ async def temporary_expiry_loop():
 
 
 async def maintenance_guard(event):
-    if not db.get_active_maintenance():
+    if not cache.maintenance_enabled:
         return False
     if is_owner(event.sender_id):
         return False
@@ -1941,9 +1984,9 @@ async def edit_and_delete_safely(message, text, delete_after=DEFAULT_DELETE_AFTE
         edited = True
     except Exception as exc:
         logger.warning("Falha ao editar %s: %s", label, exc)
-    if delete_after:
-        await asyncio.sleep(delete_after)
-    await delete_message_safely(message, label)
+    # Não retenha o handler por vários segundos: a resposta e o comando
+    # serão removidos pelo agendador compartilhado em segundo plano.
+    schedule_response_cleanup(message, message, delete_after, label)
     return edited
 
 
@@ -2091,6 +2134,18 @@ async def chat_lock_filter(event):
     raise events.StopPropagation
 
 
+async def get_settings_async(chat_id):
+    """Obtém settings do cache; a primeira criação é deslocada para uma thread."""
+    chat_id = int(chat_id)
+    if chat_id in cache.settings_loaded:
+        return dict(cache.settings.get(chat_id, {}))
+    try:
+        return await asyncio.to_thread(db.get_settings, chat_id)
+    except Exception as exc:
+        logger.debug("Falha ao carregar settings do chat %s: %s", chat_id, exc)
+        return {}
+
+
 @client.on(events.NewMessage(incoming=True))
 async def antilink_filter(event):
     """Remove links de não administradores sem consultar permissões repetidamente."""
@@ -2099,7 +2154,7 @@ async def antilink_filter(event):
     user_id = event.sender_id
     if not user_id or is_immune(user_id):
         return
-    settings = cache.settings.get(event.chat_id) or db.get_settings(event.chat_id)
+    settings = await get_settings_async(event.chat_id)
     if not int(settings.get("antilink", 0)):
         return
     if not message_contains_link(event.message, event.raw_text or ""):
@@ -2142,6 +2197,38 @@ async def apply_warning_action(chat_id, user_id, action, duration, reason, admin
     raise RuntimeError("não foi possível persistir o prazo da punição automática")
 
 
+_antispam_tasks = set()
+
+
+async def process_antispam_warning(chat_id, user_id, settings, reason):
+    """Persiste advertência e aplica a consequência sem bloquear o dispatcher."""
+    try:
+        count = await asyncio.to_thread(db.add_warning, chat_id, user_id)
+        if count is None:
+            logger.error("Não foi possível persistir advertência automática em %s/%s", chat_id, user_id)
+            return
+        threshold = max(1, min(int(settings.get("warn_threshold", 3)), 20))
+        if count < threshold:
+            return
+        action = str(settings.get("warn_action", "mute")).lower()
+        if action not in {"mute", "ban"}:
+            action = "mute"
+        duration = max(60, min(int(settings.get("warn_duration", 600)), MAX_DURATION_SECONDS))
+        try:
+            await apply_warning_action(chat_id, user_id, action, duration, reason, OWNER_ID)
+            await asyncio.to_thread(db.clear_warnings, chat_id, user_id)
+        except Exception as exc:
+            logger.debug("Falha ao aplicar ação após advertências: %s", exc)
+    except Exception as exc:
+        logger.debug("Falha ao persistir advertência antispam: %s", exc)
+
+
+def schedule_antispam_warning(chat_id, user_id, settings, reason):
+    task = asyncio.create_task(process_antispam_warning(chat_id, user_id, settings, reason))
+    _antispam_tasks.add(task)
+    task.add_done_callback(_antispam_tasks.discard)
+
+
 @client.on(events.NewMessage(incoming=True))
 async def antispam_filter(event):
     """Detecta padrões combinados para reduzir falsos positivos."""
@@ -2154,7 +2241,7 @@ async def antispam_filter(event):
     # mesma exceção e não deve haver punição automática de moderadores.
     if await is_chat_admin(event.chat_id, user_id):
         return
-    settings = cache.settings.get(event.chat_id) or db.get_settings(event.chat_id)
+    settings = await get_settings_async(event.chat_id)
     if not int(settings.get("antispam", 1)):
         return
     now = time.time()
@@ -2250,21 +2337,9 @@ async def antispam_filter(event):
 
     try:
         await delete_security_message(event, event.chat_id, user_id, event.text or "[mídia]", reason)
-        count = db.add_warning(event.chat_id, user_id)
-        if count is None:
-            logger.error("Não foi possível persistir advertência automática em %s/%s", event.chat_id, user_id)
-            return
-        threshold = max(1, min(int(settings.get("warn_threshold", 3)), 20))
-        if count >= threshold:
-            action = str(settings.get("warn_action", "mute")).lower()
-            if action not in {"mute", "ban"}:
-                action = "mute"
-            duration = max(60, min(int(settings.get("warn_duration", 600)), MAX_DURATION_SECONDS))
-            try:
-                await apply_warning_action(event.chat_id, user_id, action, duration, reason, OWNER_ID)
-                db.clear_warnings(event.chat_id, user_id)
-            except Exception as exc:
-                logger.debug("Falha ao aplicar ação após advertências: %s", exc)
+        # A exclusão é aguardada para preservar a prioridade de segurança; a
+        # gravação SQLite e a eventual punição seguem fora do hot path.
+        schedule_antispam_warning(event.chat_id, user_id, settings, reason)
         state["last_action_at"] = now
         for name in ("times", "fingerprints", "links", "media"):
             state[name].clear()
@@ -2276,7 +2351,7 @@ async def antispam_filter(event):
 
 @client.on(events.NewMessage(incoming=True, pattern=r'^\.'))
 async def maintenance_filter(event):
-    if not db.get_active_maintenance() or is_owner(event.sender_id):
+    if not cache.maintenance_enabled or is_owner(event.sender_id):
         return
     command = (event.raw_text or "").split(maxsplit=1)[0].lower()
     if command in {".maintenance", ".status", ".health", ".latency"}:
