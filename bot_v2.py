@@ -86,7 +86,7 @@ TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
 TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
 TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.32"
+VERSION = "V6.33"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -2015,33 +2015,58 @@ async def send_broadcast_payload(chat_id, reply, text=None):
 # --- REGISTRO DE CHATS E USUÁRIOS ---
 registered_chat_ids = set()
 registered_user_ids = set()
+_registering_chat_ids = set()
+_registering_user_ids = set()
+
+
+def _event_entity_without_rpc(event, attribute):
+    """Obtém a entidade anexada ao update sem chamar get_entity/get_dialogs."""
+    try:
+        return getattr(event, attribute, None)
+    except Exception:
+        return None
 
 
 async def register_chat_and_user(event):
+    chat_id = event.chat_id
+    if not chat_id:
+        return
     try:
-        chat_id = event.chat_id
-        if not chat_id:
-            return
         if chat_id not in registered_chat_ids:
-            entity = await event.get_chat()
+            entity = _event_entity_without_rpc(event, "chat")
             if event.is_group:
                 chat_type = "group"
             elif event.is_channel:
                 chat_type = "channel"
             else:
                 chat_type = "private"
-            title = getattr(entity, "title", None) or getattr(entity, "first_name", None) or ""
+            title = (
+                getattr(entity, "title", None)
+                or getattr(entity, "first_name", None)
+                or getattr(event, "chat_title", None)
+                or ""
+            )
+            # O registro é deliberadamente local e não resolve entidades pela rede.
             db.register_chat(chat_id, title, chat_type)
             registered_chat_ids.add(chat_id)
 
         sender_id = event.sender_id
         if sender_id and sender_id not in registered_user_ids:
-            sender = await event.get_sender()
+            # NewMessage normalmente já carrega o remetente no update. Se não
+            # estiver disponível, persiste apenas o ID; nunca faz get_sender()
+            # automaticamente, pois essa resolução pode provocar GetDialogsRequest.
+            sender = _event_entity_without_rpc(event, "sender")
             registered_user_ids.add(sender_id)
             if isinstance(sender, User):
                 db.remember_user(sender.id, sender.username, sender.first_name)
+            else:
+                db.remember_user(sender_id, None, None)
     except Exception as exc:
-        logger.debug(f"Falha não crítica ao registrar chat/usuário: {exc}")
+        logger.debug("Falha não crítica ao registrar chat/usuário: %s", exc)
+    finally:
+        _registering_chat_ids.discard(int(chat_id))
+        if event.sender_id:
+            _registering_user_ids.discard(int(event.sender_id))
 
 
 @client.on(events.NewMessage)
@@ -2058,7 +2083,16 @@ async def chat_registry(event):
             or sender_id in cache.local_banperm.get(chat_id, ())
         ):
             return
-    # Registro é secundário: nunca deve bloquear o filtro de exclusão.
+    # Registro é secundário: nunca deve bloquear o filtro de exclusão. A tarefa
+    # só é criada quando realmente há algo novo para registrar.
+    needs_chat = event.chat_id not in registered_chat_ids and event.chat_id not in _registering_chat_ids
+    needs_user = bool(sender_id and sender_id not in registered_user_ids and sender_id not in _registering_user_ids)
+    if not needs_chat and not needs_user:
+        return
+    if needs_chat:
+        _registering_chat_ids.add(int(event.chat_id))
+    if needs_user:
+        _registering_user_ids.add(int(sender_id))
     asyncio.create_task(register_chat_and_user(event))
 
 
