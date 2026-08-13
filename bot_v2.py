@@ -90,7 +90,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V6.35"
+VERSION = "V6.36"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -119,6 +119,9 @@ class Cache:
         self.settings_loaded = set()
         self.maintenance_enabled = False
         self.maintenance_loaded = False
+        # Identidade aquecida no startup para que .status não faça RPC no caminho comum.
+        self.me = None
+        self.me_loaded = False
 
     def load_all(self, db_conn):
         try:
@@ -137,6 +140,8 @@ class Cache:
             self.settings_loaded.clear()
             self.maintenance_enabled = False
             self.maintenance_loaded = False
+            self.me = None
+            self.me_loaded = False
 
             now = int(time.time())
             cursor = db_conn.execute(
@@ -228,6 +233,21 @@ class Cache:
             logger.error(f"Erro ao carregar cache: {e}")
 
 cache = Cache()
+
+
+async def get_cached_me():
+    """Retorna a identidade local; consulta o Telegram somente no primeiro uso."""
+    if cache.me_loaded:
+        return cache.me
+    try:
+        me = await client.get_me()
+        cache.me = me
+        cache.me_loaded = True
+        return me
+    except Exception:
+        # Permite uma nova tentativa quando a conexão estiver temporariamente indisponível.
+        cache.me_loaded = False
+        return None
 
 # --- BANCO DE DADOS ---
 class Database:
@@ -3610,19 +3630,25 @@ async def cmd_status(event):
     api_latency = "-"
     identity = "não confirmada"
     try:
+        was_cached = cache.me_loaded
         api_started = time.perf_counter()
-        me = await client.get_me()
-        api_latency = f"{(time.perf_counter() - api_started) * 1000:.0f} ms"
+        me = await get_cached_me()
+        if me is None:
+            raise RuntimeError("identidade da sessão indisponível")
+        api_latency = "cache" if was_cached else f"{(time.perf_counter() - api_started) * 1000:.0f} ms"
         identity = escape(str(getattr(me, "username", None) or getattr(me, "first_name", None) or me.id))
-        api_state = "✅ conectada"
+        api_state = "✅ conectada" if not was_cached else "✅ conectada (cache)"
     except (RPCError, asyncio.TimeoutError) as exc:
         logger.warning("Falha ao consultar status da API: %s", exc)
     except Exception as exc:
         logger.warning("Falha inesperada ao consultar status da API: %s", exc)
 
     counts = get_cache_counts()
-    db_counts = db.get_diagnostic_counts()
-    chats = db.all_chats_detailed()
+    db_counts, chats, db_size = await asyncio.gather(
+        asyncio.to_thread(db.get_diagnostic_counts),
+        asyncio.to_thread(db.all_chats_detailed),
+        asyncio.to_thread(db.get_db_size_bytes),
+    )
     active_chats = sum(1 for chat in chats if chat.get("active"))
     text = (
         f"📊 <b>STATUS DO JTZIN USERBOT {VERSION}</b>\n\n"
@@ -3635,7 +3661,7 @@ async def cmd_status(event):
         f"• Autorizados: <code>{counts['authorized']}</code>\n"
         f"• Blacklists: local <code>{counts['local_blacklist']}</code> | global <code>{counts['global_blacklist']}</code>\n"
         f"• Banimentos locais: <code>{counts['local_banperm']}</code> | Shadow: <code>{counts['shadow']}</code>\n"
-        f"• Logs: <code>{db_counts['deleted_logs']}</code> | Banco: <code>{format_bytes(db.get_db_size_bytes())}</code>"
+        f"• Logs: <code>{db_counts['deleted_logs']}</code> | Banco: <code>{format_bytes(db_size)}</code>"
     )
     performance = get_performance_snapshot()
     text += (
@@ -4193,6 +4219,12 @@ if __name__ == "__main__":
     cache.load_all(db.conn)
     logger.info("JTZIN USERBOT %s (STATUS E HEALTH) INICIANDO...", VERSION)
     client.start()
+    try:
+        # Aquece a identidade uma única vez para retirar get_me do comando .status.
+        cache.me = client.loop.run_until_complete(client.get_me())
+        cache.me_loaded = cache.me is not None
+    except Exception as exc:
+        logger.warning("Não foi possível aquecer a identidade da sessão: %s", exc)
     expiry_task = client.loop.create_task(temporary_expiry_loop())
     logger.info("USERBOT TELETHON ONLINE!")
     try:
