@@ -41,6 +41,15 @@ def _env_int(name: str, default: int, minimum: int = 0, maximum: int | None = No
     return min(value, maximum) if maximum is not None else value
 
 
+def _setting_int(settings, key, default, minimum, maximum):
+    """Lê uma configuração inteira com limites, sem deixar valor inválido derrubar filtros."""
+    try:
+        value = int((settings or {}).get(key, default))
+    except (TypeError, ValueError, OverflowError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
 try:
     API_ID = int(_required_env("API_ID"))
     API_HASH = _required_env("API_HASH")
@@ -61,6 +70,7 @@ MIN_TELEGRAM_TEMP_DURATION_SECONDS = 30
 EXPIRATION_CHECK_INTERVAL = _env_int("EXPIRATION_CHECK_INTERVAL", 30, 10, 300)
 SPAM_STATE_MAX_USERS = _env_int("SPAM_STATE_MAX_USERS", 10000, 100, 100000)
 SPAM_ACTION_COOLDOWN = _env_int("SPAM_ACTION_COOLDOWN", 30, 5, 300)
+ALLBAN_CONCURRENCY = _env_int("ALLBAN_CONCURRENCY", 3, 1, 8)
 PURGEALL_MIN_LIMIT = 1
 PURGEALL_MAX_LIMIT = 1000
 PURGEALL_MAX_SCAN = 1200
@@ -76,7 +86,7 @@ TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
 TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
 TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.31"
+VERSION = "V6.32"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -550,7 +560,7 @@ class Database:
     def add_warning(self, chat_id, user_id, now=None):
         now = int(now or time.time())
         settings = self.get_settings(chat_id)
-        window = max(60, int(settings.get("spam_window", 10)) * 6)
+        window = max(60, _setting_int(settings, "spam_window", 10, 5, 120) * 6)
         row = self.fetchone("SELECT count, first_at, last_at FROM warnings WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)))
         if not row or now - int(row["first_at"] or now) > window:
             count, first_at = 1, now
@@ -1365,7 +1375,10 @@ async def restore_permission_snapshot(chat_id, user_id, snapshot=None, action=No
 
 
 LINK_PATTERN = re.compile(
-    r"(?i)(?<![\w@])(?:https?://|www\.|t\.me/|telegram\.me/|telegram\.dog/|tg://)[^\s<>()]+"
+    r"(?i)(?<![\w@])(?:"
+    r"https?://|www\.|t\.me/|telegram\.me/|telegram\.dog/|tg://|"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.(?:com|net|org|io|me|co|dev|app|xyz|info|site|online|link|br|pt|ru|ly|gg|tv|cloud|shop|store)"
+    r")[^\s<>()]+"
 )
 
 
@@ -2155,7 +2168,7 @@ async def antilink_filter(event):
     if not user_id or is_immune(user_id):
         return
     settings = await get_settings_async(event.chat_id)
-    if not int(settings.get("antilink", 0)):
+    if not _setting_int(settings, "antilink", 0, 0, 1):
         return
     if not message_contains_link(event.message, event.raw_text or ""):
         return
@@ -2200,6 +2213,13 @@ async def apply_warning_action(chat_id, user_id, action, duration, reason, admin
 _antispam_tasks = set()
 
 
+def _schedule_antispam_task(coroutine):
+    task = asyncio.create_task(coroutine)
+    _antispam_tasks.add(task)
+    task.add_done_callback(_antispam_tasks.discard)
+    return task
+
+
 async def process_antispam_warning(chat_id, user_id, settings, reason):
     """Persiste advertência e aplica a consequência sem bloquear o dispatcher."""
     try:
@@ -2207,13 +2227,13 @@ async def process_antispam_warning(chat_id, user_id, settings, reason):
         if count is None:
             logger.error("Não foi possível persistir advertência automática em %s/%s", chat_id, user_id)
             return
-        threshold = max(1, min(int(settings.get("warn_threshold", 3)), 20))
+        threshold = _setting_int(settings, "warn_threshold", 3, 1, 20)
         if count < threshold:
             return
-        action = str(settings.get("warn_action", "mute")).lower()
+        action = str((settings or {}).get("warn_action", "mute")).lower()
         if action not in {"mute", "ban"}:
             action = "mute"
-        duration = max(60, min(int(settings.get("warn_duration", 600)), MAX_DURATION_SECONDS))
+        duration = _setting_int(settings, "warn_duration", 600, 60, MAX_DURATION_SECONDS)
         try:
             await apply_warning_action(chat_id, user_id, action, duration, reason, OWNER_ID)
             await asyncio.to_thread(db.clear_warnings, chat_id, user_id)
@@ -2223,15 +2243,25 @@ async def process_antispam_warning(chat_id, user_id, settings, reason):
         logger.debug("Falha ao persistir advertência antispam: %s", exc)
 
 
+async def process_antispam_quarantine(chat_id, user_id, duration, reason):
+    """Aplica a quarentena após a mensagem já ter sido encaminhada para exclusão."""
+    try:
+        await apply_warning_action(chat_id, user_id, "quarantine", duration, reason, OWNER_ID)
+    except Exception as exc:
+        logger.debug("Falha ao aplicar quarentena antispam em %s/%s: %s", chat_id, user_id, exc)
+
+
 def schedule_antispam_warning(chat_id, user_id, settings, reason):
-    task = asyncio.create_task(process_antispam_warning(chat_id, user_id, settings, reason))
-    _antispam_tasks.add(task)
-    task.add_done_callback(_antispam_tasks.discard)
+    return _schedule_antispam_task(process_antispam_warning(chat_id, user_id, settings, reason))
+
+
+def schedule_antispam_quarantine(chat_id, user_id, duration, reason):
+    return _schedule_antispam_task(process_antispam_quarantine(chat_id, user_id, duration, reason))
 
 
 @client.on(events.NewMessage(incoming=True))
 async def antispam_filter(event):
-    """Detecta padrões combinados para reduzir falsos positivos."""
+    """Detecta padrões combinados com limites defensivos e relógio monotônico."""
     if not event.chat_id or not (event.is_group or event.is_channel) or (event.raw_text or "").startswith("."):
         return
     user_id = event.sender_id
@@ -2242,28 +2272,43 @@ async def antispam_filter(event):
     if await is_chat_admin(event.chat_id, user_id):
         return
     settings = await get_settings_async(event.chat_id)
-    if not int(settings.get("antispam", 1)):
+    if not _setting_int(settings, "antispam", 1, 0, 1):
         return
-    now = time.time()
+
+    # time.monotonic() evita que ajustes de relógio do Android distorçam a janela.
+    now = time.monotonic()
     key = (int(event.chat_id), int(user_id))
     state = spam_state.setdefault(
         key,
-        {"times": deque(), "fingerprints": deque(), "links": deque(), "media": deque(), "last_action_at": 0.0},
+        {
+            "times": deque(),
+            "fingerprints": deque(),
+            "links": deque(),
+            "media": deque(),
+            "last_action_at": 0.0,
+            "last_seen": now,
+        },
     )
+    state["last_seen"] = now
     if len(spam_state) > SPAM_STATE_MAX_USERS:
-        oldest_key = next(iter(spam_state), None)
-        if oldest_key is not None and oldest_key != key:
+        oldest_key, _ = min(
+            spam_state.items(),
+            key=lambda item: float(item[1].get("last_seen", 0.0)),
+        )
+        if oldest_key != key:
             spam_state.pop(oldest_key, None)
-    window = max(5, min(int(settings.get("spam_window", 10)), 120))
+
+    window = _setting_int(settings, "spam_window", 10, 5, 120)
     cutoff = now - window
     for name in ("times", "fingerprints", "links", "media"):
         while state[name] and state[name][0][0] < cutoff:
             state[name].popleft()
+
     text = (event.raw_text or "").strip()
     fingerprint = hashlib.sha1(
-        re.sub(r"\s+", " ", text.lower()).encode("utf-8", "ignore")
+        re.sub(r"\s+", " ", text.casefold()).encode("utf-8", "ignore")
     ).hexdigest() if text else ""
-    link_count = len(re.findall(r"(?:https?://|t\.me/|www\.)[^\s<>()]+", text.lower()))
+    link_count = len(re.findall(r"(?:https?://|t\.me/|www\.)[^\s<>()]+", text.casefold()))
     has_media = bool(getattr(event.message, "media", None))
     state["times"].append((now, event.id))
     if fingerprint:
@@ -2273,10 +2318,10 @@ async def antispam_filter(event):
     if has_media:
         state["media"].append((now, True))
 
-    frequency_limit = max(2, min(int(settings.get("spam_limit", 6)), 100))
-    duplicate_limit = max(2, min(int(settings.get("duplicate_limit", 3)), 20))
-    link_limit = max(2, min(int(settings.get("link_limit", 3)), 20))
-    media_limit = max(2, min(int(settings.get("media_limit", 5)), 50))
+    frequency_limit = _setting_int(settings, "spam_limit", 6, 2, 100)
+    duplicate_limit = _setting_int(settings, "duplicate_limit", 3, 2, 20)
+    link_limit = _setting_int(settings, "link_limit", 3, 2, 20)
+    media_limit = _setting_int(settings, "media_limit", 5, 2, 50)
     same_text = sum(1 for _, value in state["fingerprints"] if fingerprint and value == fingerprint)
     frequency_count = len(state["times"])
     link_count_window = len(state["links"])
@@ -2298,41 +2343,41 @@ async def antispam_filter(event):
         score += min(4, 2 + max(0, media_count_window - media_limit))
         signals.append(f"mídia em rajada ({media_count_window})")
 
-    score_threshold = max(2, min(int(settings.get("spam_score_threshold", 4)), 12))
-    quarantine_threshold = max(score_threshold, min(int(settings.get("quarantine_score_threshold", 6)), 16))
+    score_threshold = _setting_int(settings, "spam_score_threshold", 4, 2, 12)
+    quarantine_threshold = max(
+        score_threshold,
+        _setting_int(settings, "quarantine_score_threshold", 6, 2, 16),
+    )
     if not signals or score < score_threshold:
         return
-    # Uma única ocorrência acima do limite não basta para quarentena. Exigimos
-    # dois sinais independentes ou uma rajada claramente anormal.
+
+    # Uma única mensagem nunca é suficiente. Exigimos dois sinais independentes
+    # ou uma rajada claramente anormal antes de excluir e advertir.
     strong_pattern = (
         len(signals) >= 2
         or frequency_count >= frequency_limit * 2
         or same_text >= duplicate_limit + 2
         or media_count_window >= media_limit * 2
     )
-    # Um sinal isolado pode representar uso normal (por exemplo, várias
-    # imagens legítimas). Nenhuma ação automática ocorre sem padrão forte.
     if not strong_pattern:
         return
     reason = f"Antispam ({score} pontos): " + ", ".join(signals)
     if now - float(state.get("last_action_at", 0.0)) < SPAM_ACTION_COOLDOWN:
         return
 
-    if int(settings.get("quarantine_enabled", 0)):
+    if _setting_int(settings, "quarantine_enabled", 0, 0, 1):
         if score < quarantine_threshold:
-            # Mantém o evento sem punição quando a evidência combinada ainda
-            # não atingiu o patamar de quarentena.
             logger.debug("Sinal antispam abaixo da quarentena em %s/%s: %s", event.chat_id, user_id, reason)
             return
-        duration = max(60, min(int(settings.get("quarantine_duration", 600)), MAX_DURATION_SECONDS))
+        duration = _setting_int(settings, "quarantine_duration", 600, 60, MAX_DURATION_SECONDS)
         try:
             await delete_security_message(event, event.chat_id, user_id, event.text or "[mídia]", reason)
-            await apply_warning_action(event.chat_id, user_id, "quarantine", duration, reason, OWNER_ID)
+            schedule_antispam_quarantine(event.chat_id, user_id, duration, reason)
             state["last_action_at"] = now
             for name in ("times", "fingerprints", "links", "media"):
                 state[name].clear()
         except Exception as exc:
-            logger.debug("Falha na quarentena antispam: %s", exc)
+            logger.debug("Falha ao encaminhar a quarentena antispam: %s", exc)
         return
 
     try:
@@ -2615,9 +2660,11 @@ async def cmd_warn(event):
     if count is None:
         await reply_or_edit(event, "❌ Não foi possível registrar a advertência no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    threshold = max(1, min(int(settings.get("warn_threshold", 3)), 20))
+    threshold = _setting_int(settings, "warn_threshold", 3, 1, 20)
     action = str(settings.get("warn_action", "mute")).lower()
-    duration = max(60, min(int(settings.get("warn_duration", 600)), MAX_DURATION_SECONDS))
+    if action not in {"mute", "ban"}:
+        action = "mute"
+    duration = _setting_int(settings, "warn_duration", 600, 60, MAX_DURATION_SECONDS)
     if count >= threshold:
         try:
             await apply_warning_action(event.chat_id, target_id, action, duration, reason or "Limite de advertências", event.sender_id)
@@ -2655,9 +2702,11 @@ async def cmd_delwarn(event):
     if count is None:
         await reply_or_edit(event, "❌ Não foi possível registrar a advertência no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    threshold = max(1, min(int(settings.get("warn_threshold", 3)), 20))
+    threshold = _setting_int(settings, "warn_threshold", 3, 1, 20)
     action = str(settings.get("warn_action", "mute")).lower()
-    duration = max(60, min(int(settings.get("warn_duration", 600)), MAX_DURATION_SECONDS))
+    if action not in {"mute", "ban"}:
+        action = "mute"
+    duration = _setting_int(settings, "warn_duration", 600, 60, MAX_DURATION_SECONDS)
     if count >= threshold:
         try:
             await apply_warning_action(event.chat_id, target_id, action, duration, reason, event.sender_id)
@@ -3177,71 +3226,195 @@ async def cmd_unshadow(event):
     user_info = db.get_user_info(target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) saiu das sombras.", delete_after=DEFAULT_DELETE_AFTER)
 
+async def _apply_allban_to_chat(chat, target_id, expires_at, purge_limit, include_pinned, semaphore):
+    """Aplica allban em um chat com snapshot-before-action e rollback seguro."""
+    chat_id = int(chat["chat_id"])
+    async with semaphore:
+        try:
+            snapshot = await capture_permission_snapshot(chat_id, target_id)
+            if snapshot is None:
+                return False, "snapshot indisponível"
+
+            permission_kwargs = {"view_messages": False}
+            if expires_at is not None:
+                permission_kwargs["until_date"] = telegram_datetime(expires_at)
+
+            applied = False
+            for attempt in range(2):
+                try:
+                    await client.edit_permissions(chat_id, target_id, **permission_kwargs)
+                    applied = True
+                    break
+                except FloodWaitError as exc:
+                    if attempt:
+                        raise
+                    await asyncio.sleep(exc.seconds)
+            if not applied:
+                return False, "permissão não aplicada"
+
+            snapshot_saved = await asyncio.to_thread(
+                db.add_global_ban_snapshot, target_id, chat_id, snapshot
+            )
+            if not snapshot_saved:
+                try:
+                    await restore_permission_snapshot(chat_id, target_id, snapshot, "ban")
+                except Exception as restore_exc:
+                    logger.error(
+                        "Falha ao desfazer allban sem snapshot em %s/%s: %s",
+                        chat_id,
+                        target_id,
+                        restore_exc,
+                    )
+                return False, "snapshot não persistido; rollback executado"
+
+            purge_note = ""
+            if purge_limit:
+                try:
+                    await purge_target_messages(
+                        chat_id,
+                        target_id,
+                        purge_limit,
+                        include_pinned=include_pinned,
+                    )
+                except Exception as purge_exc:
+                    # A punição permanece aplicada; a limpeza é opcional e
+                    # não deve transformar um banimento bem-sucedido em falha.
+                    purge_note = "limpeza parcial"
+                    logger.debug("Falha na limpeza do allban em %s/%s: %s", chat_id, target_id, purge_exc)
+            return True, purge_note
+        except FloodWaitError as exc:
+            return False, f"FloodWait de {exc.seconds}s"
+        except (RPCError, ValueError, TypeError) as exc:
+            logger.debug("Falha controlada no allban em %s/%s: %s", chat_id, target_id, exc)
+            return False, type(exc).__name__
+        except Exception as exc:
+            logger.debug("Falha inesperada no allban em %s/%s: %s", chat_id, target_id, exc)
+            return False, type(exc).__name__
+
+
 @client.on(events.NewMessage(pattern=r'^\.allban(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_allban(event):
+    status = await begin_fast_response(
+        event,
+        "⏳ Allban: validando alvo e preparando a aplicação global...",
+        label="status do allban",
+    )
     target_id = await get_target_from_event(event)
+    if await reject_fast_moderation_target(event, status, target_id, label="resultado do allban"):
+        return
+
     duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
-    if await reject_moderation_target(event, target_id):
-        return
     if duration is not None and duration < MIN_TELEGRAM_TEMP_DURATION_SECONDS:
-        await reply_or_edit(event, "❌ A duração mínima de um allban temporário é de 30 segundos.", delete_after=DEFAULT_DELETE_AFTER)
+        await finish_fast_response(
+            event,
+            status,
+            "❌ A duração mínima de um allban temporário é de 30 segundos.",
+            label="resultado do allban",
+        )
         return
+
     expires_at = int(time.time()) + duration if duration is not None else None
-    previous_global = db.get_global_blacklist_record(target_id)
-    if not db.add_global_blacklist(target_id, 'ban', reason, expires_at=expires_at):
-        await reply_or_edit(event, "❌ Não foi possível registrar o banimento global no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
+    previous_global = await asyncio.to_thread(db.get_global_blacklist_record, target_id)
+    if previous_global and str(previous_global.get("type") or "").lower() == "ban":
+        await finish_fast_response(
+            event,
+            status,
+            "ℹ️ Este usuário já possui um allban ativo. Use <code>.unallblack</code> antes de iniciar outro ciclo global.",
+            label="resultado do allban",
+        )
         return
-    chats = db.all_chats_detailed()
-    # Marca que este registro foi criado pelo fluxo atual. Assim, se
-    # nenhum chat puder ser punido, a expiração não usa o fallback legado e
-    # não remove banimentos preexistentes em chats não atingidos.
-    if not db.add_global_ban_snapshot(target_id, 0, None):
+
+    if not await asyncio.to_thread(db.add_global_blacklist, target_id, "ban", reason, expires_at):
+        await finish_fast_response(
+            event,
+            status,
+            "❌ Não foi possível registrar o banimento global no banco de dados.",
+            label="resultado do allban",
+        )
+        return
+
+    # Ao converter uma blacklist global ou recuperar de uma execução incompleta,
+    # os snapshots anteriores não podem contaminar o novo ciclo de restauração.
+    if await asyncio.to_thread(db.clear_global_ban_snapshots, target_id) < 0:
         if previous_global:
-            if not db.restore_global_blacklist_record(previous_global):
-                logger.critical("Falha ao restaurar o registro global anterior de %s após erro de snapshot", target_id)
-        elif not db.remove_global_blacklist(target_id):
-            logger.critical("Falha ao desfazer allban parcialmente persistido de %s", target_id)
-        await reply_or_edit(event, "❌ Não foi possível inicializar o controle de restauração global.", delete_after=DEFAULT_DELETE_AFTER)
+            await asyncio.to_thread(db.restore_global_blacklist_record, previous_global)
+        else:
+            await asyncio.to_thread(db.remove_global_blacklist, target_id)
+        await finish_fast_response(
+            event,
+            status,
+            "❌ Não foi possível preparar o controle de restauração global.",
+            label="resultado do allban",
+        )
         return
-    count = 0
-    for chat in chats:
-        chat_type = str(chat.get('chat_type') or '').lower()
-        if not chat.get('active') or chat_type not in {'group', 'supergroup', 'channel', 'chat'}:
-            continue
-        try:
-            snapshot = await capture_permission_snapshot(chat['chat_id'], target_id)
-            if snapshot is None:
-                logger.warning("Snapshot indisponível; allban não aplicado no chat %s/%s", chat['chat_id'], target_id)
-                continue
-            permission_kwargs = {"view_messages": False}
-            if duration is not None:
-                permission_kwargs["until_date"] = telegram_datetime(expires_at)
-            await client.edit_permissions(chat['chat_id'], target_id, **permission_kwargs)
-            if not db.add_global_ban_snapshot(target_id, chat['chat_id'], snapshot):
-                try:
-                    await restore_permission_snapshot(chat['chat_id'], target_id, snapshot, "ban")
-                except Exception as restore_exc:
-                    logger.error("Falha ao desfazer allban sem snapshot em %s/%s: %s", chat['chat_id'], target_id, restore_exc)
-                continue
-            if purge_limit:
-                await purge_target_messages(
-                    chat['chat_id'],
-                    target_id,
-                    purge_limit,
-                    include_pinned=include_pinned_requested(event),
-                )
-            # A expiração do allban é controlada pelo registro global; o
-            # snapshot por chat evita punições duplicadas e restauração indevida.
-            count += 1
-            await asyncio.sleep(0.05)
-        except FloodWaitError as e:
-            await asyncio.sleep(e.seconds)
-        except Exception as exc:
-            logger.debug(f"Falha ao aplicar ação global no chat: {exc}")
-            continue
-    user_info = db.get_user_info(target_id)
-    queue_audit_log(event.chat_id, target_id, f"Ação: Allban ({count} chats)", "Moderação Global", admin_id=event.sender_id)
-    await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) banido globalmente em {count} chats.", delete_after=DEFAULT_DELETE_AFTER)
+
+    if not await asyncio.to_thread(db.add_global_ban_snapshot, target_id, 0, None):
+        if previous_global:
+            await asyncio.to_thread(db.restore_global_blacklist_record, previous_global)
+        else:
+            await asyncio.to_thread(db.remove_global_blacklist, target_id)
+        await finish_fast_response(
+            event,
+            status,
+            "❌ Não foi possível inicializar os snapshots do banimento global.",
+            label="resultado do allban",
+        )
+        return
+
+    chats = await asyncio.to_thread(db.all_chats_detailed)
+    eligible_chats = [
+        chat for chat in chats
+        if chat.get("active")
+        and str(chat.get("chat_type") or "").lower()
+        in {"group", "supergroup", "channel", "chat"}
+    ]
+    if not eligible_chats:
+        user_info = await asyncio.to_thread(db.get_user_info, target_id)
+        queue_audit_log(event.chat_id, target_id, "Ação: Allban (0 chats)", "Moderação Global", admin_id=event.sender_id)
+        await finish_fast_response(
+            event,
+            status,
+            f"⚠️ {user_info} (<code>{target_id}</code>) foi registrado globalmente, mas não há chats ativos aplicáveis.",
+            label="resultado do allban",
+        )
+        return
+
+    semaphore = asyncio.Semaphore(ALLBAN_CONCURRENCY)
+    results = await asyncio.gather(
+        *(
+            _apply_allban_to_chat(
+                chat,
+                target_id,
+                expires_at,
+                purge_limit,
+                include_pinned_requested(event),
+                semaphore,
+            )
+            for chat in eligible_chats
+        ),
+        return_exceptions=False,
+    )
+    applied = sum(1 for ok, _ in results if ok)
+    failed = len(results) - applied
+    partial_cleanup = sum(1 for ok, note in results if ok and note)
+    user_info = await asyncio.to_thread(db.get_user_info, target_id)
+    queue_audit_log(
+        event.chat_id,
+        target_id,
+        f"Ação: Allban ({applied}/{len(results)} chats)",
+        "Moderação Global",
+        admin_id=event.sender_id,
+    )
+    if failed:
+        result_text = (
+            f"⚠️ {user_info} (<code>{target_id}</code>) aplicado em {applied}/{len(results)} chats. "
+            f"Falhas: {failed}. A blacklist global permanece ativa e pode ser reprocessada após a correção das permissões."
+        )
+    else:
+        result_text = f"✅ {user_info} (<code>{target_id}</code>) banido globalmente em {applied} chats."
+    if partial_cleanup:
+        result_text += f" Limpeza opcional com falhas parciais: {partial_cleanup}."
+    await finish_fast_response(event, status, result_text, label="resultado do allban")
 
 @client.on(events.NewMessage(pattern=r'^\.allblack(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_allblack(event):
@@ -3876,7 +4049,7 @@ async def cmd_infojt(event):
         warning_data = db.get_warning(event.chat_id, target_id)
         settings = db.get_settings(event.chat_id) or {}
         try:
-            threshold = max(1, min(int(settings.get("warn_threshold", 3)), 20))
+            threshold = _setting_int(settings, "warn_threshold", 3, 1, 20)
         except (TypeError, ValueError):
             threshold = 3
         if warning_data is None:
