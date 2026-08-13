@@ -6,6 +6,7 @@ import asyncio
 import re
 import hashlib
 import json
+import unicodedata
 import logging
 from collections import defaultdict, deque
 import threading
@@ -90,7 +91,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V6.36"
+VERSION = "V6.37"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -765,6 +766,34 @@ class Database:
             return escape(str(display))
         return str(user_id)
 
+    def get_user_info_many(self, user_ids):
+        """Resolve vários usuários com uma única consulta, preservando a ordem."""
+        ordered_ids = []
+        seen = set()
+        for value in user_ids or ():
+            try:
+                user_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if user_id not in seen:
+                seen.add(user_id)
+                ordered_ids.append(user_id)
+        if not ordered_ids:
+            return {}
+        placeholders = ",".join("?" for _ in ordered_ids)
+        rows = self.fetchall(
+            f"SELECT user_id, username, first_name FROM users WHERE user_id IN ({placeholders})",
+            tuple(ordered_ids),
+        )
+        resolved = {}
+        for row in rows:
+            user_id = int(row["user_id"])
+            display = f"@{row['username']}" if row["username"] else (row["first_name"] or str(user_id))
+            resolved[user_id] = escape(str(display))
+        for user_id in ordered_ids:
+            resolved.setdefault(user_id, str(user_id))
+        return resolved
+
     def get_all_banned_list_detailed(self):
         shadow = self.fetchall("SELECT user_id, reason, created_at FROM shadow_ban ORDER BY created_at DESC")
         glob = self.fetchall("SELECT user_id, type, reason, created_at FROM global_blacklist ORDER BY created_at DESC")
@@ -1400,21 +1429,43 @@ async def restore_permission_snapshot(chat_id, user_id, snapshot=None, action=No
 
 LINK_PATTERN = re.compile(
     r"(?i)(?<![\w@])(?:"
-    r"https?://|www\.|t\.me/|telegram\.me/|telegram\.dog/|tg://|"
-    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.(?:com|net|org|io|me|co|dev|app|xyz|info|site|online|link|br|pt|ru|ly|gg|tv|cloud|shop|store)"
+    r"https?://|hxxps?://|www\.|t\.me/|telegram\.me/|telegram\.dog/|tg://|"
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,24}|xn--[a-z0-9-]{2,59})"
     r")[^\s<>()]+"
 )
 
+_OBFUSCATED_DOT_PATTERN = re.compile(
+    r"(?i)\s*(?:\[\s*\.\s*\]|\(\s*(?:dot|ponto|\.)\s*\)|"
+    r"\[\s*(?:dot|ponto)\s*\]|\{\s*(?:dot|ponto)\s*\})\s*"
+)
+_ZERO_WIDTH_PATTERN = re.compile(r"[\u200b-\u200f\u2060\ufeff]")
+_LINK_ENTITY_NAMES = {"MessageEntityUrl", "MessageEntityTextUrl"}
+
+
+def normalize_link_text(text):
+    """Normaliza obfuscações comuns sem remover espaços de texto normal."""
+    normalized = unicodedata.normalize("NFKC", text or "")
+    normalized = _ZERO_WIDTH_PATTERN.sub("", normalized)
+    normalized = re.sub(r"(?i)\bhxxps?://", "https://", normalized)
+    normalized = _OBFUSCATED_DOT_PATTERN.sub(".", normalized)
+    return normalized
+
+
+def count_message_links(message, text=None):
+    """Conta links visíveis e entidades de URL sem contar a mesma URL duas vezes."""
+    raw_text = text if text is not None else getattr(message, "raw_text", "") or ""
+    normalized = normalize_link_text(raw_text)
+    visible_count = len(LINK_PATTERN.findall(normalized))
+    entity_count = sum(
+        1 for entity in getattr(message, "entities", None) or ()
+        if type(entity).__name__ in _LINK_ENTITY_NAMES
+    )
+    return max(visible_count, entity_count)
+
 
 def message_contains_link(message, text=None):
-    """Detecta URLs visíveis e links ocultos em MessageEntityTextUrl."""
-    text = text if text is not None else getattr(message, "raw_text", "") or ""
-    if LINK_PATTERN.search(text):
-        return True
-    for entity in getattr(message, "entities", None) or ():
-        if type(entity).__name__ in {"MessageEntityUrl", "MessageEntityTextUrl"}:
-            return True
-    return False
+    """Detecta URLs modernas, obfuscadas e links ocultos em entidades do Telegram."""
+    return count_message_links(message, text) > 0
 
 
 async def get_target_from_event(event):
@@ -1720,7 +1771,7 @@ async def temporary_expiry_loop():
                 except Exception as exc:
                     logger.debug("Falha ao restaurar banperm expirado; será tentado novamente: %s", exc)
                 else:
-                    if not db.remove_local_banperm(row["chat_id"], row["user_id"]):
+                    if not await asyncio.to_thread(db.remove_local_banperm, row["chat_id"], row["user_id"]):
                         logger.error("Banperm expirado restaurado, mas não removido do banco: %s/%s", row["chat_id"], row["user_id"])
             for row in expired_global:
                 row_type = str(row["type"] or "").lower()
@@ -2374,7 +2425,7 @@ async def antispam_filter(event):
     fingerprint = hashlib.sha1(
         re.sub(r"\s+", " ", text.casefold()).encode("utf-8", "ignore")
     ).hexdigest() if text else ""
-    link_count = len(re.findall(r"(?:https?://|t\.me/|www\.)[^\s<>()]+", text.casefold()))
+    link_count = count_message_links(event.message, text)
     has_media = bool(getattr(event.message, "media", None))
     state["times"].append((now, event.id))
     if fingerprint:
@@ -2566,11 +2617,12 @@ async def cmd_quarantine(event):
         return
     args = (event.raw_text or "").split()
     if len(args) < 2 or args[1].lower() not in {"on", "off", "1", "0"}:
-        status = bool(db.get_settings(event.chat_id).get("quarantine_enabled", 0))
+        settings = await get_settings_async(event.chat_id)
+        status = bool(_setting_int(settings, "quarantine_enabled", 0, 0, 1))
         await reply_or_edit(event, f"Quarentena: <b>{'ATIVADA' if status else 'DESATIVADA'}</b>. Use <code>.quarantine on|off</code>.", delete_after=DEFAULT_DELETE_AFTER)
         return
     enabled = args[1].lower() in {"on", "1"}
-    if not db.set_setting(event.chat_id, "quarantine_enabled", int(enabled)):
+    if not await asyncio.to_thread(db.set_setting, event.chat_id, "quarantine_enabled", int(enabled)):
         await reply_or_edit(event, "❌ Não foi possível atualizar a quarentena no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
     await reply_or_edit(event, f"🛡️ Quarentena antispam <b>{'ATIVADA' if enabled else 'DESATIVADA'}</b> neste chat.", delete_after=DEFAULT_DELETE_AFTER)
@@ -2582,11 +2634,12 @@ async def cmd_antispam_new(event):
         return
     args = (event.raw_text or "").split()
     if len(args) < 2 or args[1].lower() not in {"on", "off", "1", "0"}:
-        status = bool(db.get_settings(event.chat_id).get("antispam", 1))
+        settings = await get_settings_async(event.chat_id)
+        status = bool(_setting_int(settings, "antispam", 1, 0, 1))
         await reply_or_edit(event, f"Antispam: <b>{'ATIVADO' if status else 'DESATIVADO'}</b>. Use <code>.antispam on|off</code>.", delete_after=DEFAULT_DELETE_AFTER)
         return
     enabled = args[1].lower() in {"on", "1"}
-    if not db.set_setting(event.chat_id, "antispam", int(enabled)):
+    if not await asyncio.to_thread(db.set_setting, event.chat_id, "antispam", int(enabled)):
         await reply_or_edit(event, "❌ Não foi possível atualizar o antispam no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
     await reply_or_edit(event, f"🛡️ Antispam <b>{'ATIVADO' if enabled else 'DESATIVADO'}</b> neste chat.", delete_after=DEFAULT_DELETE_AFTER)
@@ -2598,11 +2651,12 @@ async def cmd_pinned(event):
         return
     args = (event.raw_text or "").split()
     if len(args) < 2 or args[1].lower() not in {"on", "off", "1", "0"}:
-        status = bool(db.get_settings(event.chat_id).get("protect_pinned", 1))
+        settings = await get_settings_async(event.chat_id)
+        status = bool(_setting_int(settings, "protect_pinned", 1, 0, 1))
         await reply_or_edit(event, f"Proteção de fixadas: <b>{'ATIVADA' if status else 'DESATIVADA'}</b>.", delete_after=DEFAULT_DELETE_AFTER)
         return
     enabled = args[1].lower() in {"on", "1"}
-    if not db.set_setting(event.chat_id, "protect_pinned", int(enabled)):
+    if not await asyncio.to_thread(db.set_setting, event.chat_id, "protect_pinned", int(enabled)):
         await reply_or_edit(event, "❌ Não foi possível atualizar a proteção de fixadas no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
     await reply_or_edit(event, f"📌 Proteção de mensagens fixadas <b>{'ATIVADA' if enabled else 'DESATIVADA'}</b>.", delete_after=DEFAULT_DELETE_AFTER)
@@ -2618,7 +2672,8 @@ async def cmd_antilink(event):
         return
     args = (event.raw_text or "").split()
     if len(args) < 2 or args[1].lower() not in {"on", "off", "1", "0"}:
-        status = bool(db.get_settings(event.chat_id).get("antilink", 0))
+        settings = await get_settings_async(event.chat_id)
+        status = bool(_setting_int(settings, "antilink", 0, 0, 1))
         await reply_or_edit(
             event,
             f"🔗 Antilink: <b>{'ATIVADO' if status else 'DESATIVADO'}</b>. Use <code>.antilink on|off</code>.",
@@ -2626,7 +2681,7 @@ async def cmd_antilink(event):
         )
         return
     enabled = args[1].lower() in {"on", "1"}
-    if not db.set_setting(event.chat_id, "antilink", int(enabled)):
+    if not await asyncio.to_thread(db.set_setting, event.chat_id, "antilink", int(enabled)):
         await reply_or_edit(event, "❌ Não foi possível atualizar o antilink no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
     await reply_or_edit(
@@ -2648,13 +2703,14 @@ async def cmd_autorizarlink(event):
     if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Informe um usuário válido por resposta, ID ou username.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    if not db.add_link_authorized(event.chat_id, target_id):
+    if not await asyncio.to_thread(db.add_link_authorized, event.chat_id, target_id):
         await reply_or_edit(event, "❌ Não foi possível atualizar a autorização de links no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
     queue_audit_log(event.chat_id, target_id, "Ação: AutorizarLink", "Usuário autorizado a enviar links", admin_id=event.sender_id)
+    user_info = await asyncio.to_thread(db.get_user_info, target_id)
     await reply_or_edit(
         event,
-        f"✅ <b>{db.get_user_info(target_id)}</b> (<code>{target_id}</code>) poderá enviar links neste chat.",
+        f"✅ <b>{user_info}</b> (<code>{target_id}</code>) poderá enviar links neste chat.",
         delete_after=DEFAULT_DELETE_AFTER,
     )
 
@@ -2671,13 +2727,14 @@ async def cmd_desautorizarlink(event):
     if not target_id:
         await reply_or_edit(event, "❌ Informe um usuário por resposta, ID ou username.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    if not db.remove_link_authorized(event.chat_id, target_id):
+    if not await asyncio.to_thread(db.remove_link_authorized, event.chat_id, target_id):
         await reply_or_edit(event, "❌ Não foi possível remover a autorização de links no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
     queue_audit_log(event.chat_id, target_id, "Ação: DesautorizarLink", "Autorização de links removida", admin_id=event.sender_id)
+    user_info = await asyncio.to_thread(db.get_user_info, target_id)
     await reply_or_edit(
         event,
-        f"✅ Autorização de links removida de <b>{db.get_user_info(target_id)}</b> (<code>{target_id}</code>).",
+        f"✅ Autorização de links removida de <b>{user_info}</b> (<code>{target_id}</code>).",
         delete_after=DEFAULT_DELETE_AFTER,
     )
 
@@ -2694,7 +2751,9 @@ async def cmd_listlinkauth(event):
     if not users:
         text = "🔗 Nenhum usuário autorizado a enviar links neste chat."
     else:
-        rows = [f"• {escape(db.get_user_info(user_id))} (<code>{user_id}</code>)" for user_id in users[:100]]
+        visible_users = users[:100]
+        user_info = await asyncio.to_thread(db.get_user_info_many, visible_users)
+        rows = [f"• {user_info.get(user_id, str(user_id))} (<code>{user_id}</code>)" for user_id in visible_users]
         suffix = f"\n\nExibindo 100 de {len(users)}." if len(users) > 100 else ""
         text = "🔗 <b>Usuários autorizados a enviar links</b>\n" + "\n".join(rows) + suffix
     await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
@@ -2721,8 +2780,8 @@ async def cmd_warn(event):
     _, _, reason = parse_moderation_options(event)
     if await reject_moderation_target(event, target_id):
         return
-    settings = db.get_settings(event.chat_id)
-    count = db.add_warning(event.chat_id, target_id)
+    settings = await get_settings_async(event.chat_id)
+    count = await asyncio.to_thread(db.add_warning, event.chat_id, target_id)
     if count is None:
         await reply_or_edit(event, "❌ Não foi possível registrar a advertência no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
@@ -2734,7 +2793,7 @@ async def cmd_warn(event):
     if count >= threshold:
         try:
             await apply_warning_action(event.chat_id, target_id, action, duration, reason or "Limite de advertências", event.sender_id)
-            cleared = db.clear_warnings(event.chat_id, target_id)
+            cleared = await asyncio.to_thread(db.clear_warnings, event.chat_id, target_id)
             if cleared < 0:
                 result = f"limite atingido; {action} aplicado por {duration_label(duration)}, mas a limpeza das advertências falhou"
             else:
@@ -2745,7 +2804,8 @@ async def cmd_warn(event):
     else:
         result = f"{count}/{threshold} advertências"
     queue_audit_log(event.chat_id, target_id, "Ação: Warn", reason or "Advertência", admin_id=event.sender_id)
-    await reply_or_edit(event, f"⚠️ <b>{db.get_user_info(target_id)}</b> (<code>{target_id}</code>): {result}.", delete_after=DEFAULT_DELETE_AFTER)
+    user_info = await asyncio.to_thread(db.get_user_info, target_id)
+    await reply_or_edit(event, f"⚠️ <b>{user_info}</b> (<code>{target_id}</code>): {result}.", delete_after=DEFAULT_DELETE_AFTER)
 
 
 @client.on(events.NewMessage(pattern=r'^\.delwarn(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
@@ -2763,8 +2823,8 @@ async def cmd_delwarn(event):
         await reply_or_edit(event, "❌ Não foi possível apagar a mensagem; a advertência não foi aplicada.", delete_after=DEFAULT_DELETE_AFTER)
         return
     reason = " ".join((event.raw_text or "").split()[1:]).strip() or "Mensagem removida por moderação"
-    settings = db.get_settings(event.chat_id)
-    count = db.add_warning(event.chat_id, target_id)
+    settings = await get_settings_async(event.chat_id)
+    count = await asyncio.to_thread(db.add_warning, event.chat_id, target_id)
     if count is None:
         await reply_or_edit(event, "❌ Não foi possível registrar a advertência no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
@@ -2776,7 +2836,7 @@ async def cmd_delwarn(event):
     if count >= threshold:
         try:
             await apply_warning_action(event.chat_id, target_id, action, duration, reason, event.sender_id)
-            cleared = db.clear_warnings(event.chat_id, target_id)
+            cleared = await asyncio.to_thread(db.clear_warnings, event.chat_id, target_id)
             if cleared < 0:
                 result = f"limite atingido; {action} aplicado por {duration_label(duration)}, mas a limpeza das advertências falhou"
             else:
@@ -2787,7 +2847,8 @@ async def cmd_delwarn(event):
     else:
         result = f"{count}/{threshold} advertências"
     queue_audit_log(event.chat_id, target_id, "Ação: Delwarn", reason, admin_id=event.sender_id)
-    await reply_or_edit(event, f"🗑️⚠️ Mensagem de <b>{db.get_user_info(target_id)}</b> apagada e advertência aplicada: {result}.", delete_after=DEFAULT_DELETE_AFTER)
+    user_info = await asyncio.to_thread(db.get_user_info, target_id)
+    await reply_or_edit(event, f"🗑️⚠️ Mensagem de <b>{user_info}</b> apagada e advertência aplicada: {result}.", delete_after=DEFAULT_DELETE_AFTER)
 
 
 @client.on(events.NewMessage(pattern=r'^\.unwarn(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
@@ -2799,15 +2860,15 @@ async def cmd_unwarn(event):
     if is_immune(target_id):
         await reply_or_edit(event, "❌ A conta protegida não pode ser alterada por este comando.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    before = db.get_warning(event.chat_id, target_id)
+    before = await asyncio.to_thread(db.get_warning, event.chat_id, target_id)
     if before is None:
         await reply_or_edit(event, "❌ Não foi possível consultar as advertências no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    user_info = db.get_user_info(target_id)
+    user_info = await asyncio.to_thread(db.get_user_info, target_id)
     if int(before.get("count", 0)) <= 0:
         result = f"ℹ️ {user_info} (<code>{target_id}</code>) não possui advertências ativas neste chat."
     else:
-        remaining = db.remove_warning(event.chat_id, target_id)
+        remaining = await asyncio.to_thread(db.remove_warning, event.chat_id, target_id)
         if remaining < 0:
             await reply_or_edit(event, "❌ Não foi possível remover a advertência do banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
             return
@@ -2825,11 +2886,11 @@ async def cmd_clearwarns(event):
     if is_immune(target_id):
         await reply_or_edit(event, "❌ A conta protegida não pode ser alterada por este comando.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    removed = db.clear_warnings(event.chat_id, target_id)
+    removed = await asyncio.to_thread(db.clear_warnings, event.chat_id, target_id)
     if removed < 0:
         await reply_or_edit(event, "❌ Não foi possível limpar as advertências do banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    user_info = db.get_user_info(target_id)
+    user_info = await asyncio.to_thread(db.get_user_info, target_id)
     if removed:
         text = f"✅ Todas as advertências de {user_info} (<code>{target_id}</code>) foram removidas. Total: <code>{removed}</code>."
     else:
@@ -2840,13 +2901,16 @@ async def cmd_clearwarns(event):
 
 @client.on(events.NewMessage(pattern=r'^\.warns(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_warns(event):
-    rows = db.get_warnings_report(event.chat_id)
+    rows = await asyncio.to_thread(db.get_warnings_report, event.chat_id)
     if not rows:
         await reply_or_edit(event, "📭 Nenhuma advertência ativa neste chat.", delete_after=DEFAULT_DELETE_AFTER)
         return
+    visible_rows = rows[:30]
+    info_map = await asyncio.to_thread(db.get_user_info_many, [row["user_id"] for row in visible_rows])
     text = "⚠️ <b>ADVERTÊNCIAS ATIVAS</b>\n\n"
-    for row in rows[:30]:
-        text += f"• {db.get_user_info(row['user_id'])} (<code>{row['user_id']}</code>): {row['count']}\n"
+    for row in visible_rows:
+        user_id = int(row["user_id"])
+        text += f"• {info_map.get(user_id, str(user_id))} (<code>{user_id}</code>): {row['count']}\n"
     await reply_or_edit(event, text, delete_after=15)
 
 
@@ -2867,12 +2931,12 @@ async def cmd_antiblack(event):
     
     action = args[1].lower()
     if action in ['on', 'ativar', '1']:
-        if not db.set_antiblack(event.chat_id, 1):
+        if not await asyncio.to_thread(db.set_antiblack, event.chat_id, 1):
             await reply_or_edit(event, "❌ Não foi possível ativar o Anti-Black no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
             return
         await reply_or_edit(event, "🛡️ <b>Anti-Black ATIVADO!</b> Se algum bot rival apagar suas mensagens, o Userbot irá repostá-las instantaneamente.", delete_after=DEFAULT_DELETE_AFTER)
     elif action in ['off', 'desativar', '0']:
-        if not db.set_antiblack(event.chat_id, 0):
+        if not await asyncio.to_thread(db.set_antiblack, event.chat_id, 0):
             await reply_or_edit(event, "❌ Não foi possível desativar o Anti-Black no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
             return
         await reply_or_edit(event, "❌ <b>Anti-Black DESATIVADO.</b>", delete_after=DEFAULT_DELETE_AFTER)
@@ -2902,7 +2966,7 @@ async def cmd_kick(event):
     try:
         await _edit_response_now(status_message, "⏳ Aplicando a expulsão...")
         await client.kick_participant(event.chat_id, target_id)
-        user_info = db.get_user_info(target_id)
+        user_info = await asyncio.to_thread(db.get_user_info, target_id)
         queue_audit_log(event.chat_id, target_id, "Ação: Kick", "Moderação", admin_id=event.sender_id)
         await finish_fast_response(
             event,
@@ -3008,7 +3072,7 @@ async def cmd_ban(event):
                 label="resultado de erro do ban",
             )
             return
-        user_info = db.get_user_info(target_id)
+        user_info = await asyncio.to_thread(db.get_user_info, target_id)
         queue_audit_log(event.chat_id, target_id, "Ação: Ban", "Moderação", admin_id=event.sender_id)
         await finish_fast_response(
             event,
@@ -3057,7 +3121,7 @@ async def cmd_unban(event):
             await reply_or_edit(event, "❌ A permissão foi restaurada, mas não foi possível remover o ban local no banco; a ação foi revertida quando possível.", delete_after=DEFAULT_DELETE_AFTER)
             return
         queue_audit_log(event.chat_id, target_id, "Ação: Unban Local", "Reversão", admin_id=event.sender_id)
-        user_info = db.get_user_info(target_id)
+        user_info = await asyncio.to_thread(db.get_user_info, target_id)
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) desbanido totalmente.", delete_after=DEFAULT_DELETE_AFTER)
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
@@ -3123,7 +3187,7 @@ async def cmd_mute(event):
                 label="erro de registro do mute",
             )
             return
-        user_info = db.get_user_info(target_id)
+        user_info = await asyncio.to_thread(db.get_user_info, target_id)
         queue_audit_log(event.chat_id, target_id, "Ação: Mute", "Moderação", admin_id=event.sender_id)
         suffix = f" por {duration_label(duration)}" if duration is not None else " permanentemente"
         await finish_fast_response(
@@ -3153,7 +3217,7 @@ async def cmd_unmute(event):
             await reply_or_edit(event, "⚠️ O usuário foi liberado, mas os registros temporários não puderam ser limpos.", delete_after=DEFAULT_DELETE_AFTER)
             return
         queue_audit_log(event.chat_id, target_id, "Ação: Unmute", "Reversão", admin_id=event.sender_id)
-        user_info = db.get_user_info(target_id)
+        user_info = await asyncio.to_thread(db.get_user_info, target_id)
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) pode falar novamente.", delete_after=DEFAULT_DELETE_AFTER)
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
@@ -3167,10 +3231,10 @@ async def cmd_blacklist(event):
     if await reject_moderation_target(event, target_id):
         return
     expires_at = int(time.time()) + duration if duration is not None else None
-    if not db.add_local_blacklist(event.chat_id, target_id, reason, expires_at=expires_at):
+    if not await asyncio.to_thread(db.add_local_blacklist, event.chat_id, target_id, reason, expires_at=expires_at):
         await reply_or_edit(event, "❌ Não foi possível registrar a blacklist local no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    user_info = db.get_user_info(target_id)
+    user_info = await asyncio.to_thread(db.get_user_info, target_id)
     queue_audit_log(event.chat_id, target_id, "Ação: Blacklist Local", "Moderação", admin_id=event.sender_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist local ({duration_label(duration)}).", delete_after=DEFAULT_DELETE_AFTER)
 
@@ -3180,11 +3244,11 @@ async def cmd_unblacklist(event):
     if not target_id:
         await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    if not db.remove_local_blacklist(event.chat_id, target_id):
+    if not await asyncio.to_thread(db.remove_local_blacklist, event.chat_id, target_id):
         await reply_or_edit(event, "❌ Não foi possível remover a blacklist local do banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
     queue_audit_log(event.chat_id, target_id, "Ação: Unblacklist Local", "Reversão", admin_id=event.sender_id)
-    user_info = db.get_user_info(target_id)
+    user_info = await asyncio.to_thread(db.get_user_info, target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido da blacklist local deste chat.", delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.banperm(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
@@ -3205,14 +3269,14 @@ async def cmd_banperm(event):
         await client.edit_permissions(event.chat_id, target_id, **permission_kwargs)
         if purge_limit:
             await purge_target_messages(event.chat_id, target_id, purge_limit, include_pinned=include_pinned_requested(event))
-        if not db.add_local_banperm(event.chat_id, target_id, reason, expires_at=expires_at, previous_permissions=snapshot):
+        if not await asyncio.to_thread(db.add_local_banperm, event.chat_id, target_id, reason, expires_at=expires_at, previous_permissions=snapshot):
             try:
                 await restore_permission_snapshot(event.chat_id, target_id, snapshot, "banperm")
             except Exception as restore_exc:
                 logger.error("Falha ao desfazer banperm não persistido em %s/%s: %s", event.chat_id, target_id, restore_exc)
             await reply_or_edit(event, "❌ A punição foi aplicada no Telegram, mas não pôde ser registrada no banco; tente novamente após verificar o SQLite.", delete_after=DEFAULT_DELETE_AFTER)
             return
-        user_info = db.get_user_info(target_id)
+        user_info = await asyncio.to_thread(db.get_user_info, target_id)
         queue_audit_log(event.chat_id, target_id, "Ação: BanPerm", "Moderação", admin_id=event.sender_id)
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) banido por {duration_label(duration)}.", delete_after=DEFAULT_DELETE_AFTER)
     except ChatAdminRequiredError:
@@ -3250,7 +3314,7 @@ async def cmd_unbanperm(event):
                 logger.error("Falha ao manter banperm após falha na limpeza temporária em %s/%s: %s", event.chat_id, target_id, restore_exc)
             await reply_or_edit(event, "⚠️ A permissão não foi mantida liberada porque os registros temporários não puderam ser limpos.", delete_after=DEFAULT_DELETE_AFTER)
             return
-        if not db.remove_local_banperm(event.chat_id, target_id):
+        if not await asyncio.to_thread(db.remove_local_banperm, event.chat_id, target_id):
             try:
                 await client.edit_permissions(event.chat_id, target_id, view_messages=False)
             except Exception as restore_exc:
@@ -3258,7 +3322,7 @@ async def cmd_unbanperm(event):
             await reply_or_edit(event, "❌ A permissão foi restaurada, mas não foi possível atualizar a punição local no banco; a ação foi revertida quando possível.", delete_after=DEFAULT_DELETE_AFTER)
             return
         queue_audit_log(event.chat_id, target_id, "Ação: UnbanPerm Local", "Reversão", admin_id=event.sender_id)
-        user_info = db.get_user_info(target_id)
+        user_info = await asyncio.to_thread(db.get_user_info, target_id)
         await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) perdoado neste chat.", delete_after=DEFAULT_DELETE_AFTER)
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
@@ -3272,10 +3336,10 @@ async def cmd_shadow(event):
     if await reject_moderation_target(event, target_id):
         return
     expires_at = int(time.time()) + duration if duration is not None else None
-    if not db.add_shadow_ban(target_id, reason, expires_at=expires_at):
+    if not await asyncio.to_thread(db.add_shadow_ban, target_id, reason, expires_at=expires_at):
         await reply_or_edit(event, "❌ Não foi possível registrar o Shadow Ban no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    user_info = db.get_user_info(target_id)
+    user_info = await asyncio.to_thread(db.get_user_info, target_id)
     queue_audit_log(event.chat_id, target_id, "Ação: Shadow Ban", "Moderação", admin_id=event.sender_id)
     await reply_or_edit(event, f"🌑 {user_info} (<code>{target_id}</code>) em Shadow Ban (mensagens serão apagadas globalmente).", delete_after=DEFAULT_DELETE_AFTER)
 
@@ -3285,11 +3349,11 @@ async def cmd_unshadow(event):
     if not target_id:
         await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    if not db.remove_shadow_ban(target_id):
+    if not await asyncio.to_thread(db.remove_shadow_ban, target_id):
         await reply_or_edit(event, "❌ Não foi possível remover o Shadow Ban do banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
     queue_audit_log(event.chat_id, target_id, "Ação: Unshadow Global", "Reversão", admin_id=event.sender_id)
-    user_info = db.get_user_info(target_id)
+    user_info = await asyncio.to_thread(db.get_user_info, target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) saiu das sombras.", delete_after=DEFAULT_DELETE_AFTER)
 
 async def _apply_allban_to_chat(chat, target_id, expires_at, purge_limit, include_pinned, semaphore):
@@ -3489,10 +3553,10 @@ async def cmd_allblack(event):
     if await reject_moderation_target(event, target_id):
         return
     expires_at = int(time.time()) + duration if duration is not None else None
-    if not db.add_global_blacklist(target_id, 'black', reason, expires_at=expires_at):
+    if not await asyncio.to_thread(db.add_global_blacklist, target_id, 'black', reason, expires_at=expires_at):
         await reply_or_edit(event, "❌ Não foi possível registrar a blacklist global no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    user_info = db.get_user_info(target_id)
+    user_info = await asyncio.to_thread(db.get_user_info, target_id)
     queue_audit_log(event.chat_id, target_id, "Ação: Allblack Global", "Moderação Global", admin_id=event.sender_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist global.", delete_after=DEFAULT_DELETE_AFTER)
 
@@ -3512,13 +3576,13 @@ async def cmd_unallblack(event):
                 delete_after=DEFAULT_DELETE_AFTER,
             )
             return
-    if not db.remove_global_blacklist(target_id):
+    if not await asyncio.to_thread(db.remove_global_blacklist, target_id):
         await reply_or_edit(event, "❌ Não foi possível atualizar a blacklist global do banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
     if db.clear_global_ban_snapshots(target_id) < 0:
         logger.error("Blacklist global removida, mas snapshots não puderam ser limpos: %s", target_id)
     queue_audit_log(event.chat_id, target_id, "Ação: Unallblack Global", "Reversão Global", admin_id=event.sender_id)
-    user_info = db.get_user_info(target_id)
+    user_info = await asyncio.to_thread(db.get_user_info, target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido da blacklist global.", delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.autorizar(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
@@ -3531,10 +3595,10 @@ async def cmd_autorizar(event):
         await reply_or_edit(event, "❌ Os proprietários já possuem acesso permanente.", delete_after=5)
         return
     expires_at = int(time.time()) + duration if duration is not None else None
-    if not db.add_authorized(target_id, expires_at=expires_at):
+    if not await asyncio.to_thread(db.add_authorized, target_id, expires_at=expires_at):
         await reply_or_edit(event, "❌ Não foi possível registrar a autorização no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    user_info = db.get_user_info(target_id)
+    user_info = await asyncio.to_thread(db.get_user_info, target_id)
     if expires_at is None:
         access_text = "permanentemente"
         audit_reason = "Controle; autorização permanente"
@@ -3554,71 +3618,81 @@ async def cmd_desautorizar(event):
     if not target_id:
         await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=5)
         return
-    if not db.remove_authorized(target_id):
+    if not await asyncio.to_thread(db.remove_authorized, target_id):
         await reply_or_edit(event, "❌ Não foi possível revogar a autorização no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    user_info = db.get_user_info(target_id)
+    user_info = await asyncio.to_thread(db.get_user_info, target_id)
     queue_audit_log(event.chat_id, target_id, "Ação: Desautorizar", "Controle", admin_id=event.sender_id)
     await reply_or_edit(event, f"❌ Acesso revogado para {user_info} (<code>{target_id}</code>).", delete_after=5)
 
 @client.on(events.NewMessage(pattern=r'^\.listauth(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_listauth(event):
-    auths = db.get_all_authorized()
+    auths = await asyncio.to_thread(db.get_all_authorized)
     if not auths:
         await reply_or_edit(event, "📭 Nenhum usuário autorizado no momento.", delete_after=10)
         return
+    info_map = await asyncio.to_thread(db.get_user_info_many, [row["user_id"] for row in auths])
     text = "👥 <b>LISTA DE USUÁRIOS AUTORIZADOS</b>\n\n"
-    for r in auths:
-        info = db.get_user_info(r['user_id'])
-        date_str = format_timestamp(r['created_at'])
-        expires_at = r.get('expires_at')
+    for row in auths:
+        user_id = int(row["user_id"])
+        info = info_map.get(user_id, str(user_id))
+        date_str = format_timestamp(row["created_at"])
+        expires_at = row.get("expires_at")
         access_text = "permanente" if not expires_at else f"expira em {format_timestamp(expires_at)}"
-        text += f"• {info} (<code>{r['user_id']}</code>)\n└ 📅 {date_str} | {access_text}\n"
+        text += f"• {info} (<code>{user_id}</code>)\n└ 📅 {date_str} | {access_text}\n"
     await reply_or_edit(event, text, delete_after=15)
 
 @client.on(events.NewMessage(pattern=r'^\.logs(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_logs(event):
     await audit_buffer.flush()
-    logs = db.get_latest_logs(10)
+    logs = await asyncio.to_thread(db.get_latest_logs, 10)
     if not logs:
         await reply_or_edit(event, "📭 Nenhum log registrado recentemente.", delete_after=5)
         return
+    ids = [log["user_id"] for log in logs]
+    ids.extend(log["admin_id"] for log in logs if log.get("admin_id"))
+    info_map = await asyncio.to_thread(db.get_user_info_many, ids)
     text = f"📜 <b>LOGS DE ATIVIDADE ({VERSION})</b>\n\n"
     for log in logs:
-        user_info = db.get_user_info(log['user_id'])
-        time_str = format_timestamp(log['created_at'], '%H:%M:%S')
-        raw_content = str(log['content'] or '[sem conteúdo]')
-        content = (raw_content[:30] + '...') if len(raw_content) > 30 else raw_content
+        user_id = int(log["user_id"])
+        user_info = info_map.get(user_id, str(user_id))
+        time_str = format_timestamp(log["created_at"], "%H:%M:%S")
+        raw_content = str(log["content"] or "[sem conteúdo]")
+        content = (raw_content[:30] + "...") if len(raw_content) > 30 else raw_content
         content = escape(content)
         text += f"⏰ <code>{time_str}</code> | 👤 {user_info}\n"
         text += f"🚫 <b>Motivo:</b> {escape(str(log['reason'] or 'não informado'))}\n"
-        if log['admin_id']:
-            admin_info = db.get_user_info(log['admin_id'])
-            text += f"👮 <b>Admin:</b> {admin_info}\n"
+        if log.get("admin_id"):
+            admin_id = int(log["admin_id"])
+            text += f"👮 <b>Admin:</b> {info_map.get(admin_id, str(admin_id))}\n"
         text += f"💬 <b>Conteúdo:</b> <i>{content}</i>\n"
         text += "------------------\n"
     await reply_or_edit(event, text, delete_after=15)
 
 @client.on(events.NewMessage(pattern=r'^\.listdn(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_listdn(event):
-    shadow, glob = db.get_all_banned_list_detailed()
+    shadow, glob = await asyncio.to_thread(db.get_all_banned_list_detailed)
+    all_rows = list(shadow) + list(glob)
+    info_map = await asyncio.to_thread(db.get_user_info_many, [row["user_id"] for row in all_rows]) if all_rows else {}
     text = "📋 <b>LISTA DE PUNIÇÕES GLOBAIS</b>\n\n"
     if shadow:
         text += "🌑 <b>Shadow Ban:</b>\n"
-        for r in shadow:
-            info = db.get_user_info(r['user_id'])
-            reason = f" | Motivo: {escape(str(r['reason']))}" if r['reason'] else ""
-            date_str = format_timestamp(r['created_at'])
-            text += f"• {info} (<code>{r['user_id']}</code>){reason}\n└ 📅 {date_str}\n"
+        for row in shadow:
+            user_id = int(row["user_id"])
+            info = info_map.get(user_id, str(user_id))
+            reason = f" | Motivo: {escape(str(row['reason']))}" if row["reason"] else ""
+            date_str = format_timestamp(row["created_at"])
+            text += f"• {info} (<code>{user_id}</code>){reason}\n└ 📅 {date_str}\n"
         text += "\n"
     if glob:
         text += "🌎 <b>Global Blacklist:</b>\n"
-        for r in glob:
-            info = db.get_user_info(r['user_id'])
-            reason = f" | Motivo: {escape(str(r['reason']))}" if r['reason'] else ""
-            date_str = format_timestamp(r['created_at'])
-            punishment_type = str(r.get('type') or 'black').upper()
-            text += f"• {info} (<code>{r['user_id']}</code>) [{punishment_type}]{reason}\n└ 📅 {date_str}\n"
+        for row in glob:
+            user_id = int(row["user_id"])
+            info = info_map.get(user_id, str(user_id))
+            reason = f" | Motivo: {escape(str(row['reason']))}" if row["reason"] else ""
+            date_str = format_timestamp(row["created_at"])
+            punishment_type = str(row.get("type") or "black").upper()
+            text += f"• {info} (<code>{user_id}</code>) [{punishment_type}]{reason}\n└ 📅 {date_str}\n"
     if not shadow and not glob:
         text += "Nenhuma punição global registrada."
     await reply_or_edit(event, text, delete_after=15)
@@ -3840,7 +3914,7 @@ async def cmd_antispy(event):
         if suspects:
             spy_list = []
             for uid, item in sorted(suspects.items(), key=lambda pair: pair[1]["confidence"], reverse=True):
-                info = db.get_user_info(uid)
+                info = await asyncio.to_thread(db.get_user_info, uid)
                 signals = ", ".join(sorted(item["signals"]))
                 persisted = db.add_detected_spy(uid, event.chat_id, signals, item["confidence"])
                 persistence_note = "" if persisted else " | ⚠️ não persistido"
@@ -3872,7 +3946,7 @@ async def cmd_listspy(event):
         return
     text = "🕵️‍♂️ <b>LISTA DE ESPIÕES DETECTADOS (.listspy)</b>\n\n"
     for s in spies:
-        info = db.get_user_info(s['user_id'])
+        info = await asyncio.to_thread(db.get_user_info, s['user_id'])
         date_str = datetime.fromtimestamp(s['detected_at']).strftime('%d/%m/%Y %H:%M')
         signals = escape(s.get('signals') or 'não informado')
         confidence = int(s.get('confidence') or 0)
@@ -3888,7 +3962,7 @@ async def cmd_delspy(event):
     if not db.remove_spy(target_id):
         await reply_or_edit(event, "❌ Não foi possível remover o registro de espião no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    info = db.get_user_info(target_id)
+    info = await asyncio.to_thread(db.get_user_info, target_id)
     await reply_or_edit(event, f"✅ <b>{info} (<code>{target_id}</code>) removido da lista de espiões.</b>", delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.purgeall(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
@@ -3966,7 +4040,7 @@ async def cmd_purge(event):
         await reply_or_edit(event, "❌ Responda à mensagem do usuário ou informe @username / ID junto com a quantidade. Ex: <code>.purge 10</code>", delete_after=DEFAULT_DELETE_AFTER)
         return
 
-    info = db.get_user_info(target_id)
+    info = await asyncio.to_thread(db.get_user_info, target_id)
     status_msg = await send_status_safely(
         event,
         f"🧹 [Purge] Apagando até {limit} mensagens (qualquer tipo) de {info}...",
@@ -4072,7 +4146,7 @@ async def cmd_infojt(event):
             username = getattr(entity, "username", None)
     except Exception as exc:
         logger.debug("Não foi possível resolver a entidade do .infojt para %s: %s", target_id, exc)
-        display_name = db.get_user_info(target_id) or str(target_id)
+        display_name = await asyncio.to_thread(db.get_user_info, target_id) or str(target_id)
         display_name_is_html = True
 
     name_html = display_name if display_name_is_html else escape(str(display_name))
@@ -4204,7 +4278,7 @@ async def cmd_chats(event):
         if r['chat_type'] in ['group', 'supergroup', 'Chat']: grupos.append(chat_info)
         elif r['chat_type'] in ['channel', 'Channel']: canais.append(chat_info)
         elif r['chat_type'] in ['private', 'User']:
-            user_info = db.get_user_info(r['chat_id'])
+            user_info = await asyncio.to_thread(db.get_user_info, r['chat_id'])
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
     text = f"📡 <b>RELATÓRIO DE CHATS {VERSION}</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
