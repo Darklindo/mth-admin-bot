@@ -86,7 +86,7 @@ TELEGRAM_TIMEOUT = _env_int("TELEGRAM_TIMEOUT", 10, 5, 30)
 TELEGRAM_REQUEST_RETRIES = _env_int("TELEGRAM_REQUEST_RETRIES", 3, 1, 10)
 TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 STARTED_AT = time.time()
-VERSION = "V6.33"
+VERSION = "V6.34"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -1865,6 +1865,49 @@ async def delete_security_message(event, chat_id, user_id, content_text, reason)
 
 
 _response_cleanup_tasks = set()
+_pending_incoming_command_status = {}
+_pending_incoming_command_cleanup = set()
+
+# O acknowledgment só é emitido para comandos reais e para usuários que já
+# passariam pelo mesmo predicado de autorização do handler correspondente.
+_ACK_COMMANDS = frozenset({
+    "maintenance", "lock", "unlock", "quarantine", "antispam", "pinned",
+    "antilink", "autorizarlink", "desautorizarlink", "listlinkauth", "del",
+    "warn", "delwarn", "unwarn", "clearwarns", "warns", "start", "antiblack",
+    "kick", "ban", "unban", "mute", "unmute", "blacklist", "unblacklist",
+    "banperm", "unbanperm", "shadow", "unshadow", "allban", "allblack",
+    "unallblack", "autorizar", "desautorizar", "listauth", "logs", "listdn",
+    "status", "latency", "health", "help", "antispy", "listspy", "delspy",
+    "purgeall", "purge", "purgeme", "id", "infojt", "msg", "chats",
+})
+_OWNER_ONLY_ACK_COMMANDS = frozenset({
+    "maintenance", "allban", "allblack", "unallblack", "autorizar",
+    "desautorizar", "purgeall", "msg", "chats",
+})
+
+
+def _incoming_command_name(event):
+    raw = (getattr(event, "raw_text", None) or "").strip()
+    if not raw.startswith("."):
+        return ""
+    return raw[1:].split(maxsplit=1)[0].casefold()
+
+
+def _take_incoming_command_status(event):
+    return _pending_incoming_command_status.pop(getattr(event, "id", None), None)
+
+
+async def _expire_incoming_command_status(event_id, event):
+    try:
+        await asyncio.sleep(max(10, DEFAULT_DELETE_AFTER * 2))
+        pending = _pending_incoming_command_status.pop(event_id, None)
+        if pending is not None:
+            await delete_message_safely(pending, "acknowledgment expirado")
+            await delete_command_safely(event)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.debug("Falha ao remover acknowledgment pendente: %s", exc)
 
 
 async def _cleanup_response_later(message, event, delay, label):
@@ -1914,6 +1957,11 @@ async def _edit_response_now(message, text):
 
 async def reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER):
     """Responde sem bloquear o handler durante o período de autoexclusão."""
+    pending_status = _take_incoming_command_status(event)
+    if pending_status is not None:
+        if await _edit_response_now(pending_status, text):
+            schedule_response_cleanup(pending_status, event, delete_after)
+            return pending_status
     msg = None
     try:
         if event.out:
@@ -1945,6 +1993,10 @@ async def reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER):
 
 async def begin_fast_response(event, text, label="status de moderação"):
     """Mostra o processamento imediatamente, editando o comando quando possível."""
+    pending_status = _take_incoming_command_status(event)
+    if pending_status is not None:
+        if await _edit_response_now(pending_status, text):
+            return pending_status
     try:
         if event.out:
             return await event.edit(text, parse_mode="html")
@@ -2437,6 +2489,39 @@ async def maintenance_filter(event):
         return
     await delete_command_safely(event)
     raise events.StopPropagation
+
+
+@client.on(events.NewMessage(incoming=True, pattern=r'^\.[a-zA-Z][a-zA-Z0-9_]*(?:\s|$)'))
+async def incoming_command_ack(event):
+    """Confirma imediatamente comandos externos autorizados.
+
+    A conta do Userbot consegue editar seus próprios comandos. Para uma conta
+    autorizada externa, o Telegram exige uma mensagem separada; este status é
+    reaproveitado pela resposta final para não deixar mensagens duplicadas.
+    """
+    command = _incoming_command_name(event)
+    if command not in _ACK_COMMANDS:
+        return
+    sender_id = event.sender_id
+    if command in _OWNER_ONLY_ACK_COMMANDS:
+        if not is_owner(sender_id):
+            return
+    elif not is_authorized(sender_id):
+        return
+
+    try:
+        status = await event.respond("⏳ Processando…", parse_mode=None)
+    except Exception as exc:
+        logger.debug("Não foi possível enviar acknowledgment do comando: %s", exc)
+        return
+
+    event_id = getattr(event, "id", None)
+    if event_id is None:
+        return
+    _pending_incoming_command_status[event_id] = status
+    task = asyncio.create_task(_expire_incoming_command_status(event_id, event))
+    _pending_incoming_command_cleanup.add(task)
+    task.add_done_callback(_pending_incoming_command_cleanup.discard)
 
 
 @client.on(events.NewMessage(pattern=r'^\.maintenance(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
