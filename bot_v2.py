@@ -91,7 +91,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V6.37"
+VERSION = "V7.0"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -1098,6 +1098,55 @@ class SecurityDeleteQueue:
         }
 
 
+class CommandMetrics:
+    """Métricas leves em memória; nunca bloqueiam comandos nem acessam SQLite."""
+
+    def __init__(self, max_commands=128):
+        self._active = {}
+        self._stats = {}
+        self.max_commands = max(16, int(max_commands))
+
+    @staticmethod
+    def _name(event):
+        parts = str(getattr(event, "raw_text", "") or "").strip().split(maxsplit=1)
+        raw = parts[0] if parts else ""
+        if raw.startswith(".") and len(raw) <= 48:
+            return raw.lower()
+        return "<other>"
+
+    def start(self, event):
+        key = id(event)
+        if key not in self._active:
+            self._active[key] = (self._name(event), time.perf_counter())
+
+    def finish(self, event, success=True):
+        item = self._active.pop(id(event), None)
+        if item is None:
+            return
+        name, started = item
+        elapsed_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
+        row = self._stats.setdefault(name, {"count": 0, "failed": 0, "last_ms": 0.0, "max_ms": 0.0, "total_ms": 0.0})
+        row["count"] += 1
+        row["failed"] += 0 if success else 1
+        row["last_ms"] = elapsed_ms
+        row["max_ms"] = max(row["max_ms"], elapsed_ms)
+        row["total_ms"] += elapsed_ms
+        if len(self._stats) > self.max_commands:
+            oldest = next(iter(self._stats))
+            if oldest != name:
+                self._stats.pop(oldest, None)
+
+    def snapshot(self):
+        stats = {name: dict(values) for name, values in self._stats.items()}
+        total = sum(row["count"] for row in stats.values())
+        failures = sum(row["failed"] for row in stats.values())
+        for row in stats.values():
+            row["avg_ms"] = row["total_ms"] / row["count"] if row["count"] else 0.0
+        return {"total": total, "failed": failures, "active": len(self._active), "commands": stats}
+
+
+command_metrics = CommandMetrics()
+
 # Inicializados após a criação do cliente para permitir testes offline e substituição controlada.
 audit_buffer = AuditBuffer(db)
 security_delete_queue = SecurityDeleteQueue(client)
@@ -1121,6 +1170,7 @@ def get_performance_snapshot():
         "audit_failed": audit_buffer.failed,
         # Alias mantido para evitar quebra em instalações com o nome antigo.
         "delete_failed": queue_stats.get("failed", 0),
+        "command_metrics": command_metrics.snapshot(),
     }
 
 
@@ -1287,7 +1337,7 @@ def locked_chat_rights():
 
 async def restore_global_ban(user_id):
     """Restaura somente os chats atingidos; usa fallback para registros antigos."""
-    snapshots = db.get_global_ban_snapshots(user_id)
+    snapshots = await asyncio.to_thread(db.get_global_ban_snapshots, user_id)
     if snapshots is None:
         return 0, 1
     if snapshots:
@@ -1316,7 +1366,8 @@ async def restore_global_ban(user_id):
 
     attempted = 0
     failed = 0
-    for chat in db.all_chats_detailed():
+    rows = await asyncio.to_thread(db.all_chats_detailed)
+    for chat in rows:
         chat_type = str(chat.get("chat_type") or "").lower()
         if not chat.get("active") or chat_type not in {"group", "supergroup", "channel", "chat"}:
             continue
@@ -1499,10 +1550,10 @@ async def get_target_from_event(event):
                 try:
                     user = await client.get_entity(raw)
                     if isinstance(user, User):
-                        db.remember_user(user.id, user.username, user.first_name)
+                        await asyncio.to_thread(db.remember_user, user.id, user.username, user.first_name)
                     return int(user.id)
                 except (ValueError, RPCError):
-                    resolved = db.resolve_username(raw)
+                    resolved = await asyncio.to_thread(db.resolve_username, raw)
                     return int(resolved) if resolved else None
             if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
                 return int(raw)
@@ -1578,10 +1629,10 @@ async def get_authorization_target_and_expiry(event):
             try:
                 user = await client.get_entity(raw)
                 if isinstance(user, User):
-                    db.remember_user(user.id, user.username, user.first_name)
+                    await asyncio.to_thread(db.remember_user, user.id, user.username, user.first_name)
                 return int(user.id), duration
             except (ValueError, RPCError):
-                return db.resolve_username(raw), duration
+                    return await asyncio.to_thread(db.resolve_username, raw), duration
         if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
             return int(raw), duration
     except Exception as exc:
@@ -1755,14 +1806,14 @@ async def temporary_expiry_loop():
         try:
             await asyncio.sleep(EXPIRATION_CHECK_INTERVAL)
             now = int(time.time())
-            db.expire_authorized(now)
-            db.expire_local_blacklist(now)
-            expired_local_bans = db.get_expired_local_banperm(now)
-            expired_global = db.get_expired_global_blacklist(now)
-            db.expire_shadow(now)
+            await asyncio.to_thread(db.expire_authorized, now)
+            await asyncio.to_thread(db.expire_local_blacklist, now)
+            expired_local_bans = await asyncio.to_thread(db.get_expired_local_banperm, now)
+            expired_global = await asyncio.to_thread(db.get_expired_global_blacklist, now)
+            await asyncio.to_thread(db.expire_shadow, now)
             for row in expired_local_bans:
                 try:
-                    record = db.get_local_banperm_record(row["chat_id"], row["user_id"])
+                    record = await asyncio.to_thread(db.get_local_banperm_record, row["chat_id"], row["user_id"])
                     if record is None:
                         logger.error("Falha ao ler snapshot do banperm expirado; será tentado novamente: %s/%s", row["chat_id"], row["user_id"])
                         continue
@@ -1776,18 +1827,18 @@ async def temporary_expiry_loop():
             for row in expired_global:
                 row_type = str(row["type"] or "").lower()
                 if row_type != "ban":
-                    db.remove_global_blacklist(row["user_id"])
+                    await asyncio.to_thread(db.remove_global_blacklist, row["user_id"])
                     continue
                 _attempted, failures = await restore_global_ban(row["user_id"])
                 # Mantém a punição global quando algum chat ainda não foi
                 # restaurado, permitindo nova tentativa no próximo ciclo.
                 if failures == 0:
-                    if db.remove_global_blacklist(row["user_id"]):
-                        if db.clear_global_ban_snapshots(row["user_id"]) < 0:
+                    if await asyncio.to_thread(db.remove_global_blacklist, row["user_id"]):
+                        if await asyncio.to_thread(db.clear_global_ban_snapshots, row["user_id"]) < 0:
                             logger.error("Blacklist global removida, mas snapshots não puderam ser limpos: %s", row["user_id"])
                     else:
                         logger.error("Ban global restaurado, mas o registro não pôde ser removido: %s", row["user_id"])
-            for row in db.get_expired_punishments(now):
+            for row in await asyncio.to_thread(db.get_expired_punishments, now):
                 restored = False
                 try:
                     action = str(row["action"] or "").lower()
@@ -1801,7 +1852,7 @@ async def temporary_expiry_loop():
                     restored = True
                 except Exception as exc:
                     logger.debug("Falha ao expirar punição %s; será tentado novamente: %s", row["id"], exc)
-                if restored and not db.remove_temporary_punishment(row["id"]):
+                if restored and not await asyncio.to_thread(db.remove_temporary_punishment, row["id"]):
                     logger.error("Punição %s restaurada, mas não removida do banco; será reprocessada", row["id"])
         except asyncio.CancelledError:
             return
@@ -1989,6 +2040,7 @@ async def _edit_response_now(message, text):
 
 async def reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER):
     """Responde sem bloquear o handler durante o período de autoexclusão."""
+    command_metrics.start(event)
     msg = None
     try:
         if event.out:
@@ -2011,6 +2063,7 @@ async def reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER):
         except Exception as fallback_exc:
             logger.error(f"Erro ao enviar/editar resposta: {fallback_exc}")
 
+    command_metrics.finish(event, success=msg is not None)
     if msg is not None:
         schedule_response_cleanup(msg, event, delete_after)
     elif delete_after:
@@ -2020,6 +2073,7 @@ async def reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER):
 
 async def begin_fast_response(event, text, label="status de moderação"):
     """Mostra o processamento imediatamente, editando o comando quando possível."""
+    command_metrics.start(event)
     try:
         if event.out:
             return await event.edit(text, parse_mode="html")
@@ -2042,6 +2096,7 @@ async def finish_fast_response(event, status_message, text, delete_after=DEFAULT
     if status_message is None:
         return await reply_or_edit(event, text, delete_after=delete_after)
     edited = await _edit_response_now(status_message, text)
+    command_metrics.finish(event, success=edited)
     if not edited:
         # Evita deixar o usuário sem resultado quando a edição da mensagem de
         # status falhar; a resposta alternativa também será autoexcluída.
@@ -2289,7 +2344,7 @@ async def antilink_filter(event):
         return
     if not message_contains_link(event.message, event.raw_text or ""):
         return
-    if db.is_link_authorized(event.chat_id, user_id):
+    if user_id in cache.link_whitelist.get(int(event.chat_id), set()):
         return
     if await is_chat_admin(event.chat_id, user_id):
         return
@@ -2318,7 +2373,11 @@ async def apply_warning_action(chat_id, user_id, action, duration, reason, admin
     else:
         await client.edit_permissions(chat_id, user_id, send_messages=False)
         action = "mute"
-    if db.add_temporary_punishment(chat_id, user_id, action, expires_at, reason, admin_id, previous_permissions=snapshot):
+    if await asyncio.to_thread(
+        db.add_temporary_punishment,
+        chat_id, user_id, action, expires_at, reason, admin_id,
+        previous_permissions=snapshot,
+    ):
         return True
     try:
         await restore_permission_snapshot(chat_id, user_id, snapshot, action)
@@ -2529,7 +2588,7 @@ async def cmd_maintenance(event):
         await reply_or_edit(event, "Use <code>.maintenance on</code> ou <code>.maintenance off</code>.", delete_after=DEFAULT_DELETE_AFTER)
         return
     enabled = args[1].lower() in {"on", "1"}
-    if not db.set_maintenance(enabled):
+    if not await asyncio.to_thread(db.set_maintenance, enabled):
         await reply_or_edit(event, "❌ Não foi possível atualizar o modo manutenção no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
     await reply_or_edit(event, f"🛠️ Modo manutenção <b>{'ATIVADO' if enabled else 'DESATIVADO'}</b>.", delete_after=DEFAULT_DELETE_AFTER)
@@ -2543,7 +2602,7 @@ async def cmd_lock(event):
     if not await can_manage_chat(event):
         await reply_or_edit(event, "❌ Somente administradores deste grupo podem usar o lock.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    state = db.get_chat_lock(event.chat_id)
+    state = await asyncio.to_thread(db.get_chat_lock, event.chat_id)
     if state is None:
         await reply_or_edit(event, "❌ Não foi possível consultar o estado do lock no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
@@ -2553,7 +2612,7 @@ async def cmd_lock(event):
     try:
         snapshot = await capture_chat_default_rights(event.chat_id)
         await apply_chat_default_rights(event.chat_id, locked_chat_rights())
-        if not db.set_chat_lock(event.chat_id, snapshot):
+        if not await asyncio.to_thread(db.set_chat_lock, event.chat_id, snapshot):
             try:
                 await apply_chat_default_rights(event.chat_id, deserialize_chat_default_rights(snapshot))
             except Exception as rollback_exc:
@@ -2580,7 +2639,7 @@ async def cmd_unlock(event):
     if not await can_manage_chat(event):
         await reply_or_edit(event, "❌ Somente administradores deste grupo podem usar o unlock.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    state = db.get_chat_lock(event.chat_id)
+    state = await asyncio.to_thread(db.get_chat_lock, event.chat_id)
     if state is None:
         await reply_or_edit(event, "❌ Não foi possível consultar o estado do lock no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
@@ -2590,7 +2649,7 @@ async def cmd_unlock(event):
     try:
         previous_rights = deserialize_chat_default_rights(state.get("lock_snapshot"))
         await apply_chat_default_rights(event.chat_id, previous_rights)
-        if not db.clear_chat_lock(event.chat_id):
+        if not await asyncio.to_thread(db.clear_chat_lock, event.chat_id):
             try:
                 await apply_chat_default_rights(event.chat_id, locked_chat_rights())
             except Exception as rollback_exc:
@@ -3060,7 +3119,7 @@ async def cmd_ban(event):
         )
         if purge_limit:
             await purge_target_messages(event.chat_id, target_id, purge_limit, include_pinned=include_pinned_requested(event))
-        if not db.add_temporary_punishment(event.chat_id, target_id, "ban", expires_at, reason, event.sender_id, previous_permissions=snapshot):
+        if not await asyncio.to_thread(db.add_temporary_punishment, event.chat_id, target_id, "ban", expires_at, reason, event.sender_id, previous_permissions=snapshot):
             try:
                 await restore_permission_snapshot(event.chat_id, target_id, snapshot, "ban")
             except Exception as restore_exc:
@@ -3094,18 +3153,18 @@ async def cmd_unban(event):
     if not target_id:
         await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    state = db.get_local_banperm_state(event.chat_id, target_id)
+    state = await asyncio.to_thread(db.get_local_banperm_state, event.chat_id, target_id)
     if state is None:
         await reply_or_edit(event, "❌ Não foi possível consultar o ban local no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    record = db.get_local_banperm_record(event.chat_id, target_id) if state else {}
+    record = await asyncio.to_thread(db.get_local_banperm_record, event.chat_id, target_id) if state else {}
     if state and record is None:
         await reply_or_edit(event, "❌ Não foi possível ler o snapshot do ban local no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
     snapshot = record.get("previous_permissions") if record else None
     try:
         await restore_permission_snapshot(event.chat_id, target_id, snapshot, "ban")
-        cleared = db.clear_temporary_punishments(event.chat_id, target_id, ("ban", "banperm"))
+        cleared = await asyncio.to_thread(db.clear_temporary_punishments, event.chat_id, target_id, ("ban", "banperm"))
         if cleared < 0:
             try:
                 await client.edit_permissions(event.chat_id, target_id, view_messages=False)
@@ -3113,7 +3172,7 @@ async def cmd_unban(event):
                 logger.error("Falha ao manter ban após falha na limpeza temporária em %s/%s: %s", event.chat_id, target_id, restore_exc)
             await reply_or_edit(event, "⚠️ A permissão não foi mantida liberada porque os registros temporários não puderam ser limpos.", delete_after=DEFAULT_DELETE_AFTER)
             return
-        if state and not db.remove_local_banperm(event.chat_id, target_id):
+        if state and not await asyncio.to_thread(db.remove_local_banperm, event.chat_id, target_id):
             try:
                 await client.edit_permissions(event.chat_id, target_id, view_messages=False)
             except Exception as restore_exc:
@@ -3175,7 +3234,7 @@ async def cmd_mute(event):
         await client.edit_permissions(event.chat_id, target_id, **permission_kwargs)
         if purge_limit:
             await purge_target_messages(event.chat_id, target_id, purge_limit, include_pinned=include_pinned_requested(event))
-        if duration is not None and not db.add_temporary_punishment(event.chat_id, target_id, "mute", expires_at, reason, event.sender_id, previous_permissions=snapshot):
+        if duration is not None and not await asyncio.to_thread(db.add_temporary_punishment, event.chat_id, target_id, "mute", expires_at, reason, event.sender_id, previous_permissions=snapshot):
             try:
                 await restore_permission_snapshot(event.chat_id, target_id, snapshot, "mute")
             except Exception as restore_exc:
@@ -3212,7 +3271,7 @@ async def cmd_unmute(event):
         return
     try:
         await client.edit_permissions(event.chat_id, target_id, send_messages=True, send_media=True)
-        cleared = db.clear_temporary_punishments(event.chat_id, target_id, ("mute", "quarantine"))
+        cleared = await asyncio.to_thread(db.clear_temporary_punishments, event.chat_id, target_id, ("mute", "quarantine"))
         if cleared < 0:
             await reply_or_edit(event, "⚠️ O usuário foi liberado, mas os registros temporários não puderam ser limpos.", delete_after=DEFAULT_DELETE_AFTER)
             return
@@ -3292,21 +3351,21 @@ async def cmd_unbanperm(event):
     if not target_id:
         await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    state = db.get_local_banperm_state(event.chat_id, target_id)
+    state = await asyncio.to_thread(db.get_local_banperm_state, event.chat_id, target_id)
     if state is None:
         await reply_or_edit(event, "❌ Não foi possível consultar o ban permanente no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
     if not state:
         await reply_or_edit(event, "ℹ️ Não há banimento permanente registrado para este usuário neste chat.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    record = db.get_local_banperm_record(event.chat_id, target_id)
+    record = await asyncio.to_thread(db.get_local_banperm_record, event.chat_id, target_id)
     if record is None:
         await reply_or_edit(event, "❌ Não foi possível ler o snapshot do ban permanente no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
     snapshot = record.get("previous_permissions")
     try:
         await restore_permission_snapshot(event.chat_id, target_id, snapshot, "banperm")
-        cleared = db.clear_temporary_punishments(event.chat_id, target_id, ("banperm",))
+        cleared = await asyncio.to_thread(db.clear_temporary_punishments, event.chat_id, target_id, ("banperm",))
         if cleared < 0:
             try:
                 await client.edit_permissions(event.chat_id, target_id, view_messages=False)
@@ -3579,7 +3638,7 @@ async def cmd_unallblack(event):
     if not await asyncio.to_thread(db.remove_global_blacklist, target_id):
         await reply_or_edit(event, "❌ Não foi possível atualizar a blacklist global do banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    if db.clear_global_ban_snapshots(target_id) < 0:
+    if await asyncio.to_thread(db.clear_global_ban_snapshots, target_id) < 0:
         logger.error("Blacklist global removida, mas snapshots não puderam ser limpos: %s", target_id)
     queue_audit_log(event.chat_id, target_id, "Ação: Unallblack Global", "Reversão Global", admin_id=event.sender_id)
     user_info = await asyncio.to_thread(db.get_user_info, target_id)
@@ -3738,11 +3797,13 @@ async def cmd_status(event):
         f"• Logs: <code>{db_counts['deleted_logs']}</code> | Banco: <code>{format_bytes(db_size)}</code>"
     )
     performance = get_performance_snapshot()
+    command_stats = performance.get("command_metrics", {})
     text += (
         f"\n• Fila exclusão: <code>{performance['pending']}</code> pendentes | "
         f"RPC último/máx.: <code>{performance['last_delete_ms']:.0f}/{performance['max_delete_ms']:.0f} ms</code>"
         f"\n• Auditoria: <code>{performance['audit_pending']}</code> pendentes | "
         f"persistidos: <code>{performance['audit_persisted']}</code>"
+        f"\n• Comandos medidos: <code>{command_stats.get('total', 0)}</code> | falhas: <code>{command_stats.get('failed', 0)}</code> | ativos: <code>{command_stats.get('active', 0)}</code>"
     )
     elapsed = (time.perf_counter() - started) * 1000
     text += f"\n• Diagnóstico concluído em: <code>{elapsed:.0f} ms</code>"
@@ -3763,6 +3824,7 @@ async def cmd_latency(event):
     performance = get_performance_snapshot()
     delete_failures = performance.get("failed", performance.get("delete_failed", 0))
     elapsed_ms = (time.perf_counter() - started) * 1000
+    command_stats = performance.get("command_metrics", {})
     text = (
         f"⚡ <b>DIAGNÓSTICO DE LATÊNCIA {VERSION}</b>\n\n"
         f"• API Telegram: <b>{api_state}</b> | <code>{api_ms:.0f} ms</code>\n"
@@ -3773,6 +3835,7 @@ async def cmd_latency(event):
         f"• Falhas/overflow: <code>{delete_failures}/{performance.get('overflow', 0)}</code>\n"
         f"• Auditoria pendente: <code>{performance['audit_pending']}</code> | "
         f"persistida: <code>{performance['audit_persisted']}</code>\n"
+        f"• Comandos medidos: <code>{command_stats.get('total', 0)}</code> | falhas: <code>{command_stats.get('failed', 0)}</code>\n"
         f"• Diagnóstico concluído em: <code>{elapsed_ms:.0f} ms</code>"
     )
     await reply_or_edit(event, text, delete_after=15)
@@ -3784,7 +3847,7 @@ async def cmd_health(event):
     critical_ok = True
 
     try:
-        integrity = db.fetchone("PRAGMA integrity_check")
+        integrity = await asyncio.to_thread(db.fetchone, "PRAGMA integrity_check")
         db_ok = bool(integrity and str(integrity[0]).lower() == "ok")
     except Exception as exc:
         logger.error("Falha no integrity_check do banco: %s", exc)
@@ -3808,7 +3871,7 @@ async def cmd_health(event):
     critical_ok = critical_ok and authorized_session
 
     try:
-        db_counts = db.get_diagnostic_counts()
+        db_counts = await asyncio.to_thread(db.get_diagnostic_counts)
         counts_ok = True
     except Exception as exc:
         logger.error("Falha ao consultar contadores do banco: %s", exc)
@@ -3916,7 +3979,7 @@ async def cmd_antispy(event):
             for uid, item in sorted(suspects.items(), key=lambda pair: pair[1]["confidence"], reverse=True):
                 info = await asyncio.to_thread(db.get_user_info, uid)
                 signals = ", ".join(sorted(item["signals"]))
-                persisted = db.add_detected_spy(uid, event.chat_id, signals, item["confidence"])
+                persisted = await asyncio.to_thread(db.add_detected_spy, uid, event.chat_id, signals, item["confidence"])
                 persistence_note = "" if persisted else " | ⚠️ não persistido"
                 spy_list.append(f"• {info} (<code>{uid}</code>)\n└ Sinais: {escape(signals)} | Confiança: <code>{item['confidence']}%</code> | Eventos: <code>{item['events']}</code>{persistence_note}")
             text = "⚠️ <b>ATIVIDADE ADMINISTRATIVA SUSPEITA REGISTRADA</b>\n\n" + "\n".join(spy_list) + "\n\n<i>Os sinais não provam que a conta usa userbot; exigem confirmação manual.</i>"
@@ -3940,7 +4003,7 @@ async def cmd_antispy(event):
 
 @client.on(events.NewMessage(pattern=r'^\.listspy(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_listspy(event):
-    spies = db.get_all_spies()
+    spies = await asyncio.to_thread(db.get_all_spies)
     if not spies:
         await reply_or_edit(event, "✅ <b>Nenhum espião registrado no banco de dados.</b>", delete_after=5)
         return
@@ -3959,7 +4022,7 @@ async def cmd_delspy(event):
     if not target_id:
         await reply_or_edit(event, "❌ Responda à mensagem do espião, ou digite o ID/Username após .delspy", delete_after=DEFAULT_DELETE_AFTER)
         return
-    if not db.remove_spy(target_id):
+    if not await asyncio.to_thread(db.remove_spy, target_id):
         await reply_or_edit(event, "❌ Não foi possível remover o registro de espião no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
     info = await asyncio.to_thread(db.get_user_info, target_id)
@@ -3988,7 +4051,7 @@ async def cmd_purgeall(event):
     try:
         # Não usamos deleteHistory: somente os IDs coletados nesta janela
         # são removidos, mantendo o alcance previsível e reversível no código.
-        settings = db.get_settings(event.chat_id)
+        settings = await get_settings_async(event.chat_id)
         protect_pinned = bool(settings.get("protect_pinned", 1))
         include_pinned = include_pinned_requested(event)
         scan_limit = PURGEALL_MAX_SCAN
@@ -4052,7 +4115,7 @@ async def cmd_purge(event):
     try:
         # Primeiro coleta os IDs; depois envia a exclusão em lotes para reduzir
         # chamadas individuais sem alterar o limite de 5–100 mensagens.
-        settings = db.get_settings(event.chat_id)
+        settings = await get_settings_async(event.chat_id)
         protect_pinned = bool(settings.get("protect_pinned", 1))
         include_pinned = include_pinned_requested(event)
         scan_limit = MAX_HISTORY_SCAN
@@ -4090,7 +4153,7 @@ async def cmd_purgeme(event):
     me_id = event.sender_id
     message_ids = []
     try:
-        settings = db.get_settings(event.chat_id)
+        settings = await get_settings_async(event.chat_id)
         protect_pinned = bool(settings.get("protect_pinned", 1))
         include_pinned = include_pinned_requested(event)
         scan_limit = min(MAX_HISTORY_SCAN, limit + 2)
@@ -4192,8 +4255,8 @@ async def cmd_infojt(event):
         except Exception as exc:
             logger.debug("Não foi possível consultar permissões do .infojt para %s/%s: %s", event.chat_id, target_id, exc)
 
-        warning_data = db.get_warning(event.chat_id, target_id)
-        settings = db.get_settings(event.chat_id) or {}
+        warning_data = await asyncio.to_thread(db.get_warning, event.chat_id, target_id)
+        settings = await get_settings_async(event.chat_id) or {}
         try:
             threshold = _setting_int(settings, "warn_threshold", 3, 1, 20)
         except (TypeError, ValueError):
@@ -4252,7 +4315,7 @@ async def cmd_msg(event):
     if reply is None and not text_arg:
         await reply_or_edit(event, "❌ Digite a mensagem ou responda a uma mídia.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    chats = db.all_chats_detailed()
+        chats = await asyncio.to_thread(db.all_chats_detailed)
     success = 0
     for chat in chats:
         if chat['active'] and chat['chat_type'] not in ['private', 'User']:
@@ -4269,7 +4332,7 @@ async def cmd_msg(event):
 
 @client.on(events.NewMessage(pattern=r'^\.chats(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_chats(event):
-    rows = db.all_chats_detailed()
+    chats = await asyncio.to_thread(db.all_chats_detailed)
     grupos, canais, privados = [], [], []
     for r in rows:
         status = "✅" if r['active'] else "❌"
