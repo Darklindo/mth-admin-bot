@@ -92,14 +92,20 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V7.5"
+VERSION = "V7.6"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+TELETHON_LOG_LEVEL = os.getenv("TELETHON_LOG_LEVEL", "WARNING").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=getattr(logging, LOG_LEVEL, logging.INFO),
+)
+# O Telethon continua registrando WARNING/ERROR, mas não despeja no painel
+# cada sincronização interna de diferenças como "Got difference".
+logging.getLogger("telethon").setLevel(
+    getattr(logging, TELETHON_LOG_LEVEL, logging.WARNING)
 )
 logger = logging.getLogger("jtzin-telethon")
 
@@ -1300,8 +1306,9 @@ def is_authorized(user_id: int) -> bool:
     return expires_at is None or expires_at > int(time.time())
 
 
-ADMIN_CACHE_TTL = _env_int("ADMIN_CACHE_TTL", 60, 10, 600)
+ADMIN_CACHE_TTL = _env_int("ADMIN_CACHE_TTL", 180, 10, 900)
 _admin_status_cache = {}
+_admin_status_inflight = {}
 
 
 def is_immune(user_id: int) -> bool:
@@ -1313,18 +1320,9 @@ def is_immune(user_id: int) -> bool:
     return normalized_id != 0 and is_owner(normalized_id)
 
 
-async def is_chat_admin(chat_id, user_id, use_cache=True):
-    """Consulta o cargo no chat com cache curto para não atrasar cada mensagem."""
-    if not chat_id or not user_id:
-        return False
-    user_id = int(user_id)
-    if is_owner(user_id):
-        return True
-    key = (int(chat_id), user_id)
-    now = time.monotonic()
-    cached = _admin_status_cache.get(key)
-    if use_cache and cached and now - cached[1] < ADMIN_CACHE_TTL:
-        return cached[0]
+async def _refresh_chat_admin_status(chat_id, user_id):
+    """Atualiza o cargo uma vez por chave e compartilha o resultado entre eventos."""
+    key = (int(chat_id), int(user_id))
     try:
         permissions = await client.get_permissions(chat_id, user_id)
         allowed = bool(
@@ -1339,11 +1337,58 @@ async def is_chat_admin(chat_id, user_id, use_cache=True):
     except Exception as exc:
         logger.debug("Falha ao verificar cargo no chat %s: %s", chat_id, exc)
         allowed = False
-    _admin_status_cache[key] = (allowed, now)
+    _admin_status_cache[key] = (allowed, time.monotonic())
     if len(_admin_status_cache) > 20000:
         oldest = min(_admin_status_cache, key=lambda item: _admin_status_cache[item][1])
         _admin_status_cache.pop(oldest, None)
     return allowed
+
+
+def _schedule_admin_status_refresh(chat_id, user_id):
+    """Agenda uma única consulta de cargo sem bloquear filtros de mensagens."""
+    key = (int(chat_id), int(user_id))
+    task = _admin_status_inflight.get(key)
+    if task is not None and not task.done():
+        return task
+    task = schedule_background(
+        _refresh_chat_admin_status(chat_id, user_id),
+        "admin-status-refresh",
+    )
+    _admin_status_inflight[key] = task
+
+    def _forget(_completed):
+        if _admin_status_inflight.get(key) is task:
+            _admin_status_inflight.pop(key, None)
+
+    task.add_done_callback(_forget)
+    return task
+
+
+async def is_chat_admin(chat_id, user_id, use_cache=True, wait_for_rpc=True):
+    """Consulta o cargo com cache; filtros podem optar por não esperar o RPC."""
+    if not chat_id or not user_id:
+        return False
+    user_id = int(user_id)
+    if is_owner(user_id):
+        return True
+    key = (int(chat_id), user_id)
+    now = time.monotonic()
+    cached = _admin_status_cache.get(key)
+    if use_cache and cached and now - cached[1] < ADMIN_CACHE_TTL:
+        return cached[0]
+    task = _admin_status_inflight.get(key)
+    if not wait_for_rpc:
+        _schedule_admin_status_refresh(chat_id, user_id)
+        # Estado desconhecido não deve bloquear o dispatcher. O Telegram já
+        # aplica as permissões do grupo; o resultado será usado nos próximos eventos.
+        return None
+    if task is None or task.done():
+        task = _schedule_admin_status_refresh(chat_id, user_id)
+    try:
+        return await asyncio.shield(task)
+    except Exception as exc:
+        logger.debug("Falha ao aguardar estado administrativo de %s/%s: %s", chat_id, user_id, exc)
+        return False
 
 
 async def can_manage_chat(event):
@@ -2415,7 +2460,8 @@ async def chat_lock_filter(event):
     # comandos de uma conta já autorizada pelo Userbot.
     if (event.raw_text or "").startswith(".") and is_authorized(user_id):
         return
-    if await is_chat_admin(event.chat_id, user_id):
+    admin_state = await is_chat_admin(event.chat_id, user_id, wait_for_rpc=False)
+    if admin_state is not False:
         return
     try:
         await delete_security_message(
@@ -2534,7 +2580,8 @@ async def antilink_filter(event):
         return
     if user_id in cache.link_whitelist.get(int(event.chat_id), set()):
         return
-    if await is_chat_admin(event.chat_id, user_id):
+    admin_state = await is_chat_admin(event.chat_id, user_id, wait_for_rpc=False)
+    if admin_state is not False:
         return
     try:
         await delete_security_message(
@@ -2633,7 +2680,8 @@ async def antispam_filter(event):
         return
     # Administradores não entram no antispam: o antilink também possui a
     # mesma exceção e não deve haver punição automática de moderadores.
-    if await is_chat_admin(event.chat_id, user_id):
+    admin_state = await is_chat_admin(event.chat_id, user_id, wait_for_rpc=False)
+    if admin_state is not False:
         return
     settings = await get_settings_async(event.chat_id)
     if not _setting_int(settings, "antispam", 1, 0, 1):
