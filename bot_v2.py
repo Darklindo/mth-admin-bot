@@ -17,7 +17,7 @@ from html import escape
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, functions, types
 from telethon.tl.types import User
-from telethon.errors import RPCError, FloodWaitError, ChatAdminRequiredError, UserAdminInvalidError, MessageNotModifiedError
+from telethon.errors import RPCError, FloodWaitError, ChatAdminRequiredError, UserAdminInvalidError, UserNotParticipantError, MessageNotModifiedError
 
 # --- CONFIGURAÇÕES INICIAIS ---
 BASE_DIR = Path(__file__).resolve().parent
@@ -92,7 +92,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V7.2.1"
+VERSION = "V7.3"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -314,6 +314,16 @@ class Database:
             cache.authorized_expirations[user_id] = expires_at
         return cursor is not None
 
+    def get_authorized_record(self, user_id):
+        cursor = self.execute(
+            "SELECT user_id, created_at, expires_at FROM authorized_users WHERE user_id=?",
+            (int(user_id),),
+        )
+        if cursor is None:
+            return None
+        row = cursor.fetchone()
+        return dict(row) if row else {}
+
     def remove_authorized(self, user_id):
         user_id = int(user_id)
         cursor = self.execute("DELETE FROM authorized_users WHERE user_id=?", (user_id,), commit=True)
@@ -407,6 +417,16 @@ class Database:
             cache.local_blacklist[int(chat_id)].add(int(user_id))
         return cursor is not None
 
+    def get_local_blacklist_record(self, chat_id, user_id):
+        cursor = self.execute(
+            "SELECT chat_id, user_id, reason, created_at, expires_at FROM local_blacklist WHERE chat_id=? AND user_id=?",
+            (int(chat_id), int(user_id)),
+        )
+        if cursor is None:
+            return None
+        row = cursor.fetchone()
+        return dict(row) if row else {}
+
     def remove_local_blacklist(self, chat_id, user_id):
         cursor = self.execute("DELETE FROM local_blacklist WHERE chat_id=? AND user_id=?", (int(chat_id), int(user_id)), commit=True)
         removed = cursor is not None and cursor.rowcount > 0
@@ -485,6 +505,16 @@ class Database:
         if cursor is not None:
             cache.shadow_ban.add(int(user_id))
         return cursor is not None
+
+    def get_shadow_ban_record(self, user_id):
+        cursor = self.execute(
+            "SELECT user_id, reason, created_at, expires_at FROM shadow_ban WHERE user_id=?",
+            (int(user_id),),
+        )
+        if cursor is None:
+            return None
+        row = cursor.fetchone()
+        return dict(row) if row else {}
 
     def remove_shadow_ban(self, user_id):
         cursor = self.execute("DELETE FROM shadow_ban WHERE user_id=?", (int(user_id),), commit=True)
@@ -647,6 +677,17 @@ class Database:
             commit=True,
         )
         return cursor is not None
+
+    def get_temporary_punishment(self, chat_id, user_id, action):
+        cursor = self.execute(
+            "SELECT id, chat_id, user_id, action, expires_at, reason, created_at, admin_id, previous_permissions "
+            "FROM temporary_punishments WHERE chat_id=? AND user_id=? AND action=?",
+            (int(chat_id), int(user_id), str(action)),
+        )
+        if cursor is None:
+            return None
+        row = cursor.fetchone()
+        return dict(row) if row else {}
 
     def get_expired_punishments(self, now=None):
         return self.fetchall("SELECT * FROM temporary_punishments WHERE expires_at<=? ORDER BY expires_at LIMIT 200", (int(now or time.time()),))
@@ -2399,6 +2440,81 @@ async def get_settings_async(chat_id):
         return {}
 
 
+def _record_is_active(record, now=None):
+    """Retorna True somente para um registro presente e ainda vigente."""
+    if not record:
+        return False
+    expires_at = record.get("expires_at") if isinstance(record, dict) else None
+    if expires_at in (None, ""):
+        return True
+    try:
+        return int(expires_at) > int(now or time.time())
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _active_state_suffix(record):
+    """Formata o prazo de um estado ativo para respostas idempotentes."""
+    if not record or record.get("expires_at") in (None, ""):
+        return "permanentemente"
+    try:
+        return f"até <b>{format_timestamp(int(record['expires_at']))}</b>"
+    except (TypeError, ValueError, OverflowError):
+        return "com prazo registrado"
+
+
+async def get_active_temporary_punishment(chat_id, user_id, action):
+    record = await asyncio.to_thread(db.get_temporary_punishment, chat_id, user_id, action)
+    if record is None:
+        return None, True
+    if not _record_is_active(record):
+        return {}, False
+    return record, False
+
+
+async def get_telegram_restriction_state(chat_id, user_id):
+    """Lê restrições atuais apenas sob demanda de um comando de moderação."""
+    if not callable(getattr(client, "get_permissions", None)):
+        # Clientes falsos dos testes não precisam bloquear o caminho de aplicação;
+        # o cliente Telethon real sempre expõe este método.
+        return {"mute": False, "ban": False}, False
+    try:
+        permissions = await client.get_permissions(chat_id, user_id)
+        participant = getattr(permissions, "participant", permissions)
+        banned_rights = getattr(participant, "banned_rights", None)
+        if banned_rights is None:
+            banned_rights = getattr(permissions, "banned_rights", None)
+        if banned_rights is None:
+            return {"mute": False, "ban": False}, False
+        return {
+            "mute": bool(getattr(banned_rights, "send_messages", False)),
+            "ban": bool(getattr(banned_rights, "view_messages", False)),
+        }, False
+    except (RPCError, ValueError, TypeError):
+        return {"mute": False, "ban": False}, False
+    except Exception as exc:
+        logger.debug("Falha ao consultar restrições de %s/%s: %s", chat_id, user_id, exc)
+        return {}, True
+
+
+def _snapshot_allows(snapshot, field, default=True):
+    """Retorna a permissão permitida registrada no snapshot, sem lançar exceção."""
+    if not snapshot:
+        return default
+    try:
+        data = json.loads(snapshot) if isinstance(snapshot, str) else snapshot
+        if not isinstance(data, dict):
+            return default
+        version = int(data.get("version", 1))
+        source = data.get("permissions") if version >= PERMISSION_SNAPSHOT_VERSION else data
+        if not isinstance(source, dict) or field not in source:
+            return default
+        value = bool(source[field])
+        return value if version >= PERMISSION_SNAPSHOT_VERSION else not value
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return default
+
+
 @client.on(events.NewMessage(incoming=True))
 async def antilink_filter(event):
     """Remove links de não administradores sem consultar permissões repetidamente."""
@@ -2660,6 +2776,9 @@ async def cmd_maintenance(event):
         await reply_or_edit(event, "Use <code>.jtmaintenance on</code> ou <code>.jtmaintenance off</code>.", delete_after=DEFAULT_DELETE_AFTER)
         return
     enabled = args[1].lower() in {"on", "1"}
+    if bool(cache.maintenance_enabled) == enabled:
+        await reply_or_edit(event, f"ℹ️ O modo manutenção já está <b>{'ATIVADO' if enabled else 'DESATIVADO'}</b>; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+        return
     if not await asyncio.to_thread(db.set_maintenance, enabled):
         await reply_or_edit(event, "❌ Não foi possível atualizar o modo manutenção no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
@@ -2753,6 +2872,10 @@ async def cmd_quarantine(event):
         await reply_or_edit(event, f"Quarentena: <b>{'ATIVADA' if status else 'DESATIVADA'}</b>. Use <code>.jtquarantine on|off</code>.", delete_after=DEFAULT_DELETE_AFTER)
         return
     enabled = args[1].lower() in {"on", "1"}
+    current = bool(_setting_int(await get_settings_async(event.chat_id), "quarantine_enabled", 0, 0, 1))
+    if current == enabled:
+        await reply_or_edit(event, f"ℹ️ A quarentena já está <b>{'ATIVADA' if enabled else 'DESATIVADA'}</b> neste chat; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+        return
     if not await asyncio.to_thread(db.set_setting, event.chat_id, "quarantine_enabled", int(enabled)):
         await reply_or_edit(event, "❌ Não foi possível atualizar a quarentena no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
@@ -2770,6 +2893,10 @@ async def cmd_antispam_new(event):
         await reply_or_edit(event, f"Antispam: <b>{'ATIVADO' if status else 'DESATIVADO'}</b>. Use <code>.jtantispam on|off</code>.", delete_after=DEFAULT_DELETE_AFTER)
         return
     enabled = args[1].lower() in {"on", "1"}
+    current = bool(_setting_int(await get_settings_async(event.chat_id), "antispam", 1, 0, 1))
+    if current == enabled:
+        await reply_or_edit(event, f"ℹ️ O antispam já está <b>{'ATIVADO' if enabled else 'DESATIVADO'}</b> neste chat; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+        return
     if not await asyncio.to_thread(db.set_setting, event.chat_id, "antispam", int(enabled)):
         await reply_or_edit(event, "❌ Não foi possível atualizar o antispam no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
@@ -2787,6 +2914,10 @@ async def cmd_pinned(event):
         await reply_or_edit(event, f"Proteção de fixadas: <b>{'ATIVADA' if status else 'DESATIVADA'}</b>.", delete_after=DEFAULT_DELETE_AFTER)
         return
     enabled = args[1].lower() in {"on", "1"}
+    current = bool(_setting_int(await get_settings_async(event.chat_id), "protect_pinned", 1, 0, 1))
+    if current == enabled:
+        await reply_or_edit(event, f"ℹ️ A proteção de mensagens fixadas já está <b>{'ATIVADA' if enabled else 'DESATIVADA'}</b>; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+        return
     if not await asyncio.to_thread(db.set_setting, event.chat_id, "protect_pinned", int(enabled)):
         await reply_or_edit(event, "❌ Não foi possível atualizar a proteção de fixadas no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
@@ -2812,6 +2943,10 @@ async def cmd_antilink(event):
         )
         return
     enabled = args[1].lower() in {"on", "1"}
+    current = bool(_setting_int(await get_settings_async(event.chat_id), "antilink", 0, 0, 1))
+    if current == enabled:
+        await reply_or_edit(event, f"ℹ️ O antilink já está <b>{'ATIVADO' if enabled else 'DESATIVADO'}</b> neste chat; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+        return
     if not await asyncio.to_thread(db.set_setting, event.chat_id, "antilink", int(enabled)):
         await reply_or_edit(event, "❌ Não foi possível atualizar o antilink no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
@@ -2833,6 +2968,10 @@ async def cmd_autorizarlink(event):
     target_id = await get_target_from_event(event)
     if not target_id or is_immune(target_id):
         await reply_or_edit(event, "❌ Informe um usuário válido por resposta, ID ou username.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if target_id in cache.link_whitelist.get(int(event.chat_id), set()):
+        user_info = await asyncio.to_thread(db.get_user_info, target_id)
+        await reply_or_edit(event, f"ℹ️ {user_info} (<code>{target_id}</code>) já está autorizado a enviar links neste chat; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
         return
     if not await asyncio.to_thread(db.add_link_authorized, event.chat_id, target_id):
         await reply_or_edit(event, "❌ Não foi possível atualizar a autorização de links no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
@@ -2857,6 +2996,10 @@ async def cmd_desautorizarlink(event):
     target_id = await get_target_from_event(event)
     if not target_id:
         await reply_or_edit(event, "❌ Informe um usuário por resposta, ID ou username.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if target_id not in cache.link_whitelist.get(int(event.chat_id), set()):
+        user_info = await asyncio.to_thread(db.get_user_info, target_id)
+        await reply_or_edit(event, f"ℹ️ {user_info} (<code>{target_id}</code>) não possui autorização de links neste chat; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
         return
     if not await asyncio.to_thread(db.remove_link_authorized, event.chat_id, target_id):
         await reply_or_edit(event, "❌ Não foi possível remover a autorização de links no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
@@ -3062,11 +3205,17 @@ async def cmd_antiblack(event):
     
     action = args[1].lower()
     if action in ['on', 'ativar', '1']:
+        if event.chat_id in cache.antiblack_chats:
+            await reply_or_edit(event, "ℹ️ O Anti-Black já está ativado neste chat; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+            return
         if not await asyncio.to_thread(db.set_antiblack, event.chat_id, 1):
             await reply_or_edit(event, "❌ Não foi possível ativar o Anti-Black no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
             return
         await reply_or_edit(event, "🛡️ <b>Anti-Black ATIVADO!</b> Se algum bot rival apagar suas mensagens, o Userbot irá repostá-las instantaneamente.", delete_after=DEFAULT_DELETE_AFTER)
     elif action in ['off', 'desativar', '0']:
+        if event.chat_id not in cache.antiblack_chats:
+            await reply_or_edit(event, "ℹ️ O Anti-Black já está desativado neste chat; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+            return
         if not await asyncio.to_thread(db.set_antiblack, event.chat_id, 0):
             await reply_or_edit(event, "❌ Não foi possível desativar o Anti-Black no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
             return
@@ -3095,6 +3244,19 @@ async def cmd_kick(event):
     if await reject_fast_moderation_target(event, status_message, target_id, "resultado do kick"):
         return
     try:
+        get_permissions = getattr(client, "get_permissions", None)
+        if callable(get_permissions):
+            try:
+                await get_permissions(event.chat_id, target_id)
+            except UserNotParticipantError:
+                user_info = await asyncio.to_thread(db.get_user_info, target_id)
+                await finish_fast_response(
+                    event,
+                    status_message,
+                    f"ℹ️ {user_info} (<code>{target_id}</code>) não está neste chat; nenhuma alteração foi necessária.",
+                    label="resultado idempotente do kick",
+                )
+                return
         await _edit_response_now(status_message, "⏳ Aplicando a expulsão...")
         await client.kick_participant(event.chat_id, target_id)
         user_info = await asyncio.to_thread(db.get_user_info, target_id)
@@ -3168,6 +3330,20 @@ async def cmd_ban(event):
             label="resultado do ban",
         )
         return
+    existing_ban, ban_state_error = await get_active_temporary_punishment(event.chat_id, target_id, "ban")
+    if ban_state_error:
+        await finish_fast_response(event, status_message, "❌ Não foi possível consultar o estado atual do ban com segurança.", label="erro de estado do ban")
+        return
+    if existing_ban:
+        await finish_fast_response(event, status_message, f"ℹ️ Este usuário já está banido {_active_state_suffix(existing_ban)}; nenhuma alteração foi necessária.", label="resultado do ban")
+        return
+    restriction_state, restriction_error = await get_telegram_restriction_state(event.chat_id, target_id)
+    if restriction_error:
+        await finish_fast_response(event, status_message, "❌ Não foi possível confirmar as permissões atuais do alvo; o ban não foi reaplicado.", label="erro de estado do ban")
+        return
+    if restriction_state.get("ban"):
+        await finish_fast_response(event, status_message, "ℹ️ Este usuário já está banido no Telegram; nenhuma alteração foi necessária.", label="resultado do ban")
+        return
 
     # A captura do snapshot e o EditBanned RPC podem levar alguns segundos;
     # o status acima já foi mostrado antes dessas operações.
@@ -3235,6 +3411,17 @@ async def cmd_unban(event):
         return
     snapshot = record.get("previous_permissions") if record else None
     try:
+        if not state:
+            temporary_ban = await asyncio.to_thread(db.get_temporary_punishment, event.chat_id, target_id, "ban")
+            temporary_banperm = await asyncio.to_thread(db.get_temporary_punishment, event.chat_id, target_id, "banperm")
+            if not _record_is_active(temporary_ban) and not _record_is_active(temporary_banperm):
+                restriction_state, restriction_error = await get_telegram_restriction_state(event.chat_id, target_id)
+                if restriction_error:
+                    await reply_or_edit(event, "❌ Não foi possível confirmar se o usuário está banido; nenhuma alteração foi feita.", delete_after=DEFAULT_DELETE_AFTER)
+                    return
+                if not restriction_state.get("ban"):
+                    await reply_or_edit(event, "ℹ️ Este usuário não está banido neste chat; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+                    return
         await restore_permission_snapshot(event.chat_id, target_id, snapshot, "ban")
         cleared = await asyncio.to_thread(db.clear_temporary_punishments, event.chat_id, target_id, ("ban", "banperm"))
         if cleared < 0:
@@ -3287,6 +3474,22 @@ async def cmd_mute(event):
             "❌ A duração mínima de um mute temporário é de 30 segundos.",
             label="resultado do mute",
         )
+        return
+    existing_mute = None
+    if duration is not None:
+        existing_mute, mute_state_error = await get_active_temporary_punishment(event.chat_id, target_id, "mute")
+        if mute_state_error:
+            await finish_fast_response(event, status_message, "❌ Não foi possível consultar o estado atual do mute com segurança.", label="erro de estado do mute")
+            return
+        if existing_mute:
+            await finish_fast_response(event, status_message, f"ℹ️ Este usuário já está silenciado {_active_state_suffix(existing_mute)}; nenhuma alteração foi necessária.", label="resultado do mute")
+            return
+    restriction_state, restriction_error = await get_telegram_restriction_state(event.chat_id, target_id)
+    if restriction_error:
+        await finish_fast_response(event, status_message, "❌ Não foi possível confirmar as permissões atuais do alvo; o mute não foi reaplicado.", label="erro de estado do mute")
+        return
+    if restriction_state.get("mute"):
+        await finish_fast_response(event, status_message, "ℹ️ Este usuário já está silenciado no Telegram; nenhuma alteração foi necessária.", label="resultado do mute")
         return
     expires_at = int(time.time()) + duration if duration is not None else None
     try:
@@ -3342,6 +3545,16 @@ async def cmd_unmute(event):
         await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=DEFAULT_DELETE_AFTER)
         return
     try:
+        temporary_mute = await asyncio.to_thread(db.get_temporary_punishment, event.chat_id, target_id, "mute")
+        temporary_quarantine = await asyncio.to_thread(db.get_temporary_punishment, event.chat_id, target_id, "quarantine")
+        if not _record_is_active(temporary_mute) and not _record_is_active(temporary_quarantine):
+            restriction_state, restriction_error = await get_telegram_restriction_state(event.chat_id, target_id)
+            if restriction_error:
+                await reply_or_edit(event, "❌ Não foi possível confirmar se o usuário está silenciado; nenhuma alteração foi feita.", delete_after=DEFAULT_DELETE_AFTER)
+                return
+            if not restriction_state.get("mute"):
+                await reply_or_edit(event, "ℹ️ Este usuário não está silenciado neste chat; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+                return
         await client.edit_permissions(event.chat_id, target_id, send_messages=True, send_media=True)
         cleared = await asyncio.to_thread(db.clear_temporary_punishments, event.chat_id, target_id, ("mute", "quarantine"))
         if cleared < 0:
@@ -3362,6 +3575,15 @@ async def cmd_blacklist(event):
     if await reject_moderation_target(event, target_id):
         return
     expires_at = int(time.time()) + duration if duration is not None else None
+    previous_blacklist = await asyncio.to_thread(db.get_local_blacklist_record, event.chat_id, target_id)
+    if previous_blacklist is None:
+        await reply_or_edit(event, "❌ Não foi possível consultar a blacklist local no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if _record_is_active(previous_blacklist):
+        await reply_or_edit(event, f"ℹ️ Este usuário já está na blacklist local {_active_state_suffix(previous_blacklist)}; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if previous_blacklist:
+        await asyncio.to_thread(db.remove_local_blacklist, event.chat_id, target_id)
     if not await asyncio.to_thread(db.add_local_blacklist, event.chat_id, target_id, reason, expires_at=expires_at):
         await reply_or_edit(event, "❌ Não foi possível registrar a blacklist local no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
@@ -3374,6 +3596,15 @@ async def cmd_unblacklist(event):
     target_id = await get_target_from_event(event)
     if not target_id:
         await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    previous_blacklist = await asyncio.to_thread(db.get_local_blacklist_record, event.chat_id, target_id)
+    if previous_blacklist is None:
+        await reply_or_edit(event, "❌ Não foi possível consultar a blacklist local no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if not _record_is_active(previous_blacklist):
+        if previous_blacklist:
+            await asyncio.to_thread(db.remove_local_blacklist, event.chat_id, target_id)
+        await reply_or_edit(event, "ℹ️ Este usuário não possui blacklist local ativa neste chat; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
         return
     if not await asyncio.to_thread(db.remove_local_blacklist, event.chat_id, target_id):
         await reply_or_edit(event, "❌ Não foi possível remover a blacklist local do banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
@@ -3392,8 +3623,23 @@ async def cmd_banperm(event):
         await reply_or_edit(event, "❌ A duração mínima de um ban temporário é de 30 segundos.", delete_after=DEFAULT_DELETE_AFTER)
         return
     expires_at = int(time.time()) + duration if duration is not None else None
+    existing_banperm = await asyncio.to_thread(db.get_local_banperm_record, event.chat_id, target_id)
+    if existing_banperm is None:
+        await reply_or_edit(event, "❌ Não foi possível consultar o ban local no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if _record_is_active(existing_banperm):
+        await reply_or_edit(event, f"ℹ️ Este usuário já possui banimento local {_active_state_suffix(existing_banperm)}; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if existing_banperm:
+        await asyncio.to_thread(db.remove_local_banperm, event.chat_id, target_id)
     try:
         snapshot = await capture_permission_snapshot(event.chat_id, target_id)
+        if snapshot is None:
+            await reply_or_edit(event, "❌ Não foi possível consultar as permissões atuais; o ban não foi reaplicado.", delete_after=DEFAULT_DELETE_AFTER)
+            return
+        if not _snapshot_allows(snapshot, "view_messages", True):
+            await reply_or_edit(event, "ℹ️ Este usuário já está banido no Telegram; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+            return
         permission_kwargs = {"view_messages": False}
         if expires_at is not None:
             permission_kwargs["until_date"] = telegram_datetime(expires_at)
@@ -3434,6 +3680,10 @@ async def cmd_unbanperm(event):
     if record is None:
         await reply_or_edit(event, "❌ Não foi possível ler o snapshot do ban permanente no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
+    if not _record_is_active(record):
+        await asyncio.to_thread(db.remove_local_banperm, event.chat_id, target_id)
+        await reply_or_edit(event, "ℹ️ O ban permanente já estava vencido e foi limpo; nenhuma alteração adicional foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+        return
     snapshot = record.get("previous_permissions")
     try:
         await restore_permission_snapshot(event.chat_id, target_id, snapshot, "banperm")
@@ -3467,6 +3717,15 @@ async def cmd_shadow(event):
     if await reject_moderation_target(event, target_id):
         return
     expires_at = int(time.time()) + duration if duration is not None else None
+    previous_shadow = await asyncio.to_thread(db.get_shadow_ban_record, target_id)
+    if previous_shadow is None:
+        await reply_or_edit(event, "❌ Não foi possível consultar o Shadow Ban no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if _record_is_active(previous_shadow):
+        await reply_or_edit(event, f"ℹ️ Este usuário já está em Shadow Ban {_active_state_suffix(previous_shadow)}; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if previous_shadow:
+        await asyncio.to_thread(db.remove_shadow_ban, target_id)
     if not await asyncio.to_thread(db.add_shadow_ban, target_id, reason, expires_at=expires_at):
         await reply_or_edit(event, "❌ Não foi possível registrar o Shadow Ban no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
@@ -3479,6 +3738,15 @@ async def cmd_unshadow(event):
     target_id = await get_target_from_event(event)
     if not target_id:
         await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    previous_shadow = await asyncio.to_thread(db.get_shadow_ban_record, target_id)
+    if previous_shadow is None:
+        await reply_or_edit(event, "❌ Não foi possível consultar o Shadow Ban no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if not _record_is_active(previous_shadow):
+        if previous_shadow:
+            await asyncio.to_thread(db.remove_shadow_ban, target_id)
+        await reply_or_edit(event, "ℹ️ Este usuário não possui Shadow Ban ativo; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
         return
     if not await asyncio.to_thread(db.remove_shadow_ban, target_id):
         await reply_or_edit(event, "❌ Não foi possível remover o Shadow Ban do banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
@@ -3684,6 +3952,14 @@ async def cmd_allblack(event):
     if await reject_moderation_target(event, target_id):
         return
     expires_at = int(time.time()) + duration if duration is not None else None
+    previous_global = await asyncio.to_thread(db.get_global_blacklist_record, target_id)
+    if previous_global and _record_is_active(previous_global):
+        existing_type = str(previous_global.get("type") or "").lower()
+        if existing_type == "black":
+            await reply_or_edit(event, f"ℹ️ Este usuário já está em blacklist global {_active_state_suffix(previous_global)}; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+        else:
+            await reply_or_edit(event, f"ℹ️ Este usuário já possui allban global {_active_state_suffix(previous_global)}. Use <code>.jtunallblack</code> somente após remover a punição global atual.", delete_after=DEFAULT_DELETE_AFTER)
+        return
     if not await asyncio.to_thread(db.add_global_blacklist, target_id, 'black', reason, expires_at=expires_at):
         await reply_or_edit(event, "❌ Não foi possível registrar a blacklist global no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
@@ -3697,7 +3973,15 @@ async def cmd_unallblack(event):
     if not target_id:
         await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=DEFAULT_DELETE_AFTER)
         return
-    was_ban = cache.global_blacklist_types.get(int(target_id)) == "ban"
+    current_global = await asyncio.to_thread(db.get_global_blacklist_record, target_id)
+    if current_global is None:
+        await reply_or_edit(event, "ℹ️ Este usuário não possui blacklist ou allban global ativo; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if not _record_is_active(current_global):
+        await asyncio.to_thread(db.remove_global_blacklist, target_id)
+        await reply_or_edit(event, "ℹ️ O registro global já estava vencido e foi limpo; nenhuma alteração adicional foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    was_ban = str(current_global.get("type") or "").lower() == "ban"
     if was_ban:
         attempted, failures = await restore_global_ban(target_id)
         if failures:
@@ -3726,6 +4010,10 @@ async def cmd_autorizar(event):
         await reply_or_edit(event, "❌ Os proprietários já possuem acesso permanente.", delete_after=5)
         return
     expires_at = int(time.time()) + duration if duration is not None else None
+    previous_auth = await asyncio.to_thread(db.get_authorized_record, target_id)
+    if previous_auth and _record_is_active(previous_auth):
+        await reply_or_edit(event, f"ℹ️ Este usuário já está autorizado {_active_state_suffix(previous_auth)}; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+        return
     if not await asyncio.to_thread(db.add_authorized, target_id, expires_at=expires_at):
         await reply_or_edit(event, "❌ Não foi possível registrar a autorização no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
         return
@@ -3748,6 +4036,17 @@ async def cmd_desautorizar(event):
     target_id = await get_target_from_event(event)
     if not target_id:
         await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=5)
+        return
+    previous_auth = await asyncio.to_thread(db.get_authorized_record, target_id)
+    if previous_auth is None:
+        await reply_or_edit(event, "❌ Não foi possível consultar a autorização no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if not previous_auth:
+        await reply_or_edit(event, "ℹ️ Este usuário não possui autorização ativa; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if not _record_is_active(previous_auth):
+        await asyncio.to_thread(db.remove_authorized, target_id)
+        await reply_or_edit(event, "ℹ️ A autorização já estava vencida e foi limpa; nenhuma alteração adicional foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
         return
     if not await asyncio.to_thread(db.remove_authorized, target_id):
         await reply_or_edit(event, "❌ Não foi possível revogar a autorização no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
