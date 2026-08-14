@@ -92,7 +92,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V7.3"
+VERSION = "V7.4"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -121,7 +121,7 @@ class Cache:
         self.settings_loaded = set()
         self.maintenance_enabled = False
         self.maintenance_loaded = False
-        # Identidade aquecida no startup para que .jtstatus não faça RPC no caminho comum.
+        # Identidade aquecida no startup para que .status não faça RPC no caminho comum.
         self.me = None
         self.me_loaded = False
 
@@ -2763,17 +2763,17 @@ async def maintenance_filter(event):
     if not cache.maintenance_enabled or is_owner(event.sender_id):
         return
     command = (event.raw_text or "").split(maxsplit=1)[0].lower()
-    if command in {".jtmaintenance", ".jtstatus", ".jthealth", ".jtlatency"}:
+    if command in {".maintenance", ".status", ".health", ".latency"}:
         return
     await delete_command_safely(event)
     raise events.StopPropagation
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtmaintenance(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.maintenance(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_maintenance(event):
     args = (event.raw_text or "").split()
     if len(args) < 2 or args[1].lower() not in {"on", "off", "1", "0"}:
-        await reply_or_edit(event, "Use <code>.jtmaintenance on</code> ou <code>.jtmaintenance off</code>.", delete_after=DEFAULT_DELETE_AFTER)
+        await reply_or_edit(event, "Use <code>.maintenance on</code> ou <code>.maintenance off</code>.", delete_after=DEFAULT_DELETE_AFTER)
         return
     enabled = args[1].lower() in {"on", "1"}
     if bool(cache.maintenance_enabled) == enabled:
@@ -2861,7 +2861,7 @@ async def cmd_unlock(event):
         await reply_or_edit(event, "❌ Não foi possível desbloquear o grupo com segurança.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtquarantine(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.quarantine(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_quarantine(event):
     if not await require_chat_admin(event, "alterar a quarentena"):
         return
@@ -2869,7 +2869,7 @@ async def cmd_quarantine(event):
     if len(args) < 2 or args[1].lower() not in {"on", "off", "1", "0"}:
         settings = await get_settings_async(event.chat_id)
         status = bool(_setting_int(settings, "quarantine_enabled", 0, 0, 1))
-        await reply_or_edit(event, f"Quarentena: <b>{'ATIVADA' if status else 'DESATIVADA'}</b>. Use <code>.jtquarantine on|off</code>.", delete_after=DEFAULT_DELETE_AFTER)
+        await reply_or_edit(event, f"Quarentena: <b>{'ATIVADA' if status else 'DESATIVADA'}</b>. Use <code>.quarantine on|off</code>.", delete_after=DEFAULT_DELETE_AFTER)
         return
     enabled = args[1].lower() in {"on", "1"}
     current = bool(_setting_int(await get_settings_async(event.chat_id), "quarantine_enabled", 0, 0, 1))
@@ -2882,7 +2882,7 @@ async def cmd_quarantine(event):
     await reply_or_edit(event, f"🛡️ Quarentena antispam <b>{'ATIVADA' if enabled else 'DESATIVADA'}</b> neste chat.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtantispam(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.antispam(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_antispam_new(event):
     if not await require_chat_admin(event, "alterar o antispam"):
         return
@@ -2890,7 +2890,7 @@ async def cmd_antispam_new(event):
     if len(args) < 2 or args[1].lower() not in {"on", "off", "1", "0"}:
         settings = await get_settings_async(event.chat_id)
         status = bool(_setting_int(settings, "antispam", 1, 0, 1))
-        await reply_or_edit(event, f"Antispam: <b>{'ATIVADO' if status else 'DESATIVADO'}</b>. Use <code>.jtantispam on|off</code>.", delete_after=DEFAULT_DELETE_AFTER)
+        await reply_or_edit(event, f"Antispam: <b>{'ATIVADO' if status else 'DESATIVADO'}</b>. Use <code>.antispam on|off</code>.", delete_after=DEFAULT_DELETE_AFTER)
         return
     enabled = args[1].lower() in {"on", "1"}
     current = bool(_setting_int(await get_settings_async(event.chat_id), "antispam", 1, 0, 1))
@@ -2903,7 +2903,7 @@ async def cmd_antispam_new(event):
     await reply_or_edit(event, f"🛡️ Antispam <b>{'ATIVADO' if enabled else 'DESATIVADO'}</b> neste chat.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtpinned(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.pinned(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_pinned(event):
     if not await require_chat_admin(event, "alterar a proteção de mensagens fixadas"):
         return
@@ -2957,7 +2957,7 @@ async def cmd_antilink(event):
     )
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtautorizarlink(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.autorizarlink(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_autorizarlink(event):
     if not (event.is_group or event.is_channel):
         await reply_or_edit(event, "❌ A autorização de links só pode ser configurada em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
@@ -2985,7 +2985,7 @@ async def cmd_autorizarlink(event):
     )
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtdesautorizarlink(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.desautorizarlink(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_desautorizarlink(event):
     if not (event.is_group or event.is_channel):
         await reply_or_edit(event, "❌ A autorização de links só pode ser configurada em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
@@ -3013,7 +3013,7 @@ async def cmd_desautorizarlink(event):
     )
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtlistlinkauth(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.listlinkauth(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_listlinkauth(event):
     if not (event.is_group or event.is_channel):
         await reply_or_edit(event, "❌ A whitelist de links só pode ser consultada em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
@@ -3188,19 +3188,19 @@ async def cmd_warns(event):
     await reply_or_edit(event, text, delete_after=15)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtstart(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.start(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_start(event):
     text = f"🛡️ <b>Jtzin Userbot {VERSION} (Status e Health)</b>\n\nEquipe Diamond — Operacional."
     await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.jtantiblack(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.antiblack(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_antiblack(event):
     if not await require_chat_admin(event, "alterar o Modo Fênix"):
         return
     args = event.raw_text.split()
     if len(args) < 2:
         status = "ATIVADO 🛡️" if event.chat_id in cache.antiblack_chats else "DESATIVADO ❌"
-        await reply_or_edit(event, f"ℹ️ Anti-Black neste chat está: <b>{status}</b>\nUse <code>.jtantiblack on</code> ou <code>.jtantiblack off</code>", delete_after=5)
+        await reply_or_edit(event, f"ℹ️ Anti-Black neste chat está: <b>{status}</b>\nUse <code>.antiblack on</code> ou <code>.antiblack off</code>", delete_after=5)
         return
     
     action = args[1].lower()
@@ -3221,7 +3221,7 @@ async def cmd_antiblack(event):
             return
         await reply_or_edit(event, "❌ <b>Anti-Black DESATIVADO.</b>", delete_after=DEFAULT_DELETE_AFTER)
     else:
-        await reply_or_edit(event, "❌ Use <code>.jtantiblack on</code> ou <code>.jtantiblack off</code>", delete_after=DEFAULT_DELETE_AFTER)
+        await reply_or_edit(event, "❌ Use <code>.antiblack on</code> ou <code>.antiblack off</code>", delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.jtkick(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_kick(event):
@@ -3312,13 +3312,13 @@ async def cmd_ban(event):
             label="resultado do ban",
         )
         return
-    # .jtban é temporário por definição. O comando permanente é .jtbanperm;
+    # .jtban é temporário por definição. O comando permanente é .banperm;
     # nunca permitir que a ausência de duração caia silenciosamente no ban eterno.
     if duration is None:
         await finish_fast_response(
             event,
             status_message,
-            "❌ O <code>.jtban</code> exige uma duração, por exemplo <code>.jtban 30m</code>. Para banir permanentemente, use <code>.jtbanperm</code>.",
+            "❌ O <code>.jtban</code> exige uma duração, por exemplo <code>.jtban 30m</code>. Para banir permanentemente, use <code>.banperm</code>.",
             label="resultado do ban",
         )
         return
@@ -3568,7 +3568,7 @@ async def cmd_unmute(event):
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao desmutar: {e}", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.jtblacklist(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.blacklist(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_blacklist(event):
     target_id = await get_target_from_event(event)
     duration, _, reason = parse_moderation_options(event)
@@ -3591,7 +3591,7 @@ async def cmd_blacklist(event):
     queue_audit_log(event.chat_id, target_id, "Ação: Blacklist Local", "Moderação", admin_id=event.sender_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist local ({duration_label(duration)}).", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.jtunblacklist(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.unblacklist(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unblacklist(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -3613,7 +3613,7 @@ async def cmd_unblacklist(event):
     user_info = await asyncio.to_thread(db.get_user_info, target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido da blacklist local deste chat.", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.jtbanperm(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.banperm(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_banperm(event):
     target_id = await get_target_from_event(event)
     duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
@@ -3663,7 +3663,7 @@ async def cmd_banperm(event):
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao banir: {e}", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.jtunbanperm(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.unbanperm(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unbanperm(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -3710,7 +3710,7 @@ async def cmd_unbanperm(event):
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao desbanir: {e}", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.jtshadow(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.shadow(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_shadow(event):
     target_id = await get_target_from_event(event)
     duration, _, reason = parse_moderation_options(event)
@@ -3733,7 +3733,7 @@ async def cmd_shadow(event):
     queue_audit_log(event.chat_id, target_id, "Ação: Shadow Ban", "Moderação", admin_id=event.sender_id)
     await reply_or_edit(event, f"🌑 {user_info} (<code>{target_id}</code>) em Shadow Ban (mensagens serão apagadas globalmente).", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.jtunshadow(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.unshadow(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unshadow(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -3821,7 +3821,7 @@ async def _apply_allban_to_chat(chat, target_id, expires_at, purge_limit, includ
             return False, type(exc).__name__
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtallban(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.allban(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_allban(event):
     status = await begin_fast_response(
         event,
@@ -3848,7 +3848,7 @@ async def cmd_allban(event):
         await finish_fast_response(
             event,
             status,
-            "ℹ️ Este usuário já possui um allban ativo. Use <code>.jtunallblack</code> antes de iniciar outro ciclo global.",
+            "ℹ️ Este usuário já possui um allban ativo. Use <code>.unallblack</code> antes de iniciar outro ciclo global.",
             label="resultado do allban",
         )
         return
@@ -3945,7 +3945,7 @@ async def cmd_allban(event):
         result_text += f" Limpeza opcional com falhas parciais: {partial_cleanup}."
     await finish_fast_response(event, status, result_text, label="resultado do allban")
 
-@client.on(events.NewMessage(pattern=r'^\.jtallblack(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.allblack(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_allblack(event):
     target_id = await get_target_from_event(event)
     duration, _, reason = parse_moderation_options(event)
@@ -3958,7 +3958,7 @@ async def cmd_allblack(event):
         if existing_type == "black":
             await reply_or_edit(event, f"ℹ️ Este usuário já está em blacklist global {_active_state_suffix(previous_global)}; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
         else:
-            await reply_or_edit(event, f"ℹ️ Este usuário já possui allban global {_active_state_suffix(previous_global)}. Use <code>.jtunallblack</code> somente após remover a punição global atual.", delete_after=DEFAULT_DELETE_AFTER)
+            await reply_or_edit(event, f"ℹ️ Este usuário já possui allban global {_active_state_suffix(previous_global)}. Use <code>.unallblack</code> somente após remover a punição global atual.", delete_after=DEFAULT_DELETE_AFTER)
         return
     if not await asyncio.to_thread(db.add_global_blacklist, target_id, 'black', reason, expires_at=expires_at):
         await reply_or_edit(event, "❌ Não foi possível registrar a blacklist global no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
@@ -3967,7 +3967,7 @@ async def cmd_allblack(event):
     queue_audit_log(event.chat_id, target_id, "Ação: Allblack Global", "Moderação Global", admin_id=event.sender_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist global.", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.jtunallblack(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.unallblack(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_unallblack(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -4000,7 +4000,7 @@ async def cmd_unallblack(event):
     user_info = await asyncio.to_thread(db.get_user_info, target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido da blacklist global.", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.jtautorizar(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.autorizar(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_autorizar(event):
     target_id, duration = await get_authorization_target_and_expiry(event)
     if not target_id:
@@ -4031,7 +4031,7 @@ async def cmd_autorizar(event):
         delete_after=5,
     )
 
-@client.on(events.NewMessage(pattern=r'^\.jtdesautorizar(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.desautorizar(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_desautorizar(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -4055,7 +4055,7 @@ async def cmd_desautorizar(event):
     queue_audit_log(event.chat_id, target_id, "Ação: Desautorizar", "Controle", admin_id=event.sender_id)
     await reply_or_edit(event, f"❌ Acesso revogado para {user_info} (<code>{target_id}</code>).", delete_after=5)
 
-@client.on(events.NewMessage(pattern=r'^\.jtlistauth(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.listauth(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_listauth(event):
     auths = await asyncio.to_thread(db.get_all_authorized)
     if not auths:
@@ -4072,7 +4072,7 @@ async def cmd_listauth(event):
         text += f"• {info} (<code>{user_id}</code>)\n└ 📅 {date_str} | {access_text}\n"
     await reply_or_edit(event, text, delete_after=15)
 
-@client.on(events.NewMessage(pattern=r'^\.jtlogs(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.logs(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_logs(event):
     await audit_buffer.flush()
     logs = await asyncio.to_thread(db.get_latest_logs, 10)
@@ -4099,7 +4099,7 @@ async def cmd_logs(event):
         text += "------------------\n"
     await reply_or_edit(event, text, delete_after=15)
 
-@client.on(events.NewMessage(pattern=r'^\.jtlistdn(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.listdn(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_listdn(event):
     shadow, glob = await asyncio.to_thread(db.get_all_banned_list_detailed)
     all_rows = list(shadow) + list(glob)
@@ -4127,7 +4127,7 @@ async def cmd_listdn(event):
         text += "Nenhuma punição global registrada."
     await reply_or_edit(event, text, delete_after=15)
 
-@client.on(events.NewMessage(pattern=r'^\.jtstatus(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.status(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_status(event):
     started = time.perf_counter()
     api_state = "⚠️ indisponível"
@@ -4181,7 +4181,7 @@ async def cmd_status(event):
     await reply_or_edit(event, text, delete_after=15)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtlatency(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.latency(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_latency(event):
     started = time.perf_counter()
     try:
@@ -4212,7 +4212,7 @@ async def cmd_latency(event):
     await reply_or_edit(event, text, delete_after=15)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jthealth(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.health(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_health(event):
     checks = []
     critical_ok = True
@@ -4277,40 +4277,40 @@ async def cmd_help(event):
         "• <code>.jtkick</code> | <code>.jtban [duração] [--purge N]</code> | <code>.jtunban</code>\n"
         "• <code>.jtmute [duração] [--purge N]</code> | <code>.jtunmute</code>\n"
         "• <code>.jtpurge [5-100]</code> | <code>.jtpurgeme [5-100]</code> | <code>.jtpurgeall [1-1000]</code>\n"
-        "• <code>.jtblacklist [duração]</code> | <code>.jtunblacklist</code> (somente este chat)\n"
-        "• <code>.jtbanperm [duração] [--purge N]</code> | <code>.jtunbanperm</code>\n"
-        "• <code>.jtshadow [duração]</code> | <code>.jtunshadow</code> (global)\n\n"
+        "• <code>.blacklist [duração]</code> | <code>.unblacklist</code> (somente este chat)\n"
+        "• <code>.banperm [duração] [--purge N]</code> | <code>.unbanperm</code>\n"
+        "• <code>.shadow [duração]</code> | <code>.unshadow</code> (global)\n\n"
         "⚠️ <b>ADVERTÊNCIAS & ANTISPAM:</b>\n"
         "• <code>.jtwarn @user motivo</code> | <code>.jtwarns</code>\n"
         "• <code>.jtunwarn</code> (remove uma advertência) | <code>.jtdelwarn</code> (apaga e adverte)\n"
         "• <code>.jtclearwarns @user</code> (remove todas as advertências)\n"
-        "• <code>.jtantispam on/off</code> (pontuação adaptativa, mídia, links e duplicação)\n"
-        "• <code>.jtquarantine on/off</code> (só pune com padrão forte)\n"
-        "• <code>.jtpinned on/off</code> (protege mensagens fixadas)\n\n"
+        "• <code>.antispam on/off</code> (pontuação adaptativa, mídia, links e duplicação)\n"
+        "• <code>.quarantine on/off</code> (só pune com padrão forte)\n"
+        "• <code>.pinned on/off</code> (protege mensagens fixadas)\n\n"
         "🔗 <b>CONTROLE DE LINKS:</b>\n"
         "• <code>.jtantilink on/off</code> (links somente para admins e autorizados)\n"
-        "• <code>.jtautorizarlink</code> | <code>.jtdesautorizarlink</code> | <code>.jtlistlinkauth</code>\n\n"
+        "• <code>.autorizarlink</code> | <code>.desautorizarlink</code> | <code>.listlinkauth</code>\n\n"
         "👑 <b>CONTROLE GLOBAL:</b>\n"
-        "• <code>.jtallban [duração] [--purge N]</code> | <code>.jtallblack [duração]</code> | <code>.jtunallblack</code>\n"
-        "• <code>.jtmaintenance on/off</code> (somente proprietário)\n"
-        "• <code>.jtautorizar [duração]</code> | <code>.jtdesautorizar</code> | <code>.jtlistauth</code> (Acessos permanentes ou temporários: 10s, 30m, 10h, 10d)\n\n"
+        "• <code>.allban [duração] [--purge N]</code> | <code>.allblack [duração]</code> | <code>.unallblack</code>\n"
+        "• <code>.maintenance on/off</code> (somente proprietário)\n"
+        "• <code>.autorizar [duração]</code> | <code>.desautorizar</code> | <code>.listauth</code> (Acessos permanentes ou temporários: 10s, 30m, 10h, 10d)\n\n"
         "🔍 <b>SEGURANÇA & CONTRA-ESPIONAGEM:</b>\n"
-        "• <code>.jtantiblack on/off</code> (Modo Fênix)\n"
-        "• <code>.jtantispy</code> (Varredura de Espiões)\n"
-        "• <code>.jtlistspy</code> | <code>.jtdelspy</code> (Gestão de Espiões)\n\n"
+        "• <code>.antiblack on/off</code> (Modo Fênix)\n"
+        "• <code>.antispy</code> (Varredura de Espiões)\n"
+        "• <code>.listspy</code> | <code>.delspy</code> (Gestão de Espiões)\n\n"
         "🛠️ <b>UTILITÁRIOS & RELATÓRIOS:</b>\n"
-        "• <code>.jtstart</code> | <code>.jtstatus</code> | <code>.jthealth</code> | <code>.jtlatency</code> (Diagnóstico rápido)\n"
-        "• <code>.jtmsg</code> (Broadcast Global)\n"
-        "• <code>.jtchats</code> (Lista de Chats)\n"
-        "• <code>.jtlistdn</code> (Punições Globais)\n"
-        "• <code>.jtlogs</code> (Auditoria de Deleções)\n"
+        "• <code>.start</code> | <code>.status</code> | <code>.health</code> | <code>.latency</code> (Diagnóstico rápido)\n"
+        "• <code>.msg</code> (Broadcast Global)\n"
+        "• <code>.chats</code> (Lista de Chats)\n"
+        "• <code>.listdn</code> (Punições Globais)\n"
+        "• <code>.logs</code> (Auditoria de Deleções)\n"
         "• <code>.jtid</code> (Mostra o ID do usuário)\n"
-        "• <code>.jtinfojt</code> (Informações detalhadas por reply, ID ou username)\n"
+        "• <code>.infojt</code> (Informações detalhadas por reply, ID ou username)\n"
         "• <code>.jthelp</code>"
     )
     await reply_or_edit(event, text, delete_after=15)
 
-@client.on(events.NewMessage(pattern=r'^\.jtantispy(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.antispy(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_antispy(event):
     if not event.is_group and not event.is_channel:
         await reply_or_edit(event, "❌ Este comando só pode ser usado em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
@@ -4372,7 +4372,7 @@ async def cmd_antispy(event):
         )
     await delete_command_safely(event)
 
-@client.on(events.NewMessage(pattern=r'^\.jtlistspy(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.listspy(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_listspy(event):
     spies = await asyncio.to_thread(db.get_all_spies)
     if not spies:
@@ -4387,7 +4387,7 @@ async def cmd_listspy(event):
         text += f"• {info} (<code>{s['user_id']}</code>)\n└ 🕒 {date_str} | Chat: <code>{s['chat_id']}</code> | Confiança: <code>{confidence}%</code>\n└ Sinais: {signals}\n"
     await reply_or_edit(event, text, delete_after=15)
 
-@client.on(events.NewMessage(pattern=r'^\.jtdelspy(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.delspy(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_delspy(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -4546,7 +4546,7 @@ async def cmd_id(event):
     target_id = await get_target_from_event(event) or event.sender_id
     await reply_or_edit(event, f"🆔 ID: <code>{target_id}</code>", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.jtinfojt(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.infojt(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_infojt(event):
     """Exibe informações detalhadas de um usuário por reply, ID ou username."""
     target_id = await get_target_from_event(event)
@@ -4678,7 +4678,7 @@ async def cmd_infojt(event):
     await reply_or_edit(event, "\n".join(lines), delete_after=15)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtmsg(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.msg(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_msg(event):
     reply = await event.get_reply_message()
     command_args = event.raw_text.split(maxsplit=1)
@@ -4718,7 +4718,7 @@ async def cmd_msg(event):
     success = sum(1 for result in results if result)
     await reply_or_edit(event, f"📢 Transmissão concluída: {success}/{len(targets)} chats receberam.", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.jtchats(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.chats(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_chats(event):
     chats = await asyncio.to_thread(db.all_chats_detailed)
     private_ids = [r.get('chat_id') for r in chats if r.get('chat_type') in ['private', 'User']]
@@ -4747,7 +4747,7 @@ if __name__ == "__main__":
     logger.info("JTZIN USERBOT %s (STATUS E HEALTH) INICIANDO...", VERSION)
     client.start()
     try:
-        # Aquece a identidade uma única vez para retirar get_me do comando .jtstatus.
+        # Aquece a identidade uma única vez para retirar get_me do comando .status.
         cache.me = client.loop.run_until_complete(client.get_me())
         cache.me_loaded = cache.me is not None
     except Exception as exc:
