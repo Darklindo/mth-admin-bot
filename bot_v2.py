@@ -92,11 +92,16 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V7.7"
+VERSION = "V7.8"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 TELETHON_LOG_LEVEL = os.getenv("TELETHON_LOG_LEVEL", "WARNING").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
+PROFILE_BACKUP_PATH = DATA_DIR / "profile_backup.json"
+PROFILE_BACKUP_PHOTO_PATH = DATA_DIR / "profile_backup_photo.jpg"
+PROFILE_CLONE_TEMP_PATH = DATA_DIR / "profile_clone_temp.jpg"
+PROFILE_BACKUP_SCHEMA = 1
+
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -987,6 +992,225 @@ client = TelegramClient(
     device_model="Jtzin Userbot",
     app_version=VERSION,
 )
+
+
+PROFILE_OPERATION_LOCK = asyncio.Lock()
+
+
+def _write_profile_snapshot(snapshot):
+    """Grava o backup de perfil de forma atômica e com permissões privadas."""
+    PROFILE_BACKUP_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = PROFILE_BACKUP_PATH.with_suffix(".tmp")
+    payload = json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True)
+    temporary_path.write_text(payload, encoding="utf-8")
+    try:
+        os.chmod(temporary_path, 0o600)
+    except OSError:
+        logger.debug("Não foi possível ajustar permissões do backup de perfil")
+    temporary_path.replace(PROFILE_BACKUP_PATH)
+    try:
+        os.chmod(PROFILE_BACKUP_PATH, 0o600)
+    except OSError:
+        logger.debug("Não foi possível ajustar permissões do arquivo de backup")
+
+
+def _read_profile_snapshot():
+    """Lê e valida o backup local sem confiar cegamente em JSON corrompido."""
+    try:
+        snapshot = json.loads(PROFILE_BACKUP_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("Backup de perfil inválido: %s", exc)
+        return None
+    if not isinstance(snapshot, dict):
+        logger.warning("Backup de perfil não é um objeto JSON")
+        return None
+    try:
+        schema = int(snapshot.get("schema", 0))
+    except (TypeError, ValueError):
+        logger.warning("Versão de backup de perfil inválida")
+        return None
+    if schema != PROFILE_BACKUP_SCHEMA:
+        logger.warning("Versão de backup de perfil não suportada")
+        return None
+    required = {"first_name", "last_name", "about", "username", "has_photo"}
+    if not required.issubset(snapshot):
+        logger.warning("Backup de perfil incompleto; restauração bloqueada")
+        return None
+    return snapshot
+
+
+async def _download_profile_photo_to(path, entity):
+    """Baixa uma foto de perfil para um caminho temporário, retornando bool."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    downloaded = await client.download_profile_photo(entity, file=str(path), download_big=True)
+    if not downloaded:
+        return False
+    downloaded_path = Path(downloaded)
+    if downloaded_path != path and downloaded_path.exists():
+        path.write_bytes(downloaded_path.read_bytes())
+    return path.exists() and path.stat().st_size > 0
+
+
+async def _delete_all_profile_photos():
+    """Remove as fotos atuais em lotes, usado quando o backup não tinha foto."""
+    photos = await client.get_profile_photos("me", limit=None)
+    input_photos = []
+    for photo in photos or []:
+        photo_id = getattr(photo, "id", None)
+        access_hash = getattr(photo, "access_hash", None)
+        if photo_id is None or access_hash is None:
+            continue
+        input_photos.append(
+            types.InputPhoto(
+                id=int(photo_id),
+                access_hash=int(access_hash),
+                file_reference=getattr(photo, "file_reference", b"") or b"",
+            )
+        )
+    for start in range(0, len(input_photos), 100):
+        await client(functions.photos.DeletePhotosRequest(id=input_photos[start:start + 100]))
+    return len(input_photos)
+
+
+async def _apply_profile_photo(path):
+    """Carrega e define uma foto local como foto principal do perfil."""
+    uploaded = await client.upload_file(str(path))
+    await client(functions.photos.UploadProfilePhotoRequest(file=uploaded))
+
+
+async def _capture_current_profile():
+    """Captura nome, bio, username e foto atuais da conta autenticada."""
+    me = await client.get_me()
+    full = await client(functions.users.GetFullUserRequest(me))
+    full_user = getattr(full, "full_user", None)
+    temporary_photo = PROFILE_BACKUP_PHOTO_PATH.with_suffix(".capture.tmp")
+    if temporary_photo.exists():
+        temporary_photo.unlink()
+    has_photo = False
+    try:
+        has_photo = await _download_profile_photo_to(temporary_photo, me)
+        if has_photo:
+            temporary_photo.replace(PROFILE_BACKUP_PHOTO_PATH)
+            try:
+                os.chmod(PROFILE_BACKUP_PHOTO_PATH, 0o600)
+            except OSError:
+                logger.debug("Não foi possível ajustar permissões da foto de backup")
+        elif PROFILE_BACKUP_PHOTO_PATH.exists():
+            PROFILE_BACKUP_PHOTO_PATH.unlink()
+    finally:
+        if temporary_photo.exists():
+            temporary_photo.unlink()
+    return {
+        "schema": PROFILE_BACKUP_SCHEMA,
+        "saved_at": int(time.time()),
+        "user_id": int(me.id),
+        "first_name": me.first_name or "",
+        "last_name": me.last_name or "",
+        "username": me.username or None,
+        "about": getattr(full_user, "about", "") or "",
+        "has_photo": bool(has_photo),
+    }
+
+
+async def _resolve_profile_entity(event):
+    """Resolve o alvo por reply, ID ou username para operações de perfil."""
+    reply = await event.get_reply_message()
+    if reply is not None and getattr(reply, "id", None) != getattr(event, "id", None):
+        sender = getattr(reply, "sender", None)
+        if isinstance(sender, User):
+            return sender
+        try:
+            sender = await reply.get_sender()
+            if isinstance(sender, User):
+                return sender
+        except (RPCError, ValueError) as exc:
+            logger.debug("Não foi possível resolver o remetente da resposta: %s", exc)
+
+    tokens = (event.raw_text or "").split()[1:]
+    ignored = {"confirmar", "confirm", "--confirmar", "--confirm"}
+    raw_target = next(
+        (token for token in tokens if not token.startswith("--") and token.lower() not in ignored and token.lower() != "tag"),
+        None,
+    )
+    if not raw_target:
+        return None
+    if raw_target.lstrip("-").isdigit():
+        return await client.get_entity(int(raw_target))
+    return await client.get_entity(raw_target)
+
+
+def _profile_clone_username_requested(event):
+    tokens = {(token or "").lower() for token in (event.raw_text or "").split()[1:]}
+    return "--tag" in tokens or "tag" in tokens
+
+
+def _profile_clone_confirmation_requested(event):
+    tokens = {(token or "").lower() for token in (event.raw_text or "").split()[1:]}
+    return "--confirmar" in tokens or "--confirm" in tokens or "confirmar" in tokens or "confirm" in tokens
+
+
+async def _apply_profile_snapshot(snapshot, *, apply_username=True, photo_path=None):
+    """Aplica um snapshot sem abortar os demais campos por uma falha isolada."""
+    changed = []
+    warnings = []
+    try:
+        await client(functions.account.UpdateProfileRequest(
+            first_name=str(snapshot.get("first_name") or ""),
+            last_name=str(snapshot.get("last_name") or ""),
+            about=str(snapshot.get("about") or ""),
+        ))
+        changed.append("nome e bio")
+    except Exception as exc:
+        warnings.append(f"nome/bio ({type(exc).__name__})")
+
+    try:
+        me = await client.get_me()
+        desired_username = snapshot.get("username")
+        current_username = getattr(me, "username", None)
+        if apply_username and desired_username != current_username:
+            await client(functions.account.UpdateUsernameRequest(desired_username or ""))
+            changed.append("username")
+    except Exception as exc:
+        warnings.append(f"username ({type(exc).__name__})")
+
+    try:
+        if snapshot.get("has_photo"):
+            selected_photo_path = Path(photo_path or PROFILE_BACKUP_PHOTO_PATH)
+            if not selected_photo_path.exists() or selected_photo_path.stat().st_size <= 0:
+                raise FileNotFoundError("a foto não está disponível localmente")
+            await _apply_profile_photo(selected_photo_path)
+            changed.append("foto de perfil")
+        else:
+            removed = await _delete_all_profile_photos()
+            if removed:
+                changed.append("foto de perfil")
+    except Exception as exc:
+        warnings.append(f"foto ({type(exc).__name__})")
+    return changed, warnings
+
+
+async def _prepare_clone_snapshot(entity):
+    """Obtém os dados públicos disponíveis do alvo e baixa sua foto temporária."""
+    if not isinstance(entity, User):
+        raise ValueError("o alvo precisa ser um usuário do Telegram")
+    full = await client(functions.users.GetFullUserRequest(entity))
+    full_user = getattr(full, "full_user", None)
+    if not full_user:
+        raise ValueError("não foi possível obter o perfil completo do alvo")
+    if PROFILE_CLONE_TEMP_PATH.exists():
+        PROFILE_CLONE_TEMP_PATH.unlink()
+    has_photo = await _download_profile_photo_to(PROFILE_CLONE_TEMP_PATH, entity)
+    return {
+        "schema": PROFILE_BACKUP_SCHEMA,
+        "first_name": entity.first_name or "",
+        "last_name": entity.last_name or "",
+        "username": entity.username or None,
+        "about": getattr(full_user, "about", "") or "",
+        "has_photo": bool(has_photo),
+    }
 
 
 class AuditBuffer:
@@ -2896,6 +3120,101 @@ async def antispam_filter(event):
 
 # --- COMANDOS ---
 
+
+@client.on(events.NewMessage(pattern=r'^\.salvar(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+async def cmd_salvar(event):
+    status = await begin_fast_response(event, "⏳ Salvando o perfil atual com segurança...", label="status do salvar")
+    try:
+        async with PROFILE_OPERATION_LOCK:
+            snapshot = await _capture_current_profile()
+            await asyncio.to_thread(_write_profile_snapshot, snapshot)
+        photo_label = "com foto de perfil" if snapshot.get("has_photo") else "sem foto de perfil"
+        await finish_fast_response(
+            event,
+            status,
+            f"✅ Backup do perfil salvo {photo_label}. Nome, bio e username foram preservados para <code>.restaurar</code>.",
+            label="resultado do salvar",
+        )
+    except FloodWaitError as exc:
+        await finish_fast_response(event, status, f"⚠️ O Telegram solicitou uma espera de {exc.seconds}s antes de salvar o perfil.", label="floodwait do salvar")
+    except Exception as exc:
+        logger.error("Erro no .salvar: %s", exc, exc_info=True)
+        await finish_fast_response(event, status, "❌ Não foi possível salvar o perfil com segurança. Nenhuma alteração foi aplicada.", label="erro do salvar")
+
+
+@client.on(events.NewMessage(pattern=r'^\.clonar(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+async def cmd_clonar(event):
+    wants_username = _profile_clone_username_requested(event)
+    if wants_username and not _profile_clone_confirmation_requested(event):
+        await reply_or_edit(
+            event,
+            "⚠️ Para copiar também o username, use <code>.clonar --tag --confirmar</code> respondendo à mensagem ou informando o ID/@username. Nome, bio e foto não exigem essa confirmação adicional.",
+            delete_after=DEFAULT_DELETE_AFTER,
+        )
+        return
+
+    status = await begin_fast_response(event, "⏳ Lendo o perfil do alvo e preparando a clonagem...", label="status do clonar")
+    try:
+        async with PROFILE_OPERATION_LOCK:
+            entity = await _resolve_profile_entity(event)
+            if not isinstance(entity, User):
+                await finish_fast_response(event, status, "❌ Responda a um usuário ou informe um ID/@username válido.", label="alvo inválido do clonar")
+                return
+            if cache.me and int(entity.id) == int(cache.me.id):
+                await finish_fast_response(event, status, "ℹ️ Este alvo já é a própria conta autenticada; nenhuma alteração foi necessária.", label="clonar da própria conta")
+                return
+            snapshot = await _prepare_clone_snapshot(entity)
+            changed, warnings = await _apply_profile_snapshot(
+                snapshot,
+                apply_username=wants_username,
+                photo_path=PROFILE_CLONE_TEMP_PATH,
+            )
+            target_label = escape((entity.username and f"@{entity.username}") or entity.first_name or str(entity.id))
+            applied_text = ", ".join(changed) if changed else "nenhum campo"
+            text = f"✅ Perfil de {target_label} (<code>{entity.id}</code>) aplicado: {escape(applied_text)}."
+            if not wants_username:
+                text += " Username mantido por segurança; use <code>--tag --confirmar</code> se desejar tentar copiá-lo."
+            if warnings:
+                text += "\n⚠️ Não aplicado: " + escape(", ".join(warnings)) + "."
+            await finish_fast_response(event, status, text, label="resultado do clonar")
+    except FloodWaitError as exc:
+        await finish_fast_response(event, status, f"⚠️ O Telegram solicitou uma espera de {exc.seconds}s durante a clonagem.", label="floodwait do clonar")
+    except (ValueError, RPCError) as exc:
+        logger.warning("Falha controlada no .clonar: %s", exc)
+        await finish_fast_response(event, status, "❌ Não foi possível obter ou aplicar o perfil do alvo. Verifique o ID/@username e as permissões de acesso.", label="erro controlado do clonar")
+    except Exception as exc:
+        logger.error("Erro no .clonar: %s", exc, exc_info=True)
+        await finish_fast_response(event, status, "❌ A clonagem falhou. O resultado pode ter sido parcial; use <code>.restaurar</code> após confirmar que existe um backup.", label="erro do clonar")
+    finally:
+        try:
+            if PROFILE_CLONE_TEMP_PATH.exists():
+                PROFILE_CLONE_TEMP_PATH.unlink()
+        except OSError:
+            logger.debug("Não foi possível remover a foto temporária da clonagem")
+
+
+@client.on(events.NewMessage(pattern=r'^\.restaurar(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+async def cmd_restaurar(event):
+    status = await begin_fast_response(event, "⏳ Restaurando o perfil original salvo...", label="status do restaurar")
+    try:
+        async with PROFILE_OPERATION_LOCK:
+            snapshot = await asyncio.to_thread(_read_profile_snapshot)
+            if snapshot is None:
+                await finish_fast_response(event, status, "❌ Nenhum backup válido foi encontrado. Execute <code>.salvar</code> antes de clonar.", label="backup ausente do restaurar")
+                return
+            changed, warnings = await _apply_profile_snapshot(snapshot, apply_username=True)
+            applied_text = ", ".join(changed) if changed else "nenhum campo"
+            text = f"✅ Perfil original restaurado: {escape(applied_text)}."
+            if warnings:
+                text += "\n⚠️ Não restaurado: " + escape(", ".join(warnings)) + "."
+            await finish_fast_response(event, status, text, label="resultado do restaurar")
+    except FloodWaitError as exc:
+        await finish_fast_response(event, status, f"⚠️ O Telegram solicitou uma espera de {exc.seconds}s durante a restauração.", label="floodwait do restaurar")
+    except Exception as exc:
+        logger.error("Erro no .restaurar: %s", exc, exc_info=True)
+        await finish_fast_response(event, status, "❌ Não foi possível restaurar o perfil com segurança.", label="erro do restaurar")
+
+
 @client.on(events.NewMessage(incoming=True, pattern=r'^\.jt'))
 async def maintenance_filter(event):
     if not cache.maintenance_enabled or is_owner(event.sender_id):
@@ -4435,6 +4754,12 @@ async def cmd_help(event):
         "• <code>.allban [duração] [--purge N]</code> | <code>.allblack [duração]</code> | <code>.unallblack</code>\n"
         "• <code>.maintenance on/off</code> (somente proprietário)\n"
         "• <code>.autorizar [duração]</code> | <code>.desautorizar</code> | <code>.listauth</code> (Acessos permanentes ou temporários: 10s, 30m, 10h, 10d)\n\n"
+        "👤 <b>PERFIL DA CONTA (somente proprietário):</b>\n"
+        "• <code>.salvar</code> (faz backup local de nome, bio, username e foto)\n"
+        "• <code>.clonar</code> respondendo, por ID ou @username (aplica nome, bio e foto)\n"
+        "• <code>.clonar --tag --confirmar</code> (também tenta aplicar o username, se disponível)\n"
+        "• <code>.restaurar</code> (volta ao último backup salvo)\n\n"
+
         "🔍 <b>SEGURANÇA & CONTRA-ESPIONAGEM:</b>\n"
         "• <code>.antiblack on/off</code> (Modo Fênix)\n"
         "• <code>.antispy</code> (Varredura de Espiões)\n"
