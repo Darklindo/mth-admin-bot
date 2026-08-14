@@ -72,6 +72,7 @@ EXPIRATION_CHECK_INTERVAL = _env_int("EXPIRATION_CHECK_INTERVAL", 30, 10, 300)
 SPAM_STATE_MAX_USERS = _env_int("SPAM_STATE_MAX_USERS", 10000, 100, 100000)
 SPAM_ACTION_COOLDOWN = _env_int("SPAM_ACTION_COOLDOWN", 30, 5, 300)
 ALLBAN_CONCURRENCY = _env_int("ALLBAN_CONCURRENCY", 3, 1, 8)
+BROADCAST_CONCURRENCY = _env_int("BROADCAST_CONCURRENCY", 3, 1, 8)
 PURGEALL_MIN_LIMIT = 1
 PURGEALL_MAX_LIMIT = 1000
 PURGEALL_MAX_SCAN = 1200
@@ -91,7 +92,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V7.0"
+VERSION = "V7.1"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -966,7 +967,7 @@ class AuditBuffer:
         self.records.append(record)
         self.enqueued += 1
         if self.flush_task is None or self.flush_task.done():
-            self.flush_task = loop.create_task(self._flush_after_delay())
+            self.flush_task = schedule_background(self._flush_after_delay(), "audit-flush")
 
     async def _flush_after_delay(self):
         try:
@@ -1081,7 +1082,7 @@ class SecurityDeleteQueue:
         if self.pending.get(chat_id):
             # Mantém o chat marcado como ocupado até o dreno terminar, para
             # preservar a ordem e evitar duas requisições simultâneas.
-            asyncio.create_task(self._drain_chat(chat_id))
+            schedule_background(self._drain_chat(chat_id), "security-delete-drain")
         else:
             self.running_chats.discard(chat_id)
 
@@ -1147,6 +1148,76 @@ class CommandMetrics:
 
 command_metrics = CommandMetrics()
 
+
+class BackgroundTaskSupervisor:
+    """Supervisiona tarefas de fundo sem bloquear handlers ou criar exceções silenciosas."""
+
+    def __init__(self):
+        self.tasks = set()
+        self.started = 0
+        self.completed = 0
+        self.failed = 0
+        self.cancelled = 0
+        self._lock = threading.Lock()
+
+    def create(self, coroutine, label):
+        try:
+            task = asyncio.create_task(coroutine, name=f"jtzin:{label}")
+        except RuntimeError:
+            close = getattr(coroutine, "close", None)
+            if close:
+                close()
+            raise
+        self.tasks.add(task)
+        with self._lock:
+            self.started += 1
+
+        def _done(completed_task):
+            self.tasks.discard(completed_task)
+            if completed_task.cancelled():
+                with self._lock:
+                    self.cancelled += 1
+                return
+            try:
+                completed_task.result()
+            except Exception:
+                with self._lock:
+                    self.failed += 1
+                logger.exception("Falha na tarefa de fundo '%s'", label)
+            else:
+                with self._lock:
+                    self.completed += 1
+
+        task.add_done_callback(_done)
+        return task
+
+    async def cancel_all(self):
+        tasks = list(self.tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.tasks.clear()
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "active": len(self.tasks),
+                "started": self.started,
+                "completed": self.completed,
+                "failed": self.failed,
+                "cancelled": self.cancelled,
+            }
+
+
+background_supervisor = BackgroundTaskSupervisor()
+
+
+def schedule_background(coroutine, label):
+    """Agenda tarefa supervisionada; o chamador continua sem esperar por ela."""
+    return background_supervisor.create(coroutine, label)
+
+
 # Inicializados após a criação do cliente para permitir testes offline e substituição controlada.
 audit_buffer = AuditBuffer(db)
 security_delete_queue = SecurityDeleteQueue(client)
@@ -1171,6 +1242,7 @@ def get_performance_snapshot():
         # Alias mantido para evitar quebra em instalações com o nome antigo.
         "delete_failed": queue_stats.get("failed", 0),
         "command_metrics": command_metrics.snapshot(),
+        "background_tasks": background_supervisor.snapshot(),
     }
 
 
@@ -1987,7 +2059,7 @@ async def delete_security_message(event, chat_id, user_id, content_text, reason)
         queue_audit_log(chat_id, user_id, content_text, reason)
 
     if reason in ("Global Ban", "Local BanPerm"):
-        asyncio.create_task(apply_security_restriction(chat_id, user_id))
+        schedule_background(apply_security_restriction(chat_id, user_id), "security-restriction")
 
 
 _response_cleanup_tasks = set()
@@ -2013,7 +2085,7 @@ def schedule_response_cleanup(message, event, delay, label="resposta automática
     """Agenda a exclusão sem bloquear o handler por DEFAULT_DELETE_AFTER segundos."""
     if not delay:
         return
-    task = asyncio.create_task(_cleanup_response_later(message, event, delay, label))
+    task = schedule_background(_cleanup_response_later(message, event, delay, label), "response-cleanup")
     _response_cleanup_tasks.add(task)
     task.add_done_callback(_response_cleanup_tasks.discard)
 
@@ -2223,7 +2295,7 @@ async def chat_registry(event):
         _registering_chat_ids.add(int(event.chat_id))
     if needs_user:
         _registering_user_ids.add(int(sender_id))
-    asyncio.create_task(register_chat_and_user(event))
+    schedule_background(register_chat_and_user(event), "chat-registry")
 
 
 # --- SISTEMA ANTIBLACK (AUTO-REPOSTE FÊNIX) ---
@@ -2390,7 +2462,7 @@ _antispam_tasks = set()
 
 
 def _schedule_antispam_task(coroutine):
-    task = asyncio.create_task(coroutine)
+    task = schedule_background(coroutine, "antispam-action")
     _antispam_tasks.add(task)
     task.add_done_callback(_antispam_tasks.discard)
     return task
@@ -4315,33 +4387,52 @@ async def cmd_msg(event):
     if reply is None and not text_arg:
         await reply_or_edit(event, "❌ Digite a mensagem ou responda a uma mídia.", delete_after=DEFAULT_DELETE_AFTER)
         return
-        chats = await asyncio.to_thread(db.all_chats_detailed)
-    success = 0
-    for chat in chats:
-        if chat['active'] and chat['chat_type'] not in ['private', 'User']:
-            try:
-                await send_broadcast_payload(chat['chat_id'], reply, text_arg)
-                success += 1
-                await asyncio.sleep(0.1)
-            except FloodWaitError as e:
-                await asyncio.sleep(e.seconds)
-            except Exception as exc:
-                logger.debug(f"Falha ao transmitir para {chat['chat_id']}: {exc}")
-                continue
-    await reply_or_edit(event, f"📢 Transmissão concluída: {success} chats receberam.", delete_after=DEFAULT_DELETE_AFTER)
+    chats = await asyncio.to_thread(db.all_chats_detailed)
+    targets = [
+        chat for chat in chats
+        if chat.get('active') and chat.get('chat_type') not in ['private', 'User']
+    ]
+    semaphore = asyncio.Semaphore(BROADCAST_CONCURRENCY)
+
+    async def _broadcast_one(chat):
+        chat_id = chat.get('chat_id')
+        async with semaphore:
+            for attempt in range(2):
+                try:
+                    await send_broadcast_payload(chat_id, reply, text_arg)
+                    return True
+                except FloodWaitError as exc:
+                    if attempt == 0 and int(getattr(exc, 'seconds', 0) or 0) <= FLOOD_SLEEP_THRESHOLD:
+                        await asyncio.sleep(max(0, int(exc.seconds)))
+                        continue
+                    logger.warning("FloodWait ao transmitir para %s (%ss); chat ignorado nesta rodada.", chat_id, getattr(exc, 'seconds', '?'))
+                    return False
+                except Exception as exc:
+                    logger.debug("Falha ao transmitir para %s: %s", chat_id, exc)
+                    return False
+        return False
+
+    results = await asyncio.gather(
+        *(_broadcast_one(chat) for chat in targets),
+        return_exceptions=False,
+    )
+    success = sum(1 for result in results if result)
+    await reply_or_edit(event, f"📢 Transmissão concluída: {success}/{len(targets)} chats receberam.", delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.chats(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
 async def cmd_chats(event):
     chats = await asyncio.to_thread(db.all_chats_detailed)
+    private_ids = [r.get('chat_id') for r in chats if r.get('chat_type') in ['private', 'User']]
+    private_names = await asyncio.to_thread(db.get_user_info_many, private_ids)
     grupos, canais, privados = [], [], []
-    for r in rows:
+    for r in chats:
         status = "✅" if r['active'] else "❌"
         chat_title = escape(str(r.get('title') or 'Sem título'))
         chat_info = f"{status} {chat_title} (<code>{r['chat_id']}</code>)"
         if r['chat_type'] in ['group', 'supergroup', 'Chat']: grupos.append(chat_info)
         elif r['chat_type'] in ['channel', 'Channel']: canais.append(chat_info)
         elif r['chat_type'] in ['private', 'User']:
-            user_info = await asyncio.to_thread(db.get_user_info, r['chat_id'])
+            user_info = private_names.get(int(r['chat_id']), str(r['chat_id']))
             privados.append(f"{status} {user_info} (<code>{r['chat_id']}</code>)")
     text = f"📡 <b>RELATÓRIO DE CHATS {VERSION}</b>\n\n"
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
@@ -4362,7 +4453,7 @@ if __name__ == "__main__":
         cache.me_loaded = cache.me is not None
     except Exception as exc:
         logger.warning("Não foi possível aquecer a identidade da sessão: %s", exc)
-    expiry_task = client.loop.create_task(temporary_expiry_loop())
+    expiry_task = schedule_background(temporary_expiry_loop(), "temporary-expiry")
     logger.info("USERBOT TELETHON ONLINE!")
     try:
         client.run_until_disconnected()
@@ -4372,6 +4463,10 @@ if __name__ == "__main__":
             client.loop.run_until_complete(expiry_task)
         except (asyncio.CancelledError, Exception):
             pass
+        try:
+            client.loop.run_until_complete(background_supervisor.cancel_all())
+        except Exception as exc:
+            logger.error("Falha ao cancelar tarefas de fundo: %s", exc)
         try:
             client.loop.run_until_complete(audit_buffer.flush())
         except Exception as exc:
