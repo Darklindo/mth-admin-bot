@@ -92,7 +92,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V7.6"
+VERSION = "V7.7"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 TELETHON_LOG_LEVEL = os.getenv("TELETHON_LOG_LEVEL", "WARNING").upper()
 
@@ -1149,10 +1149,16 @@ class SecurityDeleteQueue:
 class CommandMetrics:
     """Métricas leves em memória; nunca bloqueiam comandos nem acessam SQLite."""
 
-    def __init__(self, max_commands=128):
+    def __init__(self, max_commands=128, max_arrivals=2048):
         self._active = {}
+        self._arrivals = {}
         self._stats = {}
+        self._last_e2e_ms = 0.0
+        self._max_e2e_ms = 0.0
+        self._last_update_age_ms = 0.0
+        self._max_update_age_ms = 0.0
         self.max_commands = max(16, int(max_commands))
+        self.max_arrivals = max(128, int(max_arrivals))
 
     @staticmethod
     def _name(event):
@@ -1162,23 +1168,89 @@ class CommandMetrics:
             return raw.lower()
         return "<other>"
 
+    @staticmethod
+    def _update_age_ms(event):
+        message = getattr(event, "message", None)
+        message_date = getattr(message, "date", None)
+        if message_date is None:
+            return None
+        try:
+            if getattr(message_date, "tzinfo", None) is not None:
+                now = datetime.now(message_date.tzinfo)
+            else:
+                now = datetime.now()
+            age_ms = (now - message_date).total_seconds() * 1000.0
+            # Relógios locais podem ter pequena diferença do servidor. Valores
+            # absurdos não devem contaminar o diagnóstico.
+            if age_ms < 0 or age_ms > 10 * 60 * 1000:
+                return None
+            return age_ms
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def observe_arrival(self, event):
+        """Registra a entrada do comando sem criar tarefa nem fazer I/O."""
+        raw_text = str(getattr(event, "raw_text", "") or "").lstrip()
+        if not raw_text.startswith("."):
+            return
+        now = time.perf_counter()
+        # Comandos interrompidos por outro filtro não terão finish(); remova
+        # somente observações antigas para manter o limite de memória.
+        stale = [key for key, value in self._arrivals.items() if now - value[0] > 300]
+        for key in stale:
+            self._arrivals.pop(key, None)
+        key = id(event)
+        if len(self._arrivals) >= self.max_arrivals:
+            self._arrivals.pop(next(iter(self._arrivals)), None)
+        self._arrivals[key] = (now, self._update_age_ms(event))
+
     def start(self, event):
         key = id(event)
-        if key not in self._active:
-            self._active[key] = (self._name(event), time.perf_counter())
+        if key in self._active:
+            return
+        started = time.perf_counter()
+        arrival = self._arrivals.pop(key, None)
+        arrival_started = arrival[0] if arrival else started
+        update_age_ms = arrival[1] if arrival else None
+        self._active[key] = (self._name(event), started, arrival_started, update_age_ms)
 
     def finish(self, event, success=True):
         item = self._active.pop(id(event), None)
         if item is None:
             return
-        name, started = item
-        elapsed_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
-        row = self._stats.setdefault(name, {"count": 0, "failed": 0, "last_ms": 0.0, "max_ms": 0.0, "total_ms": 0.0})
+        name, started, arrival_started, update_age_ms = item
+        finished = time.perf_counter()
+        elapsed_ms = max(0.0, (finished - started) * 1000.0)
+        e2e_ms = max(0.0, (finished - arrival_started) * 1000.0)
+        row = self._stats.setdefault(name, {
+            "count": 0,
+            "failed": 0,
+            "last_ms": 0.0,
+            "max_ms": 0.0,
+            "total_ms": 0.0,
+            "last_e2e_ms": 0.0,
+            "max_e2e_ms": 0.0,
+            "total_e2e_ms": 0.0,
+            "last_update_age_ms": 0.0,
+            "max_update_age_ms": 0.0,
+            "aged_updates": 0,
+        })
         row["count"] += 1
         row["failed"] += 0 if success else 1
         row["last_ms"] = elapsed_ms
         row["max_ms"] = max(row["max_ms"], elapsed_ms)
         row["total_ms"] += elapsed_ms
+        row["last_e2e_ms"] = e2e_ms
+        row["max_e2e_ms"] = max(row["max_e2e_ms"], e2e_ms)
+        row["total_e2e_ms"] += e2e_ms
+        self._last_e2e_ms = e2e_ms
+        self._max_e2e_ms = max(self._max_e2e_ms, e2e_ms)
+        if update_age_ms is not None:
+            row["last_update_age_ms"] = update_age_ms
+            row["max_update_age_ms"] = max(row["max_update_age_ms"], update_age_ms)
+            row["aged_updates"] += 1
+            self._last_update_age_ms = update_age_ms
+            self._max_update_age_ms = max(self._max_update_age_ms, update_age_ms)
         if len(self._stats) > self.max_commands:
             oldest = next(iter(self._stats))
             if oldest != name:
@@ -1190,7 +1262,18 @@ class CommandMetrics:
         failures = sum(row["failed"] for row in stats.values())
         for row in stats.values():
             row["avg_ms"] = row["total_ms"] / row["count"] if row["count"] else 0.0
-        return {"total": total, "failed": failures, "active": len(self._active), "commands": stats}
+            row["avg_e2e_ms"] = row["total_e2e_ms"] / row["count"] if row["count"] else 0.0
+        return {
+            "total": total,
+            "failed": failures,
+            "active": len(self._active),
+            "pending_arrivals": len(self._arrivals),
+            "last_e2e_ms": self._last_e2e_ms,
+            "max_e2e_ms": self._max_e2e_ms,
+            "last_update_age_ms": self._last_update_age_ms,
+            "max_update_age_ms": self._max_update_age_ms,
+            "commands": stats,
+        }
 
 
 command_metrics = CommandMetrics()
@@ -2355,6 +2438,13 @@ async def register_chat_and_user(event):
         _registering_chat_ids.discard(int(chat_id))
         if event.sender_id:
             _registering_user_ids.discard(int(event.sender_id))
+
+
+# --- TELEMETRIA DE ENTREGA DE COMANDOS ---
+@client.on(events.NewMessage)
+async def command_latency_probe(event):
+    """Marca a chegada de comandos antes de filtros e handlers administrativos."""
+    command_metrics.observe_arrival(event)
 
 
 @client.on(events.NewMessage)
@@ -4255,6 +4345,9 @@ async def cmd_latency(event):
         f"• Auditoria pendente: <code>{performance['audit_pending']}</code> | "
         f"persistida: <code>{performance['audit_persisted']}</code>\n"
         f"• Comandos medidos: <code>{command_stats.get('total', 0)}</code> | falhas: <code>{command_stats.get('failed', 0)}</code>\n"
+        f"• E2E último/máx.: <code>{command_stats.get('last_e2e_ms', 0.0):.0f}/{command_stats.get('max_e2e_ms', 0.0):.0f} ms</code>\n"
+        f"• Idade do update último/máx.: <code>{command_stats.get('last_update_age_ms', 0.0):.0f}/{command_stats.get('max_update_age_ms', 0.0):.0f} ms</code>\n"
+        f"<i>Idade do update = tempo entre o envio da mensagem e o recebimento pelo Userbot.</i>\n"
         f"• Diagnóstico concluído em: <code>{elapsed_ms:.0f} ms</code>"
     )
     await reply_or_edit(event, text, delete_after=15)
