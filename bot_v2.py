@@ -92,7 +92,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V7.2"
+VERSION = "V7.2.1"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -4453,7 +4453,12 @@ if __name__ == "__main__":
         cache.me_loaded = cache.me is not None
     except Exception as exc:
         logger.warning("Não foi possível aquecer a identidade da sessão: %s", exc)
-    expiry_task = schedule_background(temporary_expiry_loop(), "temporary-expiry")
+    async def _start_expiry_supervised():
+        # A tarefa precisa ser criada dentro de um loop ativo; Python 3.14
+        # não permite asyncio.create_task() no escopo síncrono do módulo.
+        return schedule_background(temporary_expiry_loop(), "temporary-expiry")
+
+    expiry_task = client.loop.run_until_complete(_start_expiry_supervised())
     logger.info("USERBOT TELETHON ONLINE!")
     try:
         client.run_until_disconnected()
