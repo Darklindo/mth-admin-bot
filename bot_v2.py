@@ -92,7 +92,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V7.4"
+VERSION = "V7.5"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 DB_PATH = DATA_DIR / "bot.db"
@@ -2785,7 +2785,7 @@ async def cmd_maintenance(event):
     await reply_or_edit(event, f"🛠️ Modo manutenção <b>{'ATIVADO' if enabled else 'DESATIVADO'}</b>.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtlock(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.lock(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_lock(event):
     if not (event.is_group or event.is_channel):
         await reply_or_edit(event, "❌ O lock só pode ser usado em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
@@ -2818,11 +2818,11 @@ async def cmd_lock(event):
         logger.warning("Falha RPC ao bloquear o chat %s: %s", event.chat_id, exc)
         await reply_or_edit(event, "❌ O Telegram recusou o lock. Confirme que sou administrador com permissão para restringir membros.", delete_after=DEFAULT_DELETE_AFTER)
     except Exception as exc:
-        logger.error("Erro inesperado no .jtlock para %s: %s", event.chat_id, exc)
+        logger.error("Erro inesperado no .lock para %s: %s", event.chat_id, exc)
         await reply_or_edit(event, "❌ Não foi possível bloquear o grupo com segurança.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtunlock(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.unlock(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unlock(event):
     if not (event.is_group or event.is_channel):
         await reply_or_edit(event, "❌ O unlock só pode ser usado em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
@@ -2857,7 +2857,7 @@ async def cmd_unlock(event):
         logger.warning("Falha RPC ao desbloquear o chat %s: %s", event.chat_id, exc)
         await reply_or_edit(event, "❌ O Telegram recusou o unlock. Confirme minhas permissões de administrador.", delete_after=DEFAULT_DELETE_AFTER)
     except Exception as exc:
-        logger.error("Erro inesperado no .jtunlock para %s: %s", event.chat_id, exc)
+        logger.error("Erro inesperado no .unlock para %s: %s", event.chat_id, exc)
         await reply_or_edit(event, "❌ Não foi possível desbloquear o grupo com segurança.", delete_after=DEFAULT_DELETE_AFTER)
 
 
@@ -2924,7 +2924,7 @@ async def cmd_pinned(event):
     await reply_or_edit(event, f"📌 Proteção de mensagens fixadas <b>{'ATIVADA' if enabled else 'DESATIVADA'}</b>.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtantilink(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.antilink(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_antilink(event):
     if not (event.is_group or event.is_channel):
         await reply_or_edit(event, "❌ O antilink só pode ser configurado em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
@@ -2938,7 +2938,7 @@ async def cmd_antilink(event):
         status = bool(_setting_int(settings, "antilink", 0, 0, 1))
         await reply_or_edit(
             event,
-            f"🔗 Antilink: <b>{'ATIVADO' if status else 'DESATIVADO'}</b>. Use <code>.jtantilink on|off</code>.",
+            f"🔗 Antilink: <b>{'ATIVADO' if status else 'DESATIVADO'}</b>. Use <code>.antilink on|off</code>.",
             delete_after=DEFAULT_DELETE_AFTER,
         )
         return
@@ -3125,11 +3125,11 @@ async def cmd_delwarn(event):
     await reply_or_edit(event, f"🗑️⚠️ Mensagem de <b>{user_info}</b> apagada e advertência aplicada: {result}.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtunwarn(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.unwarn(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unwarn(event):
     target_id = await get_target_from_event(event)
     if not target_id:
-        await reply_or_edit(event, "❌ Responda à mensagem do usuário ou informe o ID/username após <code>.jtunwarn</code>.", delete_after=DEFAULT_DELETE_AFTER)
+        await reply_or_edit(event, "❌ Responda à mensagem do usuário ou informe o ID/username após <code>.unwarn</code>.", delete_after=DEFAULT_DELETE_AFTER)
         return
     if is_immune(target_id):
         await reply_or_edit(event, "❌ A conta protegida não pode ser alterada por este comando.", delete_after=DEFAULT_DELETE_AFTER)
@@ -3151,11 +3151,11 @@ async def cmd_unwarn(event):
     await reply_or_edit(event, result, delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtclearwarns(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.clearwarns(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_clearwarns(event):
     target_id = await get_target_from_event(event)
     if not target_id:
-        await reply_or_edit(event, "❌ Responda à mensagem do usuário ou informe o ID/username após <code>.jtclearwarns</code>.", delete_after=DEFAULT_DELETE_AFTER)
+        await reply_or_edit(event, "❌ Responda à mensagem do usuário ou informe o ID/username após <code>.clearwarns</code>.", delete_after=DEFAULT_DELETE_AFTER)
         return
     if is_immune(target_id):
         await reply_or_edit(event, "❌ A conta protegida não pode ser alterada por este comando.", delete_after=DEFAULT_DELETE_AFTER)
@@ -3173,7 +3173,7 @@ async def cmd_clearwarns(event):
     await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtwarns(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.warns(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_warns(event):
     rows = await asyncio.to_thread(db.get_warnings_report, event.chat_id)
     if not rows:
@@ -3223,7 +3223,7 @@ async def cmd_antiblack(event):
     else:
         await reply_or_edit(event, "❌ Use <code>.antiblack on</code> ou <code>.antiblack off</code>", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.jtkick(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.kick(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_kick(event):
     status_message = await begin_fast_response(
         event,
@@ -3233,7 +3233,7 @@ async def cmd_kick(event):
     try:
         target_id = await get_target_from_event(event)
     except Exception as exc:
-        logger.exception("Erro ao interpretar o comando .jtkick")
+        logger.exception("Erro ao interpretar o comando .kick")
         await finish_fast_response(
             event,
             status_message,
@@ -3272,7 +3272,7 @@ async def cmd_kick(event):
     except UserAdminInvalidError:
         await finish_fast_response(event, status_message, "❌ Erro: Não é possível expulsar outro administrador (hierarquia).", label="erro do kick")
     except Exception as exc:
-        logger.exception("Erro ao aplicar .jtkick")
+        logger.exception("Erro ao aplicar .kick")
         await finish_fast_response(event, status_message, f"❌ Erro ao expulsar: {exc}", label="erro do kick")
 
 @client.on(events.NewMessage(pattern=r'^\.jtban(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
@@ -3395,7 +3395,7 @@ async def cmd_ban(event):
         logger.exception("Erro ao aplicar .jtban")
         await finish_fast_response(event, status_message, f"❌ Erro ao banir: {e}", label="erro do ban")
 
-@client.on(events.NewMessage(pattern=r'^\.jtunban(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.unban(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unban(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -3538,7 +3538,7 @@ async def cmd_mute(event):
         logger.exception("Erro ao aplicar .jtmute")
         await finish_fast_response(event, status_message, f"❌ Erro ao silenciar: {exc}", label="erro do mute")
 
-@client.on(events.NewMessage(pattern=r'^\.jtunmute(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.unmute(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_unmute(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -4267,28 +4267,28 @@ async def cmd_health(event):
     await reply_or_edit(event, text, delete_after=15)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jthelp(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.help(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_help(event):
     text = (
         f"📖 <b>GUIA DE COMANDOS — Jtzin Userbot {VERSION}</b>\n\n"
         "🛡️ <b>MODERAÇÃO LOCAL & REVERSÃO:</b>\n"
         "• <code>.jtdel</code> (apaga a mensagem respondida)\n"
-        "• <code>.jtlock</code> | <code>.jtunlock</code> (somente administradores; restaura permissões anteriores)\n"
-        "• <code>.jtkick</code> | <code>.jtban [duração] [--purge N]</code> | <code>.jtunban</code>\n"
-        "• <code>.jtmute [duração] [--purge N]</code> | <code>.jtunmute</code>\n"
-        "• <code>.jtpurge [5-100]</code> | <code>.jtpurgeme [5-100]</code> | <code>.jtpurgeall [1-1000]</code>\n"
+        "• <code>.lock</code> | <code>.unlock</code> (somente administradores; restaura permissões anteriores)\n"
+        "• <code>.kick</code> | <code>.jtban [duração] [--purge N]</code> | <code>.unban</code>\n"
+        "• <code>.jtmute [duração] [--purge N]</code> | <code>.unmute</code>\n"
+        "• <code>.jtpurge [5-100]</code> | <code>.purgeme [5-100]</code> | <code>.jtpurgeall [1-1000]</code>\n"
         "• <code>.blacklist [duração]</code> | <code>.unblacklist</code> (somente este chat)\n"
         "• <code>.banperm [duração] [--purge N]</code> | <code>.unbanperm</code>\n"
         "• <code>.shadow [duração]</code> | <code>.unshadow</code> (global)\n\n"
         "⚠️ <b>ADVERTÊNCIAS & ANTISPAM:</b>\n"
-        "• <code>.jtwarn @user motivo</code> | <code>.jtwarns</code>\n"
-        "• <code>.jtunwarn</code> (remove uma advertência) | <code>.jtdelwarn</code> (apaga e adverte)\n"
-        "• <code>.jtclearwarns @user</code> (remove todas as advertências)\n"
+        "• <code>.jtwarn @user motivo</code> | <code>.warns</code>\n"
+        "• <code>.unwarn</code> (remove uma advertência) | <code>.jtdelwarn</code> (apaga e adverte)\n"
+        "• <code>.clearwarns @user</code> (remove todas as advertências)\n"
         "• <code>.antispam on/off</code> (pontuação adaptativa, mídia, links e duplicação)\n"
         "• <code>.quarantine on/off</code> (só pune com padrão forte)\n"
         "• <code>.pinned on/off</code> (protege mensagens fixadas)\n\n"
         "🔗 <b>CONTROLE DE LINKS:</b>\n"
-        "• <code>.jtantilink on/off</code> (links somente para admins e autorizados)\n"
+        "• <code>.antilink on/off</code> (links somente para admins e autorizados)\n"
         "• <code>.autorizarlink</code> | <code>.desautorizarlink</code> | <code>.listlinkauth</code>\n\n"
         "👑 <b>CONTROLE GLOBAL:</b>\n"
         "• <code>.allban [duração] [--purge N]</code> | <code>.allblack [duração]</code> | <code>.unallblack</code>\n"
@@ -4304,9 +4304,9 @@ async def cmd_help(event):
         "• <code>.chats</code> (Lista de Chats)\n"
         "• <code>.listdn</code> (Punições Globais)\n"
         "• <code>.logs</code> (Auditoria de Deleções)\n"
-        "• <code>.jtid</code> (Mostra o ID do usuário)\n"
+        "• <code>.id</code> (Mostra o ID do usuário)\n"
         "• <code>.infojt</code> (Informações detalhadas por reply, ID ou username)\n"
-        "• <code>.jthelp</code>"
+        "• <code>.help</code>"
     )
     await reply_or_edit(event, text, delete_after=15)
 
@@ -4503,7 +4503,7 @@ async def cmd_purge(event):
 
     await delete_command_safely(event)
 
-@client.on(events.NewMessage(pattern=r'^\.jtpurgeme(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.purgeme(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_purgeme(event):
     if not event.is_group and not event.is_channel:
         await reply_or_edit(event, "❌ Este comando só pode ser usado em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
@@ -4536,12 +4536,12 @@ async def cmd_purgeme(event):
         deleted_count = await delete_message_ids_safely(event.chat_id, message_ids)
         await edit_and_delete_safely(status_msg, f"✅ <b>PurgeMe concluído!</b> {deleted_count} mensagens suas foram apagadas.", label="status do purgeme")
     except Exception as e:
-        logger.error("Erro ao executar .jtpurgeme: %s", e)
-        await edit_and_delete_safely(status_msg, "❌ Não foi possível concluir o .jtpurgeme.", label="status de erro do purgeme")
+        logger.error("Erro ao executar .purgeme: %s", e)
+        await edit_and_delete_safely(status_msg, "❌ Não foi possível concluir o .purgeme.", label="status de erro do purgeme")
 
     await delete_command_safely(event)
 
-@client.on(events.NewMessage(pattern=r'^\.jtid(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.id(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
 async def cmd_id(event):
     target_id = await get_target_from_event(event) or event.sender_id
     await reply_or_edit(event, f"🆔 ID: <code>{target_id}</code>", delete_after=DEFAULT_DELETE_AFTER)
