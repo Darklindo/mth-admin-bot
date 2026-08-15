@@ -104,7 +104,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V8.0"
+VERSION = "V8.1"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 TELETHON_LOG_LEVEL = os.getenv("TELETHON_LOG_LEVEL", "WARNING").upper()
 
@@ -143,6 +143,9 @@ class Cache:
         self.settings = {}
         # Evita leituras e gravações SQLite nos filtros de alta frequência.
         self.settings_loaded = set()
+        # Uma única carga assíncrona por chat evita que vários filtros ou comandos
+        # concorrentes consultem a mesma linha SQLite ao mesmo tempo.
+        self.settings_inflight = {}
         self.maintenance_enabled = False
         self.maintenance_loaded = False
         # Identidade aquecida no startup para que .status não faça RPC no caminho comum.
@@ -164,6 +167,7 @@ class Cache:
             self.locked_chats.clear()
             self.settings.clear()
             self.settings_loaded.clear()
+            self.settings_inflight.clear()
             self.maintenance_enabled = False
             self.maintenance_loaded = False
             self.me = None
@@ -611,8 +615,11 @@ class Database:
         )
         if cursor is not None:
             chat_id = int(chat_id)
+            # Se o chat ainda não foi carregado, não marque um snapshot parcial
+            # como completo: a próxima leitura fará uma carga integral da linha.
             cache.settings.setdefault(chat_id, {})[key] = value
-            cache.settings_loaded.add(chat_id)
+            # Se o snapshot já estava completo, ele permanece válido; caso
+            # contrário, a próxima leitura integral ainda será coalescida.
             return True
         return False
 
@@ -630,11 +637,26 @@ class Database:
         return dict(result)
 
     def get_chat_lock(self, chat_id):
-        row = self.fetchone("SELECT locked, lock_snapshot FROM settings WHERE chat_id=?", (int(chat_id),))
+        chat_id = int(chat_id)
+        # O estado de lock já faz parte do snapshot de configurações. Reutilizá-lo
+        # evita uma segunda consulta quando o handler acabou de carregar settings.
+        if chat_id in cache.settings_loaded:
+            settings = cache.settings.get(chat_id, {})
+            return {
+                "locked": int(settings.get("locked") or 0),
+                "lock_snapshot": settings.get("lock_snapshot"),
+            }
+        row = self.fetchone("SELECT locked, lock_snapshot FROM settings WHERE chat_id=?", (chat_id,))
         if row is None:
-            self.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (int(chat_id),), commit=True)
-            row = self.fetchone("SELECT locked, lock_snapshot FROM settings WHERE chat_id=?", (int(chat_id),))
-        return dict(row) if row is not None else None
+            self.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (chat_id,), commit=True)
+            row = self.fetchone("SELECT locked, lock_snapshot FROM settings WHERE chat_id=?", (chat_id,))
+        result = dict(row) if row is not None else None
+        if result is not None:
+            # Esta consulta traz somente os campos do lock. Não marque o chat
+            # como carregado integralmente, pois isso faria get_settings_async
+            # devolver um snapshot parcial e ocultaria antispam/antilink.
+            cache.settings.setdefault(chat_id, {}).update(result)
+        return result
 
     def set_chat_lock(self, chat_id, snapshot):
         cursor = self.execute(
@@ -2898,12 +2920,29 @@ async def chat_lock_filter(event):
 
 
 async def get_settings_async(chat_id):
-    """Obtém settings do cache; a primeira criação é deslocada para uma thread."""
+    """Obtém settings do cache, coalescendo a primeira carga por chat."""
     chat_id = int(chat_id)
     if chat_id in cache.settings_loaded:
         return dict(cache.settings.get(chat_id, {}))
+
+    task = cache.settings_inflight.get(chat_id)
+    if task is None:
+        task = schedule_background(
+            asyncio.to_thread(db.get_settings, chat_id),
+            "settings-load",
+        )
+        cache.settings_inflight[chat_id] = task
+
+        def _forget(completed_task):
+            if cache.settings_inflight.get(chat_id) is completed_task:
+                cache.settings_inflight.pop(chat_id, None)
+
+        task.add_done_callback(_forget)
+
     try:
-        return await asyncio.to_thread(db.get_settings, chat_id)
+        # shield evita que o cancelamento de um filtro cancele a carga que pode
+        # ser reutilizada por outros eventos do mesmo chat.
+        return dict(await asyncio.shield(task) or {})
     except Exception as exc:
         logger.debug("Falha ao carregar settings do chat %s: %s", chat_id, exc)
         return {}
