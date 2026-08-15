@@ -8,7 +8,7 @@ import random
 import hashlib
 import json
 import unicodedata
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 import threading
 from pathlib import Path
 from datetime import datetime, timezone
@@ -83,6 +83,7 @@ MIN_TELEGRAM_TEMP_DURATION_SECONDS = 30
 EXPIRATION_CHECK_INTERVAL = _env_int("EXPIRATION_CHECK_INTERVAL", 30, 10, 300)
 SPAM_STATE_MAX_USERS = _env_int("SPAM_STATE_MAX_USERS", 10000, 100, 100000)
 SPAM_ACTION_COOLDOWN = _env_int("SPAM_ACTION_COOLDOWN", 30, 5, 300)
+SETTINGS_CACHE_MAX_CHATS = _env_int("SETTINGS_CACHE_MAX_CHATS", 5000, 100, 100000)
 ALLBAN_CONCURRENCY = _env_int("ALLBAN_CONCURRENCY", 3, 1, 8)
 BROADCAST_CONCURRENCY = _env_int("BROADCAST_CONCURRENCY", 3, 1, 8)
 PURGEALL_MIN_LIMIT = 1
@@ -104,7 +105,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V8.1"
+VERSION = "V8.2"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 TELETHON_LOG_LEVEL = os.getenv("TELETHON_LOG_LEVEL", "WARNING").upper()
 
@@ -141,6 +142,9 @@ class Cache:
         self.antiblack_chats = set()
         self.locked_chats = set()
         self.settings = {}
+        # LRU separado para limitar snapshots parciais e completos em instalações
+        # grandes sem alterar a API interna baseada em dict/set.
+        self.settings_access = OrderedDict()
         # Evita leituras e gravações SQLite nos filtros de alta frequência.
         self.settings_loaded = set()
         # Uma única carga assíncrona por chat evita que vários filtros ou comandos
@@ -166,6 +170,7 @@ class Cache:
             self.antiblack_chats.clear()
             self.locked_chats.clear()
             self.settings.clear()
+            self.settings_access.clear()
             self.settings_loaded.clear()
             self.settings_inflight.clear()
             self.maintenance_enabled = False
@@ -239,6 +244,7 @@ class Cache:
                     chat_id = int(row["chat_id"])
                     self.settings[chat_id] = dict(row)
                     self.settings_loaded.add(chat_id)
+                    self._touch_settings(chat_id)
             except (sqlite3.OperationalError, TypeError, KeyError):
                 # Compatibilidade defensiva com bancos de versões anteriores.
                 pass
@@ -261,6 +267,17 @@ class Cache:
             logger.info("Cache carregado com sucesso (%s - filtros de baixa latência).", VERSION)
         except Exception as e:
             logger.error(f"Erro ao carregar cache: {e}")
+
+    def _touch_settings(self, chat_id):
+        """Atualiza o LRU e limita snapshots de settings em memória."""
+        chat_id = int(chat_id)
+        self.settings_access[chat_id] = None
+        self.settings_access.move_to_end(chat_id)
+        while len(self.settings_access) > SETTINGS_CACHE_MAX_CHATS:
+            expired_chat_id, _ = self.settings_access.popitem(last=False)
+            self.settings.pop(expired_chat_id, None)
+            self.settings_loaded.discard(expired_chat_id)
+
 
 cache = Cache()
 
@@ -618,6 +635,7 @@ class Database:
             # Se o chat ainda não foi carregado, não marque um snapshot parcial
             # como completo: a próxima leitura fará uma carga integral da linha.
             cache.settings.setdefault(chat_id, {})[key] = value
+            cache._touch_settings(chat_id)
             # Se o snapshot já estava completo, ele permanece válido; caso
             # contrário, a próxima leitura integral ainda será coalescida.
             return True
@@ -626,6 +644,7 @@ class Database:
     def get_settings(self, chat_id):
         chat_id = int(chat_id)
         if chat_id in cache.settings_loaded:
+            cache._touch_settings(chat_id)
             return dict(cache.settings.get(chat_id, {}))
         row = self.fetchone("SELECT * FROM settings WHERE chat_id=?", (chat_id,))
         if row is None:
@@ -634,6 +653,7 @@ class Database:
         result = dict(row) if row else {}
         cache.settings[chat_id] = result
         cache.settings_loaded.add(chat_id)
+        cache._touch_settings(chat_id)
         return dict(result)
 
     def get_chat_lock(self, chat_id):
@@ -641,6 +661,7 @@ class Database:
         # O estado de lock já faz parte do snapshot de configurações. Reutilizá-lo
         # evita uma segunda consulta quando o handler acabou de carregar settings.
         if chat_id in cache.settings_loaded:
+            cache._touch_settings(chat_id)
             settings = cache.settings.get(chat_id, {})
             return {
                 "locked": int(settings.get("locked") or 0),
@@ -656,6 +677,7 @@ class Database:
             # como carregado integralmente, pois isso faria get_settings_async
             # devolver um snapshot parcial e ocultaria antispam/antilink.
             cache.settings.setdefault(chat_id, {}).update(result)
+            cache._touch_settings(chat_id)
         return result
 
     def set_chat_lock(self, chat_id, snapshot):
@@ -668,6 +690,7 @@ class Database:
         if cursor is not None:
             cache.locked_chats.add(int(chat_id))
             cache.settings.setdefault(int(chat_id), {}).update({"locked": 1, "lock_snapshot": snapshot})
+            cache._touch_settings(int(chat_id))
             return True
         return False
 
@@ -680,6 +703,7 @@ class Database:
         if cursor is not None:
             cache.locked_chats.discard(int(chat_id))
             cache.settings.setdefault(int(chat_id), {}).update({"locked": 0, "lock_snapshot": None})
+            cache._touch_settings(int(chat_id))
             return True
         return False
 
@@ -1673,7 +1697,8 @@ def is_authorized(user_id: int) -> bool:
 
 
 ADMIN_CACHE_TTL = _env_int("ADMIN_CACHE_TTL", 180, 10, 900)
-_admin_status_cache = {}
+ADMIN_CACHE_MAX_ENTRIES = _env_int("ADMIN_CACHE_MAX_ENTRIES", 20000, 1000, 100000)
+_admin_status_cache = OrderedDict()
 _admin_status_inflight = {}
 
 
@@ -1704,9 +1729,9 @@ async def _refresh_chat_admin_status(chat_id, user_id):
         logger.debug("Falha ao verificar cargo no chat %s: %s", chat_id, exc)
         allowed = False
     _admin_status_cache[key] = (allowed, time.monotonic())
-    if len(_admin_status_cache) > 20000:
-        oldest = min(_admin_status_cache, key=lambda item: _admin_status_cache[item][1])
-        _admin_status_cache.pop(oldest, None)
+    _admin_status_cache.move_to_end(key)
+    while len(_admin_status_cache) > ADMIN_CACHE_MAX_ENTRIES:
+        _admin_status_cache.popitem(last=False)
     return allowed
 
 
@@ -1741,6 +1766,7 @@ async def is_chat_admin(chat_id, user_id, use_cache=True, wait_for_rpc=True):
     now = time.monotonic()
     cached = _admin_status_cache.get(key)
     if use_cache and cached and now - cached[1] < ADMIN_CACHE_TTL:
+        _admin_status_cache.move_to_end(key)
         return cached[0]
     task = _admin_status_inflight.get(key)
     if not wait_for_rpc:
@@ -2793,7 +2819,7 @@ async def chat_registry(event):
 
 
 # --- SISTEMA ANTIBLACK (AUTO-REPOSTE FÊNIX) ---
-recent_sent_messages = {}
+recent_sent_messages = OrderedDict()
 MAX_RECENT_SENT_MESSAGES = 5000
 
 
@@ -2817,23 +2843,23 @@ async def antiblack_tracker(event):
     key = _antiblack_message_key(chat_id, event.id)
     if key is None:
         return
+    now = time.time()
     recent_sent_messages[key] = {
         "chat_id": chat_id,
         "message": event.message,
-        "time": time.time(),
+        "time": now,
     }
-    cutoff = time.time() - 10
-    for message_key, data in list(recent_sent_messages.items()):
-        if data["time"] < cutoff:
-            recent_sent_messages.pop(message_key, None)
-    overflow = len(recent_sent_messages) - MAX_RECENT_SENT_MESSAGES
-    if overflow > 0:
-        oldest_keys = sorted(
-            recent_sent_messages,
-            key=lambda message_key: recent_sent_messages[message_key]["time"],
-        )[:overflow]
-        for message_key in oldest_keys:
-            recent_sent_messages.pop(message_key, None)
+    recent_sent_messages.move_to_end(key)
+    cutoff = now - 10
+    # As entradas são inseridas em ordem temporal; retirar pelo início evita
+    # varrer e ordenar milhares de mensagens a cada envio.
+    while recent_sent_messages:
+        oldest_key, oldest_data = next(iter(recent_sent_messages.items()))
+        if oldest_data.get("time", 0) >= cutoff:
+            break
+        recent_sent_messages.pop(oldest_key, None)
+    while len(recent_sent_messages) > MAX_RECENT_SENT_MESSAGES:
+        recent_sent_messages.popitem(last=False)
 
 
 @client.on(events.MessageDeleted())
@@ -2923,6 +2949,7 @@ async def get_settings_async(chat_id):
     """Obtém settings do cache, coalescendo a primeira carga por chat."""
     chat_id = int(chat_id)
     if chat_id in cache.settings_loaded:
+        cache._touch_settings(chat_id)
         return dict(cache.settings.get(chat_id, {}))
 
     task = cache.settings_inflight.get(chat_id)
@@ -3056,7 +3083,7 @@ async def antilink_filter(event):
     raise events.StopPropagation
 
 
-spam_state = {}
+spam_state = OrderedDict()
 
 
 async def apply_warning_action(chat_id, user_id, action, duration, reason, admin_id):
@@ -3164,13 +3191,9 @@ async def antispam_filter(event):
         },
     )
     state["last_seen"] = now
+    spam_state.move_to_end(key)
     if len(spam_state) > SPAM_STATE_MAX_USERS:
-        oldest_key, _ = min(
-            spam_state.items(),
-            key=lambda item: float(item[1].get("last_seen", 0.0)),
-        )
-        if oldest_key != key:
-            spam_state.pop(oldest_key, None)
+        spam_state.popitem(last=False)
 
     window = _setting_int(settings, "spam_window", 10, 5, 120)
     cutoff = now - window
