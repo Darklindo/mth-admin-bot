@@ -4,6 +4,7 @@ import sqlite3
 import time
 import asyncio
 import re
+import random
 import hashlib
 import json
 import unicodedata
@@ -91,7 +92,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V7.9"
+VERSION = "V8.0"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 TELETHON_LOG_LEVEL = os.getenv("TELETHON_LOG_LEVEL", "WARNING").upper()
 
@@ -100,6 +101,7 @@ PROFILE_BACKUP_PATH = DATA_DIR / "profile_backup.json"
 PROFILE_BACKUP_PHOTO_PATH = DATA_DIR / "profile_backup_photo.jpg"
 PROFILE_CLONE_TEMP_PATH = DATA_DIR / "profile_clone_temp.jpg"
 PROFILE_BACKUP_SCHEMA = 1
+EXU_ASSET_DIR = BASE_DIR / "assets" / "exu"
 
 
 logging.basicConfig(
@@ -4867,6 +4869,7 @@ async def cmd_help(event):
         "• <code>.logs</code> (Auditoria de Deleções)\n"
         "• <code>.id</code> (Mostra o ID do usuário)\n"
         "• <code>.infojt</code> (Informações detalhadas por reply, ID ou username)\n"
+        "• <code>.exu</code> (imagem aleatória de Exu; usa sticker como fallback)\n"
         "• <code>.help</code>"
     )
     await reply_or_edit(event, text, delete_after=15)
@@ -5237,6 +5240,91 @@ async def cmd_infojt(event):
 
     lines.extend(["", f"🔑 <b>Autorização:</b> {authorization_label}"])
     await reply_or_edit(event, "\n".join(lines), delete_after=15)
+
+
+_EXU_LABELS = {
+    "exu_ze_pelintra": "Zé Pelintra",
+    "exu_tranca_rua": "Exu Tranca-Rua",
+    "exu_caveira": "Exu Caveira",
+    "exu_mirim": "Exu Mirim",
+}
+
+
+def _exu_assets(extension):
+    """Retorna somente assets regulares do `.exu`, sem acessar o Telegram."""
+    try:
+        return tuple(sorted(EXU_ASSET_DIR.glob(f"exu_*.{extension}")))
+    except OSError as exc:
+        logger.warning("Não foi possível listar assets do .exu: %s", exc)
+        return ()
+
+
+async def _finish_exu_text(event, text):
+    """Envia fallback textual seguindo as métricas e a limpeza padrão."""
+    message = None
+    try:
+        message = await event.reply(text, parse_mode="html")
+    except Exception as exc:
+        logger.warning("Fallback HTML do .exu falhou: %s", exc)
+        try:
+            message = await event.reply(text, parse_mode=None)
+        except Exception as fallback_exc:
+            logger.error("Fallback textual do .exu falhou: %s", fallback_exc)
+    command_metrics.finish(event, success=message is not None)
+    if message is not None:
+        schedule_response_cleanup(message, event, DEFAULT_DELETE_AFTER, "resposta do .exu")
+    else:
+        schedule_response_cleanup(None, event, DEFAULT_DELETE_AFTER, "comando .exu")
+    return message
+
+
+@client.on(events.NewMessage(pattern=r'^\.exu(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+async def cmd_exu(event):
+    """Envia uma imagem de Exu e usa sticker local como fallback de mídia."""
+    command_metrics.start(event)
+    image_assets = _exu_assets("jpg")
+    sticker_assets = _exu_assets("webp")
+    selected_name = None
+    sent_message = None
+
+    if image_assets:
+        selected = random.choice(image_assets)
+        selected_name = selected.stem
+        label = _EXU_LABELS.get(selected.stem, "Exu")
+        try:
+            sent_message = await client.send_file(
+                event.chat_id,
+                str(selected),
+                caption=f"🕯️ <b>{escape(label)}</b>",
+                parse_mode="html",
+                force_document=False,
+            )
+        except Exception as exc:
+            logger.warning("Envio da imagem do .exu falhou (%s): %s", selected.name, exc)
+
+    if sent_message is None and sticker_assets:
+        sticker = random.choice(sticker_assets)
+        selected_name = sticker.stem
+        try:
+            sent_message = await client.send_file(
+                event.chat_id,
+                str(sticker),
+                force_document=False,
+            )
+        except Exception as exc:
+            logger.warning("Fallback para sticker do .exu falhou (%s): %s", sticker.name, exc)
+
+    if sent_message is not None:
+        command_metrics.finish(event, success=True)
+        schedule_response_cleanup(sent_message, event, DEFAULT_DELETE_AFTER, "mídia do .exu")
+        logger.debug(".exu enviou o asset %s no chat %s", selected_name, event.chat_id)
+        return sent_message
+
+    if not image_assets and not sticker_assets:
+        text = "❌ Nenhum asset do <code>.exu</code> foi encontrado em <code>assets/exu</code>."
+    else:
+        text = "❌ Não foi possível enviar a imagem nem o sticker do <code>.exu</code>."
+    return await _finish_exu_text(event, text)
 
 
 @client.on(events.NewMessage(pattern=r'^\.msg(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
