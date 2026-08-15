@@ -70,6 +70,13 @@ Para excluir mensagens, restringir usuários e aplicar banimentos, a conta preci
 
 O banco SQLite fica em `data/bot.db`, utiliza WAL e possui migrações idempotentes. O arquivo `migrate_db.py` pode ser executado novamente sem apagar os registros existentes.
 
+## Documentação comercial
+
+- [Tutorial completo para Termux](TUTORIAL_TERMUX.md)
+- [Catálogo completo de comandos V8.0](COMANDOS.md)
+
+O comando `.exu` utiliza assets locais e possui fallback automático para stickers. Os comandos de perfil `.salvar`, `.clonar` e `.restaurar` são exclusivos ao proprietário.
+
 ## Segurança
 
 As credenciais MTProto são sensíveis. Não publique `API_HASH`, sessões do Telethon, tokens, banco local ou logs que contenham dados privados. Se uma credencial for exposta, revogue-a ou substitua-a antes de continuar usando o ambiente.

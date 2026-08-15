@@ -51,15 +51,27 @@ def _setting_int(settings, key, default, minimum, maximum):
     return max(minimum, min(value, maximum))
 
 
+def _optional_owner_env(name: str) -> int:
+    value = os.getenv(name, "0").strip()
+    if not value:
+        return 0
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} deve ser um ID numérico ou 0 no .env") from exc
+    if parsed < 0:
+        raise RuntimeError(f"{name} não pode ser negativo")
+    return parsed
+
+
 try:
     API_ID = int(_required_env("API_ID"))
     API_HASH = _required_env("API_HASH")
     OWNER_ID = int(_required_env("OWNER_ID"))
 except ValueError as exc:
     raise RuntimeError("API_ID e OWNER_ID devem ser números inteiros no .env") from exc
-
-SECOND_OWNER_ID = int(os.getenv("SECOND_OWNER_ID", "6466326477"))
-THIRD_OWNER_ID = int(os.getenv("THIRD_OWNER_ID", "7916427095"))
+SECOND_OWNER_ID = _optional_owner_env("SECOND_OWNER_ID")
+THIRD_OWNER_ID = _optional_owner_env("THIRD_OWNER_ID")
 
 MIN_PURGE_LIMIT = 5
 MAX_PURGE_LIMIT = 100
