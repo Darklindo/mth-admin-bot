@@ -7,7 +7,6 @@ import re
 import hashlib
 import json
 import unicodedata
-import logging
 from collections import defaultdict, deque
 import threading
 from pathlib import Path
@@ -92,7 +91,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V7.8"
+VERSION = "V7.9"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 TELETHON_LOG_LEVEL = os.getenv("TELETHON_LOG_LEVEL", "WARNING").upper()
 
@@ -263,6 +262,30 @@ async def get_cached_me():
         return None
 
 # --- BANCO DE DADOS ---
+class _LockedCursor:
+    """Cursor SQLite que mantém o lock também durante o consumo das linhas."""
+
+    def __init__(self, cursor, lock):
+        self._cursor = cursor
+        self._lock = lock
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    @property
+    def lastrowid(self):
+        return self._cursor.lastrowid
+
+    def fetchone(self):
+        with self._lock:
+            return self._cursor.fetchone()
+
+    def fetchall(self):
+        with self._lock:
+            return self._cursor.fetchall()
+
+
 class Database:
     def __init__(self, path: Path):
         self.path = path
@@ -285,7 +308,7 @@ class Database:
                 cursor = self.conn.execute(query, params)
                 if commit:
                     self.conn.commit()
-                return cursor
+                return _LockedCursor(cursor, self._db_lock)
         except Exception as e:
             logger.error(f"DB Error: {e} | Query: {query}")
             try:
@@ -1228,7 +1251,7 @@ class AuditBuffer:
     def enqueue(self, chat_id, user_id, content, reason, admin_id=None):
         record = (chat_id, user_id, admin_id, content, reason, int(time.time()))
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             self.failed += 1
             self.database.add_deleted_log(
@@ -1984,6 +2007,36 @@ def message_contains_link(message, text=None):
     return count_message_links(message, text) > 0
 
 
+def _looks_like_target_token(token):
+    """Identifica somente tokens inequívocos de ID ou username explícito."""
+    raw = str(token or "").strip()
+    return bool(
+        (raw.startswith("@") and len(raw) > 1)
+        or raw.isdigit()
+        or (raw.startswith("-") and raw[1:].isdigit())
+    )
+
+
+def _find_target_token_index(args):
+    """Encontra o alvo explícito mesmo quando opções aparecem antes dele."""
+    skip_next = False
+    for index, token in enumerate(args[1:], start=1):
+        lower = str(token or "").lower()
+        if skip_next:
+            skip_next = False
+            continue
+        if lower == "--purge":
+            skip_next = True
+            continue
+        if lower.startswith("--purge=") or lower in {"--include-pinned", "--tag", "--confirmar", "--confirm", "tag", "confirm", "confirmar"}:
+            continue
+        if parse_duration_token(token) is not None or lower in {"perm", "permanent", "permanente"}:
+            continue
+        if _looks_like_target_token(token):
+            return index
+    return None
+
+
 async def get_target_from_event(event):
     """Resolve alvo por reply, ID ou username sem confundir o autor do comando."""
     try:
@@ -2009,19 +2062,21 @@ async def get_target_from_event(event):
                 return int(forward_sender_id)
 
         args = (event.raw_text or "").split()
-        if len(args) > 1:
-            raw = args[1].strip()
-            if raw.startswith("@"):
-                try:
-                    user = await client.get_entity(raw)
-                    if isinstance(user, User):
-                        await asyncio.to_thread(db.remember_user, user.id, user.username, user.first_name)
-                    return int(user.id)
-                except (ValueError, RPCError):
-                    resolved = await asyncio.to_thread(db.resolve_username, raw)
-                    return int(resolved) if resolved else None
-            if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
-                return int(raw)
+        target_index = _find_target_token_index(args)
+        if target_index is None:
+            return None
+        raw = args[target_index].strip()
+        if raw.startswith("@"):
+            try:
+                user = await client.get_entity(raw)
+                if isinstance(user, User):
+                    await asyncio.to_thread(db.remember_user, user.id, user.username, user.first_name)
+                return int(user.id)
+            except (ValueError, RPCError):
+                resolved = await asyncio.to_thread(db.resolve_username, raw)
+                return int(resolved) if resolved else None
+        if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
+            return int(raw)
     except (TypeError, ValueError, RPCError) as exc:
         logger.debug("Erro ao extrair alvo: %s", exc)
     except Exception as exc:
@@ -2199,12 +2254,15 @@ def parse_duration_token(token):
 
 def parse_moderation_options(event, allow_purge=False):
     args = (event.raw_text or "").split()
-    start = 1 if event.is_reply else 2
+    target_index = None if event.is_reply else _find_target_token_index(args)
     duration = None
     purge_limit = None
     reason_tokens = []
-    index = start
+    index = 1
     while index < len(args):
+        if index == target_index:
+            index += 1
+            continue
         token = args[index]
         lower = token.lower()
         if allow_purge and lower == "--purge":
@@ -2702,6 +2760,17 @@ async def chat_registry(event):
 recent_sent_messages = {}
 MAX_RECENT_SENT_MESSAGES = 5000
 
+
+def _antiblack_message_key(chat_id, message_id):
+    """Usa chat + mensagem porque IDs de mensagem se repetem entre chats."""
+    try:
+        normalized_chat = int(chat_id) if chat_id is not None else None
+        normalized_message = int(message_id)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return normalized_chat, normalized_message
+
+
 @client.on(events.NewMessage(outgoing=True))
 async def antiblack_tracker(event):
     if not event.is_group and not event.is_channel:
@@ -2709,28 +2778,54 @@ async def antiblack_tracker(event):
     chat_id = event.chat_id
     if chat_id not in cache.antiblack_chats or (event.raw_text or "").startswith("."):
         return
-    recent_sent_messages[event.id] = {
+    key = _antiblack_message_key(chat_id, event.id)
+    if key is None:
+        return
+    recent_sent_messages[key] = {
         "chat_id": chat_id,
         "message": event.message,
         "time": time.time(),
     }
     cutoff = time.time() - 10
-    for msg_id, data in list(recent_sent_messages.items()):
-        if data["time"] < cutoff or len(recent_sent_messages) > MAX_RECENT_SENT_MESSAGES:
-            recent_sent_messages.pop(msg_id, None)
+    for message_key, data in list(recent_sent_messages.items()):
+        if data["time"] < cutoff:
+            recent_sent_messages.pop(message_key, None)
+    overflow = len(recent_sent_messages) - MAX_RECENT_SENT_MESSAGES
+    if overflow > 0:
+        oldest_keys = sorted(
+            recent_sent_messages,
+            key=lambda message_key: recent_sent_messages[message_key]["time"],
+        )[:overflow]
+        for message_key in oldest_keys:
+            recent_sent_messages.pop(message_key, None)
+
 
 @client.on(events.MessageDeleted())
 async def antiblack_resender(event):
+    event_chat_id = getattr(event, "chat_id", None)
     for deleted_id in event.deleted_ids:
-        data = recent_sent_messages.pop(deleted_id, None)
-        if not data or data["chat_id"] != event.chat_id or time.time() - data["time"] >= 10:
+        key = _antiblack_message_key(event_chat_id, deleted_id)
+        data = recent_sent_messages.pop(key, None) if key is not None else None
+        if data is None and event_chat_id is None:
+            # Alguns updates de exclusão não carregam o chat. Só usamos um
+            # candidato quando o ID é único entre os chats, evitando repostar
+            # conteúdo no chat errado.
+            candidates = [
+                candidate_key
+                for candidate_key in recent_sent_messages
+                if candidate_key[1] == int(deleted_id)
+            ]
+            if len(candidates) == 1:
+                data = recent_sent_messages.pop(candidates[0], None)
+                event_chat_id = data.get("chat_id") if data else None
+        if not data or data["chat_id"] != event_chat_id or time.time() - data["time"] >= 10:
             continue
         try:
             message = data["message"]
             if message.media:
-                await client.send_file(event.chat_id, message.media, caption=message.text or None)
+                await client.send_file(event_chat_id, message.media, caption=message.text or None)
             elif message.text:
-                await client.send_message(event.chat_id, message.text)
+                await client.send_message(event_chat_id, message.text)
         except Exception as exc:
             logger.error(f"Erro no auto-reposte antiblack: {exc}")
 
@@ -3215,7 +3310,7 @@ async def cmd_restaurar(event):
         await finish_fast_response(event, status, "❌ Não foi possível restaurar o perfil com segurança.", label="erro do restaurar")
 
 
-@client.on(events.NewMessage(incoming=True, pattern=r'^\.jt'))
+@client.on(events.NewMessage(incoming=True, pattern=r'^\.[a-z0-9_]+(?:\s|$)'))
 async def maintenance_filter(event):
     if not cache.maintenance_enabled or is_owner(event.sender_id):
         return

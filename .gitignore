@@ -7,3 +7,4 @@ venv/
 *.log
 *.session
 *.session-journal
+purgeall_research.md
