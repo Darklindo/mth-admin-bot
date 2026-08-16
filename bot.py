@@ -357,7 +357,7 @@ async def _is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat = update.effective_chat
     if not user or not chat:
         return False
-    if int(user.id) == OWNER_ID:
+    if _is_owner(user.id):
         return True
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
