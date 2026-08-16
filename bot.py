@@ -44,12 +44,36 @@ def _required_env(name: str) -> str:
 
 
 BOT_TOKEN = _required_env("BOT_TOKEN")
-try:
-    OWNER_ID = int(_required_env("OWNER_ID"))
-except ValueError as exc:
-    raise RuntimeError("OWNER_ID deve ser um ID numérico") from exc
-if OWNER_ID <= 0:
-    raise RuntimeError("OWNER_ID deve ser positivo")
+
+
+def _parse_owner_ids() -> frozenset[int]:
+    raw = os.getenv("OWNER_IDS", "").strip()
+    if not raw:
+        raw = _required_env("OWNER_ID")
+    values = set()
+    for token in re.split(r"[\s,;]+", raw):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            owner_id = int(token)
+        except ValueError as exc:
+            raise RuntimeError("OWNER_IDS deve conter apenas IDs numéricos separados por vírgula") from exc
+        if owner_id <= 0:
+            raise RuntimeError("OWNER_IDS deve conter somente IDs positivos")
+        values.add(owner_id)
+    if not values:
+        raise RuntimeError("Pelo menos um proprietário deve ser configurado em OWNER_IDS")
+    return frozenset(values)
+
+
+OWNER_IDS = _parse_owner_ids()
+# Compatibilidade interna: OWNER_ID representa o menor ID, mas as autorizações usam OWNER_IDS.
+OWNER_ID = min(OWNER_IDS)
+
+
+def _is_owner(user_id: int | None) -> bool:
+    return user_id is not None and int(user_id) in OWNER_IDS
 
 DB_PATH = DATA_DIR / "bot_api.db"
 DELETE_AFTER_SECONDS = 5
@@ -455,7 +479,7 @@ async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target is None:
         await _reply_and_cleanup(update, _target_error("blacklist"))
         return
-    if target.user_id == OWNER_ID:
+    if _is_owner(target.user_id):
         await _reply_and_cleanup(update, "❌ O proprietário não pode ser colocado na blacklist.")
         return
     chat_id = update.effective_chat.id
@@ -481,7 +505,7 @@ async def cmd_banperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target is None:
         await _reply_and_cleanup(update, _target_error("banperm"))
         return
-    if target.user_id == OWNER_ID:
+    if _is_owner(target.user_id):
         await _reply_and_cleanup(update, "❌ O proprietário é imune a banimentos.")
         return
     chat_id = update.effective_chat.id
@@ -530,18 +554,18 @@ async def _ban_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, target:
 
 
 async def cmd_allban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or int(update.effective_user.id) != OWNER_ID:
+    if not update.effective_user or not _is_owner(update.effective_user.id):
         await _reply_and_cleanup(update, "⛔ Este comando é exclusivo do proprietário configurado.")
         return
     target = await _resolve_target(update, context)
     if target is None:
         await _reply_and_cleanup(update, _target_error("allban"))
         return
-    if target.user_id == OWNER_ID:
+    if _is_owner(target.user_id):
         await _reply_and_cleanup(update, "❌ O proprietário não pode ser banido.")
         return
     reason = _reason(context)
-    if not await asyncio.to_thread(db.add_allban, target, OWNER_ID, reason):
+    if not await asyncio.to_thread(db.add_allban, target, update.effective_user.id, reason):
         await _reply_and_cleanup(update, "❌ Não foi possível registrar o allban global.")
         return
     ALLBAN_CACHE.add(target.user_id)
@@ -600,7 +624,7 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = target.user_id
 
     # Allban tem prioridade e tenta reforçar o banimento em chats onde o bot foi adicionado depois.
-    if user_id in ALLBAN_CACHE and user_id != OWNER_ID:
+    if user_id in ALLBAN_CACHE and not _is_owner(user_id):
         await _safe_delete(message)
         await _ban_in_chat(context, chat.id, target)
         return
@@ -627,7 +651,7 @@ async def post_init(app: Application):
             BotCommand("allban", "Banir em todos os grupos — proprietário"),
         ]
     )
-    logger.info("Jtzin Bot API online; proprietário=%s", OWNER_ID)
+    logger.info("Jtzin Bot API online; proprietários=%s", ",".join(str(owner_id) for owner_id in sorted(OWNER_IDS)))
 
 
 async def post_shutdown(app: Application):
