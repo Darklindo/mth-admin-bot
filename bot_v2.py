@@ -109,7 +109,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V8.4"
+VERSION = "V8.5"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 TELETHON_LOG_LEVEL = os.getenv("TELETHON_LOG_LEVEL", "WARNING").upper()
 
@@ -1744,6 +1744,8 @@ def is_authorized_event(event) -> bool:
 
 
 ADMIN_CACHE_TTL = _env_int("ADMIN_CACHE_TTL", 180, 10, 900)
+ADMIN_UNKNOWN_TTL = _env_int("ADMIN_UNKNOWN_TTL", 3, 1, 30)
+ADMIN_STALE_POSITIVE_TTL = _env_int("ADMIN_STALE_POSITIVE_TTL", 15, 3, 60)
 ADMIN_CACHE_MAX_ENTRIES = _env_int("ADMIN_CACHE_MAX_ENTRIES", 20000, 1000, 100000)
 # Em filtros de mensagens, uma carga fria tem uma janela curta para concluir o
 # RPC compartilhado. Isso reduz bypasses sem transformar cada mensagem em RPC.
@@ -1764,6 +1766,7 @@ def is_immune(user_id: int) -> bool:
 async def _refresh_chat_admin_status(chat_id, user_id):
     """Atualiza o cargo uma vez por chave e compartilha o resultado entre eventos."""
     key = (int(chat_id), int(user_id))
+    previous = _admin_status_cache.get(key)
     try:
         permissions = await client.get_permissions(chat_id, user_id)
         allowed = bool(
@@ -1773,18 +1776,30 @@ async def _refresh_chat_admin_status(chat_id, user_id):
                 "ChannelParticipantAdmin", "ChannelParticipantCreator",
             }
         )
+        timestamp = time.monotonic()
     except UserNotParticipantError:
         # Resposta válida: quem não participa não pode ser administrador.
         allowed = False
+        timestamp = time.monotonic()
     except (FloodWaitError, ChatAdminRequiredError, RPCError, ValueError, TypeError) as exc:
-        # Estado desconhecido: filtros automáticos devem aguardar a próxima
-        # tentativa, nunca interpretar uma falha transitória como não-admin.
+        # Falha transitória: preserve uma confirmação positiva anterior para
+        # não apagar links de administradores durante uma indisponibilidade.
+        # Para uma chave nunca confirmada, mantenha None; o antilink fail-closed
+        # bloqueará a mensagem em vez de abrir uma brecha para membros comuns.
+        allowed = True if previous and previous[0] is True else None
+        timestamp = (
+            time.monotonic() - ADMIN_CACHE_TTL + ADMIN_STALE_POSITIVE_TTL
+            if allowed is True else time.monotonic()
+        )
         logger.debug("Estado administrativo indisponível no chat %s: %s", chat_id, exc)
-        allowed = None
     except Exception as exc:
+        allowed = True if previous and previous[0] is True else None
+        timestamp = (
+            time.monotonic() - ADMIN_CACHE_TTL + ADMIN_STALE_POSITIVE_TTL
+            if allowed is True else time.monotonic()
+        )
         logger.debug("Falha ao verificar cargo no chat %s: %s", chat_id, exc)
-        allowed = None
-    _admin_status_cache[key] = (allowed, time.monotonic())
+    _admin_status_cache[key] = (allowed, timestamp)
     _admin_status_cache.move_to_end(key)
     while len(_admin_status_cache) > ADMIN_CACHE_MAX_ENTRIES:
         _admin_status_cache.popitem(last=False)
@@ -1821,7 +1836,8 @@ async def is_chat_admin(chat_id, user_id, use_cache=True, wait_for_rpc=True):
     key = (int(chat_id), user_id)
     now = time.monotonic()
     cached = _admin_status_cache.get(key)
-    if use_cache and cached and now - cached[1] < ADMIN_CACHE_TTL:
+    cache_ttl = ADMIN_UNKNOWN_TTL if cached and cached[0] is None else ADMIN_CACHE_TTL
+    if use_cache and cached and now - cached[1] < cache_ttl:
         _admin_status_cache.move_to_end(key)
         return cached[0]
     task = _admin_status_inflight.get(key)
@@ -1843,8 +1859,8 @@ async def admin_state_for_filter(chat_id, user_id):
     """Obtém o cargo para filtros com uma espera curta e compartilhada.
 
     O primeiro acesso agenda uma consulta única. Se ela terminar rapidamente,
-    o filtro usa o resultado real; se o Telegram estiver lento, o filtro não
-    bloqueia o dispatcher nem transforma um estado desconhecido em admin.
+    o filtro usa o resultado real; se o Telegram estiver lento, o estado fica
+    explicitamente desconhecido para que cada filtro escolha sua política.
     """
     state = await is_chat_admin(chat_id, user_id, wait_for_rpc=False)
     if state is not None:
@@ -1860,6 +1876,21 @@ async def admin_state_for_filter(chat_id, user_id):
     except Exception as exc:
         logger.debug("Falha ao obter estado administrativo no filtro %s/%s: %s", chat_id, user_id, exc)
         return None
+
+
+async def admin_state_for_antilink(chat_id, user_id):
+    """Retorna somente estado confirmado para permitir links.
+
+    O antilink é deliberadamente fail-closed: apenas `True` libera a mensagem.
+    Assim, atraso ou falha transitória da consulta não cria uma brecha para
+    membros não autorizados. Administradores confirmados, proprietários e a
+    whitelist são tratados antes desta função pelo filtro.
+    """
+    state = await admin_state_for_filter(chat_id, user_id)
+    if state is None:
+        logger.debug("Cargo desconhecido; antilink aplicará bloqueio a %s/%s", chat_id, user_id)
+        return False
+    return bool(state)
 
 
 async def can_manage_chat(event):
@@ -2145,9 +2176,22 @@ def count_message_links(message, text=None):
     return max(visible_count, entity_count)
 
 
+def link_scan_text(message, text=None):
+    """Combina legenda/texto e nome de arquivo para uma varredura abrangente."""
+    parts = []
+    raw_text = text if text is not None else getattr(message, "raw_text", "") or ""
+    if raw_text:
+        parts.append(str(raw_text))
+    file_info = getattr(message, "file", None)
+    file_name = getattr(file_info, "name", None)
+    if file_name:
+        parts.append(str(file_name))
+    return "\n".join(parts)
+
+
 def message_contains_link(message, text=None):
-    """Detecta URLs modernas, obfuscadas e links ocultos em entidades do Telegram."""
-    return count_message_links(message, text) > 0
+    """Detecta URLs, convites e links ocultos em texto, legenda e arquivo."""
+    return count_message_links(message, link_scan_text(message, text)) > 0
 
 
 def _looks_like_target_token(token):
@@ -3136,9 +3180,10 @@ async def antilink_filter(event):
     """Remove links de não administradores sem consultar permissões repetidamente."""
     if not event.chat_id or not (event.is_group or event.is_channel):
         return
-    # Comandos não são links de usuário e não devem disparar leitura de
-    # settings, whitelist ou consulta RPC de administrador.
-    if (event.raw_text or "").startswith("."):
+    # Mensagens iniciadas por ponto sem link continuam fora do caminho quente,
+    # mas um membro não autorizado não pode esconder um convite dentro de um
+    # comando ou texto iniciado por ponto.
+    if (event.raw_text or "").startswith(".") and not message_contains_link(event.message, event.raw_text or ""):
         return
     user_id = event.sender_id
     if not user_id or is_immune(user_id):
@@ -3150,8 +3195,8 @@ async def antilink_filter(event):
         return
     if user_id in cache.link_whitelist.get(int(event.chat_id), set()):
         return
-    admin_state = await admin_state_for_filter(event.chat_id, user_id)
-    if admin_state is not False:
+    admin_state = await admin_state_for_antilink(event.chat_id, user_id)
+    if admin_state:
         return
     try:
         await delete_security_message(

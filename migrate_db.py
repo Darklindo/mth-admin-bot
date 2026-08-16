@@ -14,7 +14,7 @@ def ensure_column(conn, table, column, definition):
 
 
 def migrate():
-    print("Iniciando Migração V8.4 (modernização da versão pessoal e inicialização compatível com Python 3.14)...")
+    print("Iniciando Migração V8.5 (modernização da versão pessoal e inicialização compatível com Python 3.14)...")
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
@@ -147,7 +147,7 @@ def migrate():
                 """
             )
         conn.commit()
-        print("Migração V8.4 concluída com sucesso.")
+        print("Migração V8.5 concluída com sucesso.")
     finally:
         conn.close()
 
