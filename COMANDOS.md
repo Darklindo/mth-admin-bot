@@ -1,8 +1,22 @@
-# Jtzin Userbot — Catálogo de comandos V8.0
+# Catálogo de comandos — Jtzin Bot API + Userbot V9.0
 
-Todos os comandos usam o prefixo `.`. Para evitar conflito com o Group Help, apenas os sete comandos abaixo usam o prefixo `.jt`:
+A V9.0 possui duas superfícies independentes. O **Bot API** usa comandos com `/` e oferece apenas três funções. O **Userbot** usa comandos com `.` e só aceita mensagens do proprietário configurado em `OWNER_ID`.
 
-| Comando com conflito | Forma correta |
+## Bot API — três funções
+
+| Comando | Função | Acesso |
+|---|---|---|
+| `/blacklist` | Registra o alvo na blacklist local do grupo atual e apaga mensagens dele enquanto o bot estiver ativo. Use respondendo à mensagem ou com ID/username conhecido. | Administrador do grupo |
+| `/banperm` | Bane permanentemente o alvo somente no grupo atual. Use respondendo à mensagem ou com ID/username conhecido. | Administrador do grupo |
+| `/allban` | Registra o alvo na lista global e tenta bani-lo em todos os grupos conhecidos do Bot API. | Somente `OWNER_ID` |
+
+O Bot API precisa estar no grupo e possuir as permissões administrativas correspondentes. A função global não consegue operar em chats que o bot não conhece, não acessa ou onde não pode restringir membros. O banco do Bot API é separado do banco do Userbot.
+
+## Userbot — prefixos
+
+Todos os comandos do Userbot usam `.`. Para evitar conflito com o Group Help, somente estes sete usam `.jt`:
+
+| Conflito | Forma correta |
 |---|---|
 | ban | `.jtban` |
 | mute | `.jtmute` |
@@ -14,6 +28,8 @@ Todos os comandos usam o prefixo `.`. Para evitar conflito com o Group Help, ape
 
 Todos os demais comandos permanecem com o prefixo normal, como `.kick`, `.lock`, `.infojt` e `.exu`.
 
+> **Acesso:** na V9.0 não existem subproprietários nem autorização de terceiros. Os comandos `.autorizar`, `.desautorizar` e `.listauth` foram removidos. Somente o `OWNER_ID` usa o Userbot.
+
 ## Moderação local
 
 | Comando | Função e exemplo |
@@ -21,131 +37,96 @@ Todos os demais comandos permanecem com o prefixo normal, como `.kick`, `.lock`,
 | `.jtban` | Banimento temporário local. Exemplo: `.jtban 1h motivo`; exige duração explícita e pode usar `--purge N`. |
 | `.banperm` | Banimento permanente local no chat atual. Exemplo: `.banperm @usuario motivo`. |
 | `.jtmute` | Silencia temporariamente no chat atual. Exemplo: `.jtmute 30m motivo`. |
-| `.kick` | Remove o usuário do chat sem banimento permanente. Exemplo: responda à mensagem com `.kick` ou use `.kick @usuario`. |
-| `.unban` | Remove o banimento local. Pode ser usado respondendo, por ID ou por username. |
+| `.kick` | Remove o usuário do chat sem banimento permanente. |
+| `.unban` | Remove o banimento local. |
 | `.unbanperm` | Remove o banimento permanente local. |
 | `.unmute` | Remove o silêncio local. |
-| `.blacklist` | Ativa blacklist local; mensagens recentes do alvo são apagadas neste chat. Aceita duração, como `.blacklist 1h`. |
+| `.blacklist` | Ativa blacklist local, com duração opcional, apagando mensagens do alvo no chat atual. |
 | `.unblacklist` | Remove a blacklist local. |
-| `.jtdel` | Apaga a mensagem respondida, sem aplicar punição. |
-| `.jtdelwarn` | Apaga a mensagem respondida e aplica uma advertência ao autor. |
-| `.jtpurge` | Apaga mensagens recentes do alvo. Use `.jtpurge 10`; protege mensagens fixadas por padrão. |
-| `.purgeme` | Apaga mensagens recentes da própria conta. Use `.purgeme 10`. |
-| `.jtpurgeall` | Apaga mensagens recentes em grande quantidade, com limite controlado. Use `--include-pinned` para incluir mensagens fixadas. |
-| `.lock` | Fecha o envio para membros, mantendo administradores liberados. Guarda snapshot das permissões. |
-| `.unlock` | Reabre o chat e restaura o snapshot de permissões anterior. |
+| `.jtdel` | Apaga somente a mensagem respondida. |
+| `.jtdelwarn` | Apaga a mensagem respondida e aplica advertência ao autor. |
+| `.jtpurge` | Apaga mensagens recentes do alvo. Use `.jtpurge 10`; mensagens fixadas são protegidas por padrão. |
+| `.purgeme` | Apaga mensagens recentes da própria conta. |
+| `.jtpurgeall` | Apaga mensagens recentes em grande quantidade, respeitando limites de segurança. Use `--include-pinned` para incluir fixadas. |
+| `.lock` | Fecha o envio para membros, mantendo administradores liberados e salvando snapshot. |
+| `.unlock` | Reabre o chat e restaura o snapshot anterior. |
 
-Quando um comando de alvo for respondido a uma mensagem, o ID ou username pode ser omitido. A conta precisa ter permissões administrativas suficientes no chat.
+Ao responder à mensagem do alvo, o ID ou username pode ser omitido. A conta precisa ter as permissões administrativas exigidas pelo Telegram.
 
 ## Advertências, antispam e quarentena
 
 | Comando | Função e exemplo |
 |---|---|
 | `.jtwarn` | Adverte o alvo. Exemplo: `.jtwarn @usuario motivo`. |
-| `.warns` | Consulta advertências do alvo no chat atual. |
-| `.unwarn` | Remove uma advertência do alvo. |
-| `.clearwarns` | Remove todas as advertências do alvo. |
-| `.antispam on/off` | Ativa ou desativa a proteção antispam com pontuação, rajadas, links, mídia e duplicação. |
-| `.quarantine on/off` | Ativa ou desativa a quarentena para padrões fortes de spam. |
-| `.pinned on/off` | Define se mensagens fixadas ficam protegidas dos comandos de purge. |
+| `.warns` | Consulta advertências do alvo. |
+| `.unwarn` | Remove uma advertência. |
+| `.clearwarns` | Remove todas as advertências. |
+| `.antispam on/off` | Ativa ou desativa antispam por pontuação, rajadas, links, mídia e duplicação. |
+| `.quarantine on/off` | Ativa ou desativa quarentena para padrões fortes de spam. |
+| `.pinned on/off` | Define a proteção de mensagens fixadas nos comandos de purge. |
 
-O antispam utiliza múltiplos sinais e não deve punir um usuário por uma única mensagem isolada. Os limites podem ser ajustados pelas configurações existentes no banco local.
+O antispam usa múltiplos sinais e não deve punir por uma mensagem isolada. A quarentena deve priorizar contenção reversível quando a confiança do detector não for suficiente para uma punição definitiva.
 
 ## Links
 
 | Comando | Função e exemplo |
 |---|---|
-| `.antilink on/off` | Permite links somente a administradores e usuários autorizados no chat. |
-| `.autorizarlink` | Autoriza um usuário específico a enviar links no chat. Pode ser usado por reply, ID ou username. |
-| `.desautorizarlink` | Remove a autorização de links do alvo. |
+| `.antilink on/off` | Permite links somente a administradores e usuários autorizados no chat. O modo fail-closed bloqueia quando o estado administrativo é desconhecido. |
+| `.autorizarlink` | Autoriza um usuário específico a enviar links. Pode usar reply, ID ou username. |
+| `.desautorizarlink` | Remove a autorização de links. |
 | `.listlinkauth` | Lista usuários autorizados a enviar links no chat atual. |
 
-## Controle global
+A autorização de links é apenas uma configuração do AntiLink. Ela não concede acesso aos comandos do Userbot.
+
+## Controle global do Userbot
 
 | Comando | Função e exemplo |
 |---|---|
-| `.allban` | Banimento global em todos os chats compatíveis. Exclusivo aos proprietários. Aceita duração e `--purge N`. |
-| `.allblack` | Blacklist global; apaga mensagens do alvo nos chats registrados. Exclusivo aos proprietários. |
-| `.unallblack` | Remove a blacklist global. Exclusivo aos proprietários. |
+| `.allban` | Banimento global nos chats compatíveis. Aceita duração e `--purge N`. |
+| `.allblack` | Blacklist global; apaga mensagens do alvo nos chats registrados. |
+| `.unallblack` | Remove a blacklist global. |
 | `.shadow` | Shadow ban global com duração opcional, como `.shadow 7d`. |
 | `.unshadow` | Remove o shadow ban global. |
-| `.maintenance on/off` | Ativa ou desativa o modo de manutenção. Exclusivo ao proprietário absoluto. |
+| `.maintenance on/off` | Ativa ou desativa o modo de manutenção. |
 
-Os comandos globais dependem dos chats registrados, das permissões da conta e das limitações de FloodWait do Telegram.
+Todos os comandos do Userbot são exclusivos do proprietário único configurado no `.env`. A execução ainda depende das permissões da conta em cada chat e das limitações do Telegram.
 
-## Autorizações
-
-| Comando | Função e exemplo |
-|---|---|
-| `.autorizar` | Autoriza um usuário a usar comandos. Aceita `10s`, `30m`, `10h`, `10d` e `1w`; sem duração, a autorização é permanente. |
-| `.desautorizar` | Remove a autorização de um usuário. |
-| `.listauth` | Lista autorizações ativas e suas expirações. |
-
-Exemplos:
-
-```text
-.autorizar 30m @usuario
-.autorizar 10d 123456789
-.autorizar @usuario
-.desautorizar @usuario
-.listauth
-```
-
-Os proprietários absolutos são definidos somente no `.env`. Usuários autorizados recebem acesso aos comandos permitidos, mas não se tornam imunes a punições.
-
-## Perfil da conta
+## AntiBlack, AntiSpy e diagnósticos
 
 | Comando | Função e exemplo |
 |---|---|
-| `.salvar` | Salva localmente nome, bio, username e foto atuais da conta. Deve ser usado antes de uma clonagem. Exclusivo ao proprietário. |
-| `.clonar` | Copia nome, bio e foto do usuário-alvo. Use por reply, ID ou username. Exclusivo ao proprietário. |
-| `.clonar --tag --confirmar @usuario` | Além dos campos anteriores, tenta aplicar o username se estiver disponível. A alteração é opcional e exige confirmação explícita. |
-| `.restaurar` | Restaura o último backup criado por `.salvar`. Exclusivo ao proprietário. |
-
-Exemplos:
-
-```text
-.salvar
-.clonar @usuario
-.clonar 123456789
-.clonar --tag --confirmar @usuario
-.restaurar
-```
-
-O backup fica em `data/` e não é enviado ao Telegram. Não apague o arquivo de backup enquanto ainda precisar restaurar o perfil.
-
-## Segurança e diagnóstico
-
-| Comando | Função e exemplo |
-|---|---|
-| `.antiblack on/off` | Modo Fênix por chat; tenta republicar mensagens recentes da própria conta quando recebe o evento de exclusão. |
-| `.antispy` | Faz uma varredura de sinais de atividade administrativa suspeita no chat. |
+| `.antiblack on/off` | Ativa ou desativa o Modo Fênix por chat. |
+| `.antiblack add` | Protege um usuário adicional por reply, ID ou username. |
+| `.antiblack list` | Lista os usuários protegidos no chat. |
+| `.unantiblack` | Remove um usuário da proteção. |
+| `.listantiblack` | Alias para a listagem do AntiBlack. |
+| `.antispy` | Analisa sinais de outros userbots ou atividade administrativa suspeita. |
 | `.listspy` | Lista usuários monitorados pelo AntiSpy. |
-| `.delspy` | Remove um usuário da lista de monitoramento. |
-| `.status` | Mostra estado operacional resumido. |
-| `.health` | Verifica conexão, sessão, banco e permissões do chat. |
-| `.latency` | Mostra RPC de exclusão, latência E2E e idade do update. |
-| `.logs` | Exibe logs de mensagens apagadas, quando autorizado. |
+| `.delspy` | Remove um usuário do monitoramento. |
+| `.status` | Mostra o estado operacional resumido. |
+| `.health` | Verifica sessão, conexão, banco e permissões. |
+| `.latency` | Mostra latência RPC, E2E, idade do update e falhas. |
+| `.logs` | Exibe logs de mensagens apagadas, quando disponíveis. |
 
-## Utilitários e mídia
+## Perfil, utilitários e mídia
 
 | Comando | Função e exemplo |
 |---|---|
-| `.start` | Exibe a mensagem inicial e informações do Userbot. |
-| `.help` | Exibe o guia interno de comandos. |
-| `.id` | Mostra o ID do autor da mensagem respondida ou do alvo informado. |
-| `.infojt` | Mostra informações detalhadas de um usuário por reply, ID ou username. |
-| `.chats` | Lista chats registrados, com identificação e resumo operacional. |
-| `.listdn` | Exibe punições locais/globais e respectivos estados. |
-| `.msg` | Broadcast global de texto ou mídia, conforme as permissões do proprietário. |
-| `.exu` | Envia uma imagem aleatória local de Exu. Se a imagem falhar, tenta um sticker WebP como fallback. |
+| `.salvar` | Salva nome, bio, username e foto atuais da conta. |
+| `.clonar` | Copia nome, bio e foto do usuário-alvo por reply, ID ou username. |
+| `.clonar --tag --confirmar @usuario` | Tenta copiar também o username com confirmação explícita. |
+| `.restaurar` | Restaura o último backup criado por `.salvar`. |
+| `.start` | Exibe informações iniciais do Userbot. |
+| `.help` | Exibe o guia interno atualizado. |
+| `.id` | Mostra o ID do autor respondido ou do alvo. |
+| `.infojt` | Exibe informações detalhadas do usuário e o status correto no chat. |
+| `.chats` | Lista chats registrados e o resumo operacional. |
+| `.listdn` | Exibe punições locais e globais. |
+| `.msg` | Envia texto ou mídia aos chats compatíveis. |
+| `.exu` | Envia uma imagem aleatória de Exu, com fallback para sticker. |
 
-O `.exu` usa os arquivos locais em `assets/exu/` e segue a política de autoexclusão padrão do Userbot.
+## Regras de resposta e segurança
 
-## Regras de autoexclusão
+As respostas e as próprias mensagens de comando são programadas para exclusão automática conforme a configuração. Relatórios e diagnósticos podem permanecer por mais tempo para leitura. A conta precisa ter permissões administrativas reais; o Userbot não contorna as regras do Telegram.
 
-As respostas dos comandos e as próprias mensagens de comando são programadas para exclusão automática conforme as constantes de configuração. Relatórios e diagnósticos usam uma janela maior para permitir leitura.
-
-## Observações de permissão
-
-A source usa uma conta de usuário autenticada no MTProto. Ela não contorna permissões do Telegram. A conta precisa ser administradora no grupo ou canal para excluir mensagens, aplicar restrições, banir usuários, alterar permissões ou enviar mídia em canais onde isso seja exigido.
+Não publique tokens, `API_HASH`, sessões, bancos, backups ou logs privados. Se uma credencial for exposta, revogue-a ou substitua-a antes de continuar.

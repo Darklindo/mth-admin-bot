@@ -1,13 +1,19 @@
+from __future__ import annotations
+
+import asyncio
 import logging
 import os
 import re
 import sqlite3
+import threading
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
+from dataclasses import dataclass
+from html import escape
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import ChatPermissions, Update, BotCommand
+from telegram import BotCommand, Update
 from telegram.constants import ChatType
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
@@ -24,254 +30,395 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-load_dotenv(BASE_DIR / ".env")
+ENV_FILE = Path(os.getenv("BOT_ENV_FILE", ".env.bot"))
+if not ENV_FILE.is_absolute():
+    ENV_FILE = BASE_DIR / ENV_FILE
+load_dotenv(ENV_FILE)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN não configurado. Crie o arquivo .env.")
-if not OWNER_ID:
-    raise RuntimeError("OWNER_ID não configurado. Crie o arquivo .env.")
+def _required_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Variável obrigatória ausente em {ENV_FILE.name}: {name}")
+    return value
 
-DB_PATH = DATA_DIR / "bot.db"
 
-# Anti-spam: 7 mensagens em 8 segundos => mensagens excedentes são apagadas.
-SPAM_LIMIT = 7
-SPAM_WINDOW = 8
+BOT_TOKEN = _required_env("BOT_TOKEN")
+try:
+    OWNER_ID = int(_required_env("OWNER_ID"))
+except ValueError as exc:
+    raise RuntimeError("OWNER_ID deve ser um ID numérico") from exc
+if OWNER_ID <= 0:
+    raise RuntimeError("OWNER_ID deve ser positivo")
+
+DB_PATH = DATA_DIR / "bot_api.db"
+DELETE_AFTER_SECONDS = 5
+ALLBAN_CONCURRENCY = 4
+MAX_TARGET_ID_LENGTH = 20
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
 )
-logger = logging.getLogger("mth-admin")
+logger = logging.getLogger("jtzin-bot-api")
 
-spam_buckets = defaultdict(deque)
+
+@dataclass(frozen=True)
+class Target:
+    user_id: int
+    username: str = ""
+    full_name: str = ""
+
+    @property
+    def label(self) -> str:
+        if self.username:
+            return f"@{self.username.lstrip('@')}"
+        return self.full_name or str(self.user_id)
 
 
 class Database:
+    """Banco independente do Userbot, com escritas serializadas e cache carregável."""
+
     def __init__(self, path: Path):
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.path = path
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=5)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.init()
+        with self._lock:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.execute("PRAGMA busy_timeout=5000")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            self.conn.execute("PRAGMA temp_store=MEMORY")
+            self.conn.execute("PRAGMA cache_size=-8192")
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS chats (
+                    chat_id INTEGER PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT '',
+                    chat_type TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL DEFAULT '',
+                    full_name TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS blacklist (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    added_by INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(chat_id, user_id)
+                );
+                CREATE TABLE IF NOT EXISTS banperm (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    added_by INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(chat_id, user_id)
+                );
+                CREATE TABLE IF NOT EXISTS allban (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    added_by INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_chats_active ON chats(active);
+                CREATE INDEX IF NOT EXISTS idx_blacklist_chat ON blacklist(chat_id);
+                CREATE INDEX IF NOT EXISTS idx_banperm_chat ON banperm(chat_id);
+                """
+            )
+            self.conn.commit()
 
-    def init(self):
-        self.conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS chats (
-                chat_id INTEGER PRIMARY KEY,
-                title TEXT NOT NULL DEFAULT '',
-                chat_type TEXT NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at INTEGER NOT NULL
-            );
+    def _execute(self, sql, params=(), *, commit=False):
+        with self._lock:
+            cursor = self.conn.execute(sql, params)
+            if commit:
+                self.conn.commit()
+            return cursor
 
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS blacklist (
-                chat_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                username TEXT,
-                added_by INTEGER NOT NULL,
-                created_at INTEGER NOT NULL,
-                PRIMARY KEY(chat_id, user_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS settings (
-                chat_id INTEGER PRIMARY KEY,
-                antispam INTEGER NOT NULL DEFAULT 1
-            );
-
-            CREATE TABLE IF NOT EXISTS warnings (
-                chat_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                count INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY(chat_id, user_id)
-            );
-            """
+    def load_state(self):
+        with self._lock:
+            chats = self.conn.execute(
+                "SELECT chat_id FROM chats WHERE active=1 AND chat_type IN ('group','supergroup')"
+            ).fetchall()
+            users = self.conn.execute(
+                "SELECT user_id,username,full_name FROM users"
+            ).fetchall()
+            blacklist_rows = self.conn.execute(
+                "SELECT chat_id,user_id FROM blacklist"
+            ).fetchall()
+            banperm_rows = self.conn.execute(
+                "SELECT chat_id,user_id FROM banperm"
+            ).fetchall()
+            allban_rows = self.conn.execute("SELECT user_id FROM allban").fetchall()
+        blacklist_by_chat = defaultdict(set)
+        for row in blacklist_rows:
+            blacklist_by_chat[int(row["chat_id"])].add(int(row["user_id"]))
+        banperm_by_chat = defaultdict(set)
+        for row in banperm_rows:
+            banperm_by_chat[int(row["chat_id"])].add(int(row["user_id"]))
+        return (
+            {int(row["chat_id"]) for row in chats},
+            {int(row["user_id"]): (row["username"] or "", row["full_name"] or "") for row in users},
+            blacklist_by_chat,
+            banperm_by_chat,
+            {int(row["user_id"]) for row in allban_rows},
         )
-        self.conn.commit()
 
-    def register_chat(self, chat_id, title, chat_type):
-        self.conn.execute(
+    def register_chat(self, chat_id: int, title: str, chat_type: str, active: bool = True):
+        self._execute(
             """
-            INSERT INTO chats(chat_id,title,chat_type,active,created_at)
+            INSERT INTO chats(chat_id,title,chat_type,active,updated_at)
             VALUES(?,?,?,?,?)
             ON CONFLICT(chat_id) DO UPDATE SET
                 title=excluded.title,
                 chat_type=excluded.chat_type,
-                active=1
+                active=excluded.active,
+                updated_at=excluded.updated_at
             """,
-            (chat_id, title or "", chat_type, 1, int(time.time())),
+            (int(chat_id), title or "", chat_type or "", int(active), int(time.time())),
+            commit=True,
         )
-        self.conn.execute(
-            "INSERT OR IGNORE INTO settings(chat_id, antispam) VALUES(?,1)",
-            (chat_id,),
-        )
-        self.conn.commit()
 
-    def set_active(self, chat_id, active):
-        self.conn.execute("UPDATE chats SET active=? WHERE chat_id=?", (int(active), chat_id))
-        self.conn.commit()
-
-    def active_chats(self):
-        return self.conn.execute(
-            "SELECT chat_id,title,chat_type FROM chats WHERE active=1 ORDER BY chat_id"
-        ).fetchall()
-
-    def remember_user(self, user):
-        if not user:
-            return
-        username = (user.username or "").lower().lstrip("@") or None
-        self.conn.execute(
+    def remember_user(self, user_id: int, username: str = "", full_name: str = ""):
+        self._execute(
             """
-            INSERT INTO users(user_id,username,first_name)
-            VALUES(?,?,?)
+            INSERT INTO users(user_id,username,full_name,updated_at)
+            VALUES(?,?,?,?)
             ON CONFLICT(user_id) DO UPDATE SET
                 username=excluded.username,
-                first_name=excluded.first_name
+                full_name=excluded.full_name,
+                updated_at=excluded.updated_at
             """,
-            (user.id, username, user.first_name or ""),
+            (int(user_id), (username or "").lstrip("@"), full_name or "", int(time.time())),
+            commit=True,
         )
-        self.conn.commit()
 
-    def resolve_username(self, username):
-        username = username.lower().lstrip("@")
-        row = self.conn.execute(
-            "SELECT user_id FROM users WHERE username=? LIMIT 1", (username,)
+    def resolve_username(self, username: str):
+        row = self._execute(
+            "SELECT user_id,username,full_name FROM users WHERE lower(username)=lower(?) LIMIT 1",
+            (username.lstrip("@"),),
         ).fetchone()
-        return int(row["user_id"]) if row else None
+        return dict(row) if row else None
 
-    def add_blacklist(self, chat_id, user_id, username, added_by):
-        self.conn.execute(
+    def add_blacklist(self, target: Target, chat_id: int, added_by: int, reason: str):
+        cursor = self._execute(
             """
-            INSERT INTO blacklist(chat_id,user_id,username,added_by,created_at)
-            VALUES(?,?,?,?,?)
+            INSERT INTO blacklist(chat_id,user_id,username,reason,added_by,created_at)
+            VALUES(?,?,?,?,?,?)
             ON CONFLICT(chat_id,user_id) DO UPDATE SET
                 username=excluded.username,
+                reason=excluded.reason,
                 added_by=excluded.added_by
             """,
-            (chat_id, user_id, username or "", added_by, int(time.time())),
+            (int(chat_id), target.user_id, target.username, reason, int(added_by), int(time.time())),
+            commit=True,
         )
-        self.conn.commit()
+        return cursor.rowcount >= 0
 
-    def remove_blacklist(self, chat_id, user_id):
-        cur = self.conn.execute(
-            "DELETE FROM blacklist WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+    def add_banperm(self, target: Target, chat_id: int, added_by: int, reason: str):
+        cursor = self._execute(
+            """
+            INSERT INTO banperm(chat_id,user_id,username,reason,added_by,created_at)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(chat_id,user_id) DO UPDATE SET
+                username=excluded.username,
+                reason=excluded.reason,
+                added_by=excluded.added_by
+            """,
+            (int(chat_id), target.user_id, target.username, reason, int(added_by), int(time.time())),
+            commit=True,
         )
-        self.conn.commit()
-        return cur.rowcount > 0
+        return cursor.rowcount >= 0
 
-    def is_blacklisted(self, chat_id, user_id):
-        row = self.conn.execute(
-            "SELECT 1 FROM blacklist WHERE chat_id=? AND user_id=?",
-            (chat_id, user_id),
-        ).fetchone()
-        return row is not None
+    def add_allban(self, target: Target, added_by: int, reason: str):
+        cursor = self._execute(
+            """
+            INSERT INTO allban(user_id,username,reason,added_by,created_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username=excluded.username,
+                reason=excluded.reason,
+                added_by=excluded.added_by
+            """,
+            (target.user_id, target.username, reason, int(added_by), int(time.time())),
+            commit=True,
+        )
+        return cursor.rowcount >= 0
 
-    def blacklist_rows(self, chat_id):
-        return self.conn.execute(
-            "SELECT user_id,username FROM blacklist WHERE chat_id=? ORDER BY created_at",
-            (chat_id,),
+    def active_chats(self):
+        return self._execute(
+            "SELECT chat_id,title,chat_type FROM chats WHERE active=1 AND chat_type IN ('group','supergroup') ORDER BY chat_id"
         ).fetchall()
 
-    def set_antispam(self, chat_id, enabled):
-        self.conn.execute(
-            """
-            INSERT INTO settings(chat_id,antispam) VALUES(?,?)
-            ON CONFLICT(chat_id) DO UPDATE SET antispam=excluded.antispam
-            """,
-            (chat_id, int(enabled)),
-        )
-        self.conn.commit()
-
-    def antispam_enabled(self, chat_id):
-        row = self.conn.execute(
-            "SELECT antispam FROM settings WHERE chat_id=?", (chat_id,)
-        ).fetchone()
-        return bool(row["antispam"]) if row else True
-
-    def add_warning(self, chat_id, user_id):
-        self.conn.execute(
-            """
-            INSERT INTO warnings(chat_id,user_id,count) VALUES(?,?,1)
-            ON CONFLICT(chat_id,user_id) DO UPDATE SET count=count+1
-            """,
-            (chat_id, user_id),
-        )
-        self.conn.commit()
-        row = self.conn.execute(
-            "SELECT count FROM warnings WHERE chat_id=? AND user_id=?",
-            (chat_id, user_id),
-        ).fetchone()
-        return int(row["count"])
-
     def close(self):
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
 
 
 db = Database(DB_PATH)
+try:
+    KNOWN_CHAT_IDS, KNOWN_USERS, BLACKLIST_CACHE, BANPERM_CACHE, ALLBAN_CACHE = db.load_state()
+except sqlite3.Error:
+    logger.exception("Falha ao carregar o estado do banco do Bot API")
+    raise
+
+BOT_USER_ID = 0
+_cleanup_tasks: set[asyncio.Task] = set()
+_chat_registration_seen = set(KNOWN_CHAT_IDS)
 
 
-def owner_only(update: Update) -> bool:
-    return bool(update.effective_user and update.effective_user.id == OWNER_ID)
+def _remember_user_in_memory(user) -> Target:
+    username = (getattr(user, "username", "") or "").lstrip("@")
+    full_name = getattr(user, "full_name", "") or ""
+    user_id = int(user.id)
+    KNOWN_USERS[user_id] = (username, full_name)
+    return Target(user_id, username, full_name)
 
 
-async def require_owner(update: Update) -> bool:
-    if owner_only(update):
-        return True
-    if update.effective_message:
-        await update.effective_message.reply_text("⛔ Este comando é exclusivo do dono.")
-    return False
+def _safe_html(text: str) -> str:
+    return escape(str(text or ""))
 
 
-async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+def _schedule_delete(message, delay: int = DELETE_AFTER_SECONDS):
+    if message is None:
+        return
+
+    async def worker():
+        try:
+            await asyncio.sleep(delay)
+            await message.delete()
+        except (BadRequest, Forbidden, TelegramError):
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Falha inesperada ao apagar mensagem agendada", exc_info=True)
+
+    task = asyncio.create_task(worker())
+    _cleanup_tasks.add(task)
+    task.add_done_callback(_cleanup_tasks.discard)
+
+
+async def _reply_and_cleanup(update: Update, text: str, *, parse_mode: str | None = "HTML"):
+    message = update.effective_message
+    if message is None:
+        return None
+    kwargs = {"parse_mode": parse_mode} if parse_mode else {}
+    try:
+        response = await message.reply_text(text, **kwargs)
+    except TelegramError:
+        return None
+    _schedule_delete(message)
+    _schedule_delete(response)
+    return response
+
+
+def _is_group(update: Update) -> bool:
+    chat = update.effective_chat
+    return bool(chat and chat.type in {ChatType.GROUP, ChatType.SUPERGROUP})
+
+
+async def _is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     chat = update.effective_chat
     if not user or not chat:
         return False
-    if user.id == OWNER_ID:
+    if int(user.id) == OWNER_ID:
         return True
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
-        return member.status in ("administrator", "creator")
+        return member.status in {"administrator", "creator"}
     except TelegramError:
         return False
 
 
-async def require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if await is_admin(update, context):
+async def _require_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not _is_group(update):
+        await _reply_and_cleanup(update, "❌ Este comando só pode ser usado em grupos ou supergrupos.")
+        return False
+    if await _is_chat_admin(update, context):
         return True
-    if update.effective_message:
-        await update.effective_message.reply_text("⛔ Apenas administradores podem usar este comando.")
+    await _reply_and_cleanup(update, "⛔ Apenas administradores do grupo podem usar este comando.")
     return False
 
 
-async def bot_can_delete(chat_id, context):
+async def _bot_can_restrict(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    global BOT_USER_ID
     try:
-        me = await context.bot.get_me()
-        member = await context.bot.get_chat_member(chat_id, me.id)
-        return getattr(member, "can_delete_messages", False) or member.status == "creator"
+        if not BOT_USER_ID:
+            BOT_USER_ID = (await context.bot.get_me()).id
+        member = await context.bot.get_chat_member(chat_id, BOT_USER_ID)
+        return member.status == "creator" or bool(getattr(member, "can_restrict_members", False))
     except TelegramError:
         return False
 
 
-async def bot_can_restrict(chat_id, context):
-    try:
-        me = await context.bot.get_me()
-        member = await context.bot.get_chat_member(chat_id, me.id)
-        return getattr(member, "can_restrict_members", False) or member.status == "creator"
-    except TelegramError:
-        return False
+async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Target | None:
+    message = update.effective_message
+    if message is None:
+        return None
+    reply = message.reply_to_message
+    if reply and reply.from_user and not reply.from_user.is_bot:
+        target = _remember_user_in_memory(reply.from_user)
+        await asyncio.to_thread(db.remember_user, target.user_id, target.username, target.full_name)
+        return target
+
+    args = list(context.args or [])
+    if not args:
+        return None
+    raw = args[0].strip()
+    if re.fullmatch(r"\d{4,20}", raw):
+        user_id = int(raw)
+        username, full_name = KNOWN_USERS.get(user_id, ("", ""))
+        return Target(user_id, username, full_name)
+    if raw.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{5,32}", raw):
+        known = KNOWN_USERS.get(next((uid for uid, value in KNOWN_USERS.items() if value[0].lower() == raw[1:].lower()), 0), None)
+        if known:
+            uid = next(uid for uid, value in KNOWN_USERS.items() if value == known)
+            return Target(uid, known[0], known[1])
+        row = await asyncio.to_thread(db.resolve_username, raw[1:])
+        if row:
+            return Target(int(row["user_id"]), row.get("username", ""), row.get("full_name", ""))
+    return None
 
 
-async def safe_delete(message):
+def _reason(context: ContextTypes.DEFAULT_TYPE) -> str:
+    args = list(context.args or [])
+    return " ".join(args[1:]).strip()[:500]
+
+
+def _target_error(command: str) -> str:
+    return (
+        f"❌ Informe o alvo para <code>/{command}</code>: responda à mensagem do usuário "
+        f"ou use um ID numérico/@username conhecido."
+    )
+
+
+async def _remember_message_context(update: Update):
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat is None or user is None:
+        return
+    if chat.id not in _chat_registration_seen:
+        _chat_registration_seen.add(chat.id)
+        KNOWN_CHAT_IDS.add(chat.id)
+        await asyncio.to_thread(db.register_chat, chat.id, chat.title or "", chat.type)
+    if not user.is_bot and int(user.id) not in KNOWN_USERS:
+        target = _remember_user_in_memory(user)
+        await asyncio.to_thread(db.remember_user, target.user_id, target.username, target.full_name)
+
+
+async def _safe_delete(message) -> bool:
     try:
         await message.delete()
         return True
@@ -279,412 +426,216 @@ async def safe_delete(message):
         return False
 
 
-def target_from_update(update: Update):
-    msg = update.effective_message
-    if not msg:
-        return None
-
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        return msg.reply_to_message.from_user
-
-    if not update.message:
-        return None
-
-    args = update.message.text.split(maxsplit=2) if update.message.text else []
-    if len(args) < 2:
-        return None
-
-    raw = args[1].strip()
-    if raw.startswith("@"):
-        uid = db.resolve_username(raw)
-        if uid:
-            return uid
-        return None
-
-    if re.fullmatch(r"\d{4,20}", raw):
-        return int(raw)
-
-    return None
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _reply_and_cleanup(
+        update,
+        "🛡️ <b>Jtzin Administrator Bot</b>\n\n"
+        "Bot API dedicado a blacklist local, banimento permanente local e allban global.\n"
+        "Use /help para consultar a forma de uso.",
+    )
 
 
-async def target_required(update, context):
-    target = target_from_update(update)
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _reply_and_cleanup(
+        update,
+        "🛡️ <b>Jtzin Administrator Bot</b>\n\n"
+        "<b>Comandos disponíveis</b>\n"
+        "<code>/blacklist</code> — adiciona o alvo à blacklist deste grupo e apaga as mensagens dele.\n"
+        "<code>/banperm</code> — bane permanentemente o alvo deste grupo.\n"
+        "<code>/allban</code> — o proprietário bane o alvo em todos os grupos registrados.\n\n"
+        "Use respondendo à mensagem do alvo ou informe o ID. O bot precisa ser administrador "
+        "com permissão para apagar mensagens e restringir membros. O allban é exclusivo do proprietário.",
+    )
+
+
+async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group_admin(update, context):
+        return
+    target = await _resolve_target(update, context)
     if target is None:
-        await update.effective_message.reply_text(
-            "Use respondendo à mensagem do usuário, ou informe o ID.\n"
-            "Ex.: /banperm 123456789\n"
-            "Para @username, o bot precisa já ter visto esse usuário no grupo."
-        )
-    return target
+        await _reply_and_cleanup(update, _target_error("blacklist"))
+        return
+    if target.user_id == OWNER_ID:
+        await _reply_and_cleanup(update, "❌ O proprietário não pode ser colocado na blacklist.")
+        return
+    chat_id = update.effective_chat.id
+    if target.user_id in BLACKLIST_CACHE[chat_id]:
+        await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> já está na blacklist deste grupo.")
+        return
+    reason = _reason(context)
+    if not await asyncio.to_thread(db.add_blacklist, target, chat_id, update.effective_user.id, reason):
+        await _reply_and_cleanup(update, "❌ Não foi possível persistir a blacklist.")
+        return
+    BLACKLIST_CACHE[chat_id].add(target.user_id)
+    await _reply_and_cleanup(
+        update,
+        f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) foi adicionado à blacklist local.\n"
+        "As próximas mensagens dele serão apagadas automaticamente.",
+    )
 
 
-async def register_group(update: Update):
-    chat = update.effective_chat
-    if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL):
-        db.register_chat(chat.id, chat.title or "", chat.type)
+async def cmd_banperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group_admin(update, context):
+        return
+    target = await _resolve_target(update, context)
+    if target is None:
+        await _reply_and_cleanup(update, _target_error("banperm"))
+        return
+    if target.user_id == OWNER_ID:
+        await _reply_and_cleanup(update, "❌ O proprietário é imune a banimentos.")
+        return
+    chat_id = update.effective_chat.id
+    if target.user_id in BANPERM_CACHE[chat_id]:
+        await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> já está banido permanentemente neste grupo.")
+        return
+    if not await _bot_can_restrict(chat_id, context):
+        await _reply_and_cleanup(update, "❌ Conceda ao bot a permissão de restringir/banir membros.")
+        return
+    try:
+        await context.bot.ban_chat_member(chat_id, target.user_id)
+    except (Forbidden, BadRequest, RetryAfter, TelegramError):
+        logger.exception("Falha ao aplicar banperm em %s/%s", chat_id, target.user_id)
+        await _reply_and_cleanup(update, "❌ Não foi possível aplicar o banimento permanente neste grupo.")
+        return
+    reason = _reason(context)
+    if not await asyncio.to_thread(db.add_banperm, target, chat_id, update.effective_user.id, reason):
+        logger.error("Banimento aplicado, mas não persistido em %s/%s", chat_id, target.user_id)
+        BANPERM_CACHE[chat_id].add(target.user_id)
+        await _reply_and_cleanup(update, "⚠️ Banimento aplicado, mas o registro local não pôde ser persistido.")
+        return
+    BANPERM_CACHE[chat_id].add(target.user_id)
+    await _reply_and_cleanup(update, f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) banido permanentemente neste grupo.")
+
+
+async def _ban_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, target: Target):
+    try:
+        await context.bot.ban_chat_member(chat_id, target.user_id)
+        return "ok"
+    except RetryAfter as exc:
+        try:
+            await asyncio.sleep(float(exc.retry_after))
+            await context.bot.ban_chat_member(chat_id, target.user_id)
+            return "ok"
+        except TelegramError:
+            return "failed"
+    except Forbidden:
+        return "forbidden"
+    except BadRequest as exc:
+        text = str(exc).lower()
+        if "user is an administrator" in text or "chat member status" in text:
+            return "skipped"
+        return "failed"
+    except TelegramError:
+        return "failed"
+
+
+async def cmd_allban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or int(update.effective_user.id) != OWNER_ID:
+        await _reply_and_cleanup(update, "⛔ Este comando é exclusivo do proprietário configurado.")
+        return
+    target = await _resolve_target(update, context)
+    if target is None:
+        await _reply_and_cleanup(update, _target_error("allban"))
+        return
+    if target.user_id == OWNER_ID:
+        await _reply_and_cleanup(update, "❌ O proprietário não pode ser banido.")
+        return
+    reason = _reason(context)
+    if not await asyncio.to_thread(db.add_allban, target, OWNER_ID, reason):
+        await _reply_and_cleanup(update, "❌ Não foi possível registrar o allban global.")
+        return
+    ALLBAN_CACHE.add(target.user_id)
+
+    rows = await asyncio.to_thread(db.active_chats)
+    if not rows:
+        await _reply_and_cleanup(update, "✅ Allban registrado. Nenhum grupo ativo está registrado para receber a ação agora.")
+        return
+
+    semaphore = asyncio.Semaphore(ALLBAN_CONCURRENCY)
+
+    async def apply(row):
+        async with semaphore:
+            result = await _ban_in_chat(context, int(row["chat_id"]), target)
+            return result
+
+    results = await asyncio.gather(*(apply(row) for row in rows))
+    counts = {key: results.count(key) for key in {"ok", "failed", "forbidden", "skipped"}}
+    await _reply_and_cleanup(
+        update,
+        f"✅ <b>Allban registrado</b> para {_safe_html(target.label)} (<code>{target.user_id}</code>).\n\n"
+        f"✅ Banidos: <b>{counts['ok']}</b>\n"
+        f"⚠️ Ignorados: <b>{counts['skipped']}</b>\n"
+        f"🔒 Sem permissão: <b>{counts['forbidden']}</b>\n"
+        f"❌ Falhas: <b>{counts['failed']}</b>\n"
+        f"📊 Grupos processados: <b>{len(rows)}</b>",
+    )
 
 
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
-    if not chat:
+    change = update.my_chat_member
+    if not chat or not change:
         return
-    status = update.my_chat_member.new_chat_member.status
-    if status in ("member", "administrator"):
-        db.register_chat(chat.id, chat.title or "", chat.type)
-        logger.info("Chat registrado: %s (%s)", chat.id, chat.title)
-    elif status in ("left", "kicked"):
-        db.set_active(chat.id, False)
-
-
-async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat:
-        db.register_chat(chat.id, chat.title or "", chat.type)
+    status = change.new_chat_member.status
+    if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        return
+    active = status not in {"left", "kicked"}
+    if active:
+        KNOWN_CHAT_IDS.add(chat.id)
+        _chat_registration_seen.add(chat.id)
+    else:
+        KNOWN_CHAT_IDS.discard(chat.id)
+        _chat_registration_seen.discard(chat.id)
+    await asyncio.to_thread(db.register_chat, chat.id, chat.title or "", chat.type, active)
 
 
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    chat = update.effective_chat
+    message = update.effective_message
     user = update.effective_user
-
-    if not msg or not chat or not user:
+    chat = update.effective_chat
+    if not message or not user or not chat or user.is_bot:
         return
+    await _remember_message_context(update)
+    target = _remember_user_in_memory(user)
+    user_id = target.user_id
 
-    db.register_chat(chat.id, chat.title or "", chat.type)
-    db.remember_user(user)
-
-    if user.is_bot:
+    # Allban tem prioridade e tenta reforçar o banimento em chats onde o bot foi adicionado depois.
+    if user_id in ALLBAN_CACHE and user_id != OWNER_ID:
+        await _safe_delete(message)
+        await _ban_in_chat(context, chat.id, target)
         return
-
-    # Blacklist tem prioridade sobre o anti-spam.
-    if db.is_blacklisted(chat.id, user.id):
-        await safe_delete(msg)
-        return
-
-    if not db.antispam_enabled(chat.id):
-        return
-
-    # Não aplicar anti-spam a administradores.
-    try:
-        member = await context.bot.get_chat_member(chat.id, user.id)
-        if member.status in ("administrator", "creator"):
-            return
-    except TelegramError:
-        return
-
-    now = time.monotonic()
-    bucket = spam_buckets[(chat.id, user.id)]
-    while bucket and now - bucket[0] > SPAM_WINDOW:
-        bucket.popleft()
-    bucket.append(now)
-
-    if len(bucket) > SPAM_LIMIT:
-        await safe_delete(msg)
-        if len(bucket) == SPAM_LIMIT + 1:
-            await msg.reply_text(
-                f"⚠️ {user.mention_html()} diminua o ritmo de mensagens para evitar spam.",
-                parse_mode="HTML",
-            )
-
-
-async def cmd_start(update, context):
-    await update.effective_message.reply_text(
-        "🛡️ MTH ADMIN BOT\n\n"
-        "Use /help para ver os comandos.\n"
-        "Adicione o bot como administrador do grupo e conceda as permissões necessárias."
-    )
-
-
-async def cmd_help(update, context):
-    text = (
-        "🛡️ <b>MTH ADMIN BOT</b>\n\n"
-        "<b>Moderação</b>\n"
-        "/ban — banir usuário\n"
-        "/banperm — banimento permanente\n"
-        "/unban — remover ban\n"
-        "/kick — remover usuário\n"
-        "/mute — silenciar por minutos\n"
-        "/unmute — remover silêncio\n"
-        "/warn — advertência\n\n"
-        "<b>Blacklist</b>\n"
-        "/blacklist — apagar automaticamente mensagens do usuário\n"
-        "/unblacklist — remover da blacklist\n"
-        "/blacklistlist — listar blacklist\n\n"
-        "<b>Anti-spam</b>\n"
-        "/antispam on|off\n\n"
-        "<b>Dono</b>\n"
-        "/divulgar texto — enviar aos chats registrados\n"
-        "/chats — mostrar chats registrados\n"
-        "/id — mostrar seu ID"
-    )
-    await update.effective_message.reply_text(text, parse_mode="HTML")
-
-
-async def cmd_id(update, context):
-    await update.effective_message.reply_text(f"🆔 Seu ID: <code>{update.effective_user.id}</code>", parse_mode="HTML")
-
-
-async def cmd_ban(update, context):
-    if not await require_admin(update, context):
-        return
-    target = await target_required(update, context)
-    if target is None:
-        return
-    user_id = target.id if hasattr(target, "id") else target
-    chat_id = update.effective_chat.id
-
-    if not await bot_can_restrict(chat_id, context):
-        await update.effective_message.reply_text("❌ O bot precisa da permissão de restringir/banir usuários.")
-        return
-
-    try:
-        await context.bot.ban_chat_member(chat_id, user_id)
-        await update.effective_message.reply_text("🔨 Usuário banido.")
-    except TelegramError as e:
-        await update.effective_message.reply_text(f"❌ Não foi possível banir: {e}")
-
-
-async def cmd_banperm(update, context):
-    # Telegram trata ban sem data de expiração como permanente.
-    await cmd_ban(update, context)
-
-
-async def cmd_unban(update, context):
-    if not await require_admin(update, context):
-        return
-    target = await target_required(update, context)
-    if target is None:
-        return
-    user_id = target.id if hasattr(target, "id") else target
-    try:
-        await context.bot.unban_chat_member(update.effective_chat.id, user_id, only_if_banned=True)
-        await update.effective_message.reply_text("✅ Ban removido.")
-    except TelegramError as e:
-        await update.effective_message.reply_text(f"❌ Não foi possível remover o ban: {e}")
-
-
-async def cmd_kick(update, context):
-    # Kick = ban temporário e desbanir imediatamente.
-    if not await require_admin(update, context):
-        return
-    target = await target_required(update, context)
-    if target is None:
-        return
-    user_id = target.id if hasattr(target, "id") else target
-    try:
-        await context.bot.ban_chat_member(update.effective_chat.id, user_id)
-        await context.bot.unban_chat_member(update.effective_chat.id, user_id)
-        await update.effective_message.reply_text("👢 Usuário removido do grupo.")
-    except TelegramError as e:
-        await update.effective_message.reply_text(f"❌ Não foi possível remover: {e}")
-
-
-async def cmd_mute(update, context):
-    if not await require_admin(update, context):
-        return
-    target = await target_required(update, context)
-    if target is None:
-        return
-
-    minutes = 10
-    if context.args and context.args[-1].isdigit():
-        minutes = max(1, min(int(context.args[-1]), 10080))
-
-    user_id = target.id if hasattr(target, "id") else target
-    permissions = ChatPermissions(can_send_messages=False)
-
-    try:
-        until = int(time.time()) + minutes * 60
-        await context.bot.restrict_chat_member(
-            update.effective_chat.id, user_id, permissions=permissions, until_date=until
-        )
-        await update.effective_message.reply_text(f"🔇 Usuário silenciado por {minutes} minuto(s).")
-    except TelegramError as e:
-        await update.effective_message.reply_text(f"❌ Não foi possível silenciar: {e}")
-
-
-async def cmd_unmute(update, context):
-    if not await require_admin(update, context):
-        return
-    target = await target_required(update, context)
-    if target is None:
-        return
-    user_id = target.id if hasattr(target, "id") else target
-
-    try:
-        chat = await context.bot.get_chat(update.effective_chat.id)
-        permissions = chat.permissions or ChatPermissions(can_send_messages=True)
-        await context.bot.restrict_chat_member(
-            update.effective_chat.id, user_id, permissions=permissions
-        )
-        await update.effective_message.reply_text("🔊 Usuário liberado.")
-    except TelegramError as e:
-        await update.effective_message.reply_text(f"❌ Não foi possível liberar: {e}")
-
-
-async def cmd_warn(update, context):
-    if not await require_admin(update, context):
-        return
-    target = await target_required(update, context)
-    if target is None:
-        return
-    user_id = target.id if hasattr(target, "id") else target
-    count = db.add_warning(update.effective_chat.id, user_id)
-    await update.effective_message.reply_text(f"⚠️ Advertência registrada. Total: {count}")
-
-
-async def cmd_blacklist(update, context):
-    if not await require_admin(update, context):
-        return
-    target = await target_required(update, context)
-    if target is None:
-        return
-    user_id = target.id if hasattr(target, "id") else target
-    username = getattr(target, "username", "") if hasattr(target, "username") else ""
-    db.add_blacklist(update.effective_chat.id, user_id, username, update.effective_user.id)
-
-    # Tenta remover a mensagem do comando também.
-    await safe_delete(update.effective_message)
-    try:
-        await context.bot.send_message(
-            update.effective_chat.id,
-            "🚫 Usuário adicionado à blacklist. As próximas mensagens dele serão apagadas automaticamente."
-        )
-    except TelegramError:
-        pass
-
-
-async def cmd_unblacklist(update, context):
-    if not await require_admin(update, context):
-        return
-    target = await target_required(update, context)
-    if target is None:
-        return
-    user_id = target.id if hasattr(target, "id") else target
-    if db.remove_blacklist(update.effective_chat.id, user_id):
-        await update.effective_message.reply_text("✅ Usuário removido da blacklist.")
-    else:
-        await update.effective_message.reply_text("ℹ️ Esse usuário não está na blacklist.")
-
-
-async def cmd_blacklistlist(update, context):
-    if not await require_admin(update, context):
-        return
-    rows = db.blacklist_rows(update.effective_chat.id)
-    if not rows:
-        await update.effective_message.reply_text("📋 Blacklist vazia.")
-        return
-    lines = ["📋 <b>BLACKLIST</b>"]
-    for i, row in enumerate(rows, 1):
-        name = f"@{row['username']}" if row["username"] else str(row["user_id"])
-        lines.append(f"{i}. {name} — <code>{row['user_id']}</code>")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
-async def cmd_antispam(update, context):
-    if not await require_admin(update, context):
-        return
-    if not context.args or context.args[0].lower() not in ("on", "off"):
-        await update.effective_message.reply_text("Use: /antispam on ou /antispam off")
-        return
-    enabled = context.args[0].lower() == "on"
-    db.set_antispam(update.effective_chat.id, enabled)
-    await update.effective_message.reply_text(
-        f"🛡️ Anti-spam {'ATIVADO' if enabled else 'DESATIVADO'}."
-    )
-
-
-async def cmd_chats(update, context):
-    if not await require_owner(update):
-        return
-    rows = db.active_chats()
-    if not rows:
-        await update.effective_message.reply_text("Nenhum grupo/canal registrado ainda.")
-        return
-    lines = [f"📡 <b>CHATS REGISTRADOS: {len(rows)}</b>"]
-    for row in rows[:50]:
-        lines.append(f"• {row['title'] or 'Sem título'} — <code>{row['chat_id']}</code>")
-    if len(rows) > 50:
-        lines.append(f"… e mais {len(rows)-50}.")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
-async def cmd_broadcast(update, context):
-    if not await require_owner(update):
-        return
-
-    text = update.effective_message.text.partition(" ")[2].strip()
-    if not text:
-        await update.effective_message.reply_text("Use: /divulgar seu texto aqui")
-        return
-
-    rows = db.active_chats()
-    if not rows:
-        await update.effective_message.reply_text("❌ Nenhum chat registrado.")
-        return
-
-    sent = failed = 0
-    status = await update.effective_message.reply_text(
-        f"📢 Iniciando divulgação em {len(rows)} chat(s)..."
-    )
-
-    for row in rows:
-        chat_id = row["chat_id"]
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=text)
-            sent += 1
-            # Pequena pausa para reduzir risco de flood/rate-limit.
-            await asyncio_sleep(0.8)
-        except RetryAfter as e:
-            await asyncio_sleep(float(e.retry_after) + 0.5)
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=text)
-                sent += 1
-            except TelegramError:
-                failed += 1
-        except (Forbidden, BadRequest):
-            failed += 1
-        except TelegramError:
-            failed += 1
-
-    await status.edit_text(
-        f"📢 <b>DIVULGAÇÃO CONCLUÍDA</b>\n\n"
-        f"✅ Enviadas: {sent}\n"
-        f"❌ Falhas: {failed}\n"
-        f"📡 Total: {len(rows)}",
-        parse_mode="HTML",
-    )
-
-
-async def asyncio_sleep(seconds):
-    import asyncio
-    await asyncio.sleep(seconds)
+    if user_id in BANPERM_CACHE.get(chat.id, set()) or user_id in BLACKLIST_CACHE.get(chat.id, set()):
+        await _safe_delete(message)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Erro não tratado: %s", context.error)
+    if isinstance(context.error, RetryAfter):
+        logger.warning("Telegram solicitou RetryAfter: %s", context.error)
+    else:
+        logger.exception("Erro não tratado no Bot API", exc_info=context.error)
 
 
 async def post_init(app: Application):
-    commands = [
-        BotCommand("start", "Iniciar"),
-        BotCommand("help", "Ajuda"),
-        BotCommand("id", "Ver seu ID"),
-        BotCommand("ban", "Banir usuário"),
-        BotCommand("banperm", "Banir permanentemente"),
-        BotCommand("unban", "Remover ban"),
-        BotCommand("kick", "Remover usuário"),
-        BotCommand("mute", "Silenciar"),
-        BotCommand("unmute", "Liberar usuário"),
-        BotCommand("warn", "Advertir"),
-        BotCommand("blacklist", "Adicionar à blacklist"),
-        BotCommand("unblacklist", "Remover da blacklist"),
-        BotCommand("blacklistlist", "Listar blacklist"),
-        BotCommand("antispam", "Ativar/desativar anti-spam"),
-        BotCommand("divulgar", "Divulgar (somente dono)"),
-        BotCommand("chats", "Chats registrados (dono)"),
-    ]
-    await app.bot.set_my_commands(commands)
+    global BOT_USER_ID
+    BOT_USER_ID = (await app.bot.get_me()).id
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "Iniciar o bot"),
+            BotCommand("help", "Ver instruções"),
+            BotCommand("blacklist", "Adicionar à blacklist local"),
+            BotCommand("banperm", "Banir permanentemente no grupo"),
+            BotCommand("allban", "Banir em todos os grupos — proprietário"),
+        ]
+    )
+    logger.info("Jtzin Bot API online; proprietário=%s", OWNER_ID)
+
+
+async def post_shutdown(app: Application):
+    for task in list(_cleanup_tasks):
+        task.cancel()
+    if _cleanup_tasks:
+        await asyncio.gather(*_cleanup_tasks, return_exceptions=True)
+    await asyncio.to_thread(db.close)
 
 
 def main():
@@ -692,42 +643,20 @@ def main():
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .concurrent_updates(False)
         .build()
     )
-
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("id", cmd_id))
-    app.add_handler(CommandHandler("ban", cmd_ban))
-    app.add_handler(CommandHandler("banperm", cmd_banperm))
-    app.add_handler(CommandHandler("unban", cmd_unban))
-    app.add_handler(CommandHandler("kick", cmd_kick))
-    app.add_handler(CommandHandler("mute", cmd_mute))
-    app.add_handler(CommandHandler("unmute", cmd_unmute))
-    app.add_handler(CommandHandler("warn", cmd_warn))
     app.add_handler(CommandHandler("blacklist", cmd_blacklist))
-    app.add_handler(CommandHandler("unblacklist", cmd_unblacklist))
-    app.add_handler(CommandHandler("blacklistlist", cmd_blacklistlist))
-    app.add_handler(CommandHandler("antispam", cmd_antispam))
-    app.add_handler(CommandHandler("divulgar", cmd_broadcast))
-    app.add_handler(CommandHandler("chats", cmd_chats))
-
-    app.add_handler(
-        MessageHandler(filters.UpdateType.CHANNEL_POSTS, on_channel_post),
-        group=1,
-    )
-    app.add_handler(
-        MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, on_group_message),
-        group=2,
-    )
-
+    app.add_handler(CommandHandler("banperm", cmd_banperm))
+    app.add_handler(CommandHandler("allban", cmd_allban))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, on_group_message), group=1)
     app.add_error_handler(error_handler)
-
-    logger.info("MTH Admin Bot iniciando...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+    logger.info("Iniciando polling do Jtzin Bot API")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":

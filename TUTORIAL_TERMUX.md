@@ -1,34 +1,35 @@
-# Jtzin Userbot — Tutorial comercial para Termux
+# Tutorial Termux — Jtzin Bot API + Userbot V9.0
 
 ## 1. O que esta distribuição contém
 
-Esta distribuição contém o Userbot ativo baseado em **Telethon**, o script de migração SQLite, o watchdog de reinício, o atualizador automático, os assets locais do comando `.exu`, o template de ambiente e a documentação operacional.
+Esta distribuição contém dois processos independentes: o **Bot API** mínimo, com `blacklist`, `banperm` e `allban`, e o **Userbot Telethon**, com os recursos avançados históricos. Eles usam credenciais, bancos e estados separados.
 
-A source distribuída não contém `API_HASH`, `API_ID`, IDs de proprietários, sessão do Telegram, banco de dados, backups de perfil, tokens ou arquivos de logs. Cada comprador deve configurar as próprias credenciais e a própria conta.
+A source não contém `API_HASH`, sessão do Telegram, bancos, backups de perfil, token real do Bot API ou logs. Cada instalação deve usar credenciais próprias.
 
-> Nunca compartilhe o arquivo `.env`, qualquer arquivo `*.session`, `data/bot.db` ou um backup de perfil.
+> Como tokens enviados em mensagens podem ser comprometidos, revogue imediatamente qualquer token exposto no `@BotFather` e gere outro. Nunca coloque um token real em arquivos versionados.
 
 ## 2. Requisitos
 
-O ambiente recomendado é o Termux atualizado em um dispositivo Android com conexão estável à internet. O pacote utiliza Python 3, Telethon, `python-dotenv`, SQLite, `tmux` e Bash.
+Use o Termux atualizado em um dispositivo Android com conexão estável. O pacote utiliza Python 3, Telethon, `python-telegram-bot`, `python-dotenv`, SQLite, `tmux` e Bash.
 
 | Recurso | Finalidade |
 |---|---|
-| Python 3 | Execução do Userbot |
-| Git | Atualização da source |
-| tmux | Manter o processo ativo no terminal |
-| Termux:API não é obrigatório | O Userbot não depende de notificações externas |
+| Python 3 | Executar os dois processos |
+| Git | Baixar atualizações |
+| tmux | Manter o supervisor ativo |
 | Conta Telegram própria | Autenticação MTProto do Userbot |
+| Bot criado no @BotFather | Credencial do Bot API |
+| Permissões administrativas | Banir e apagar mensagens nos chats |
 
-## 3. Obter credenciais próprias
+## 3. Credenciais
 
-Acesse [my.telegram.org](https://my.telegram.org), entre com a sua conta e crie ou consulte uma aplicação para obter `API_ID` e `API_HASH`. Essas credenciais são pessoais e não devem ser reutilizadas entre clientes sem autorização.
+Para o Userbot, acesse [my.telegram.org](https://my.telegram.org), entre com a conta que será autenticada e obtenha `API_ID` e `API_HASH`. O `OWNER_ID` deve ser o ID numérico da conta **JT Cacique** que utilizará a sessão do Userbot.
 
-O `OWNER_ID` é o ID numérico da conta que será usada como proprietária absoluta. O modo mais simples para descobrir o ID é iniciar a sessão e usar `.id` em uma mensagem da própria conta, ou consultar um bot confiável de identificação antes de configurar o Userbot.
+Para o Bot API, abra o `@BotFather`, crie um bot e copie o token diretamente para o arquivo privado `.env.bot`. Se o token já tiver sido compartilhado, revogue-o antes.
 
 ## 4. Instalação limpa
 
-No Termux, execute:
+No Termux:
 
 ```bash
 pkg update -y
@@ -41,24 +42,31 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 cp .env.example .env
+cp .env.bot.example .env.bot
 nano .env
+nano .env.bot
 ```
 
-Preencha o `.env` com valores próprios:
+O `.env` do Userbot deve conter:
 
 ```dotenv
 API_ID=SEU_API_ID
 API_HASH=SEU_API_HASH
-OWNER_ID=SEU_ID_NUMERICO
-SECOND_OWNER_ID=0
-THIRD_OWNER_ID=0
+OWNER_ID=SEU_ID_JT_CACIQUE
 ```
 
-`SECOND_OWNER_ID` e `THIRD_OWNER_ID` são opcionais. Mantenha `0` quando não houver subproprietário. Não coloque aspas, espaços extras ou o símbolo `@` nos IDs numéricos.
+O `.env.bot` deve conter:
 
-## 5. Primeira autenticação
+```dotenv
+BOT_TOKEN=TOKEN_NOVO_GERADO_PELO_BOTFATHER
+OWNER_ID=SEU_ID_JT_CACIQUE
+```
 
-Com o ambiente virtual ativado, execute:
+Não use `@` nos IDs, não coloque espaços extras e não compartilhe esses arquivos. Os campos `SECOND_OWNER_ID` e `THIRD_OWNER_ID` não existem mais na V9.0.
+
+## 5. Primeira autenticação do Userbot
+
+Execute a migração e inicie temporariamente o Userbot:
 
 ```bash
 cd ~/mth-admin
@@ -67,77 +75,99 @@ python migrate_db.py
 python bot_v2.py
 ```
 
-Na primeira execução, o Telethon solicitará o número de telefone, o código de login enviado pelo Telegram e, se existir, a senha da verificação em duas etapas. A sessão será gravada localmente em um arquivo `*.session`. Não envie esse arquivo para outra pessoa: ele pode permitir acesso à conta autenticada.
+Na primeira execução, o Telethon solicitará telefone, código do Telegram e, se necessário, a senha da verificação em duas etapas. A sessão será salva localmente em `*.session`. Interrompa com `Ctrl+C` após confirmar que a sessão entrou online.
 
-Depois de confirmar que o Userbot entrou online, interrompa-o com `Ctrl+C` e inicie pelo watchdog:
+O Bot API não exige login interativo: ele usará o token privado do `.env.bot` quando o supervisor for iniciado.
 
-```bash
-termux-wake-lock
-tmux new-session -d -s mthadmin './watchdog.sh'
-tmux attach -t mthadmin
-```
-
-Para sair da visualização sem encerrar o Userbot, pressione `Ctrl+B` e depois `D`. Para retornar:
-
-```bash
-tmux attach -t mthadmin
-```
-
-## 6. Atualização segura
-
-Use o atualizador para baixar a versão publicada, instalar dependências, executar a migração e ajustar permissões:
+## 6. Iniciar Bot API e Userbot juntos
 
 ```bash
 cd ~/mth-admin
-(tmux kill-session -t mthadmin 2>/dev/null || true)
-git pull --ff-only origin master
-chmod +x update_bot.sh watchdog.sh
-./update_bot.sh
+chmod +x update_bot.sh watchdog.sh watchdog_all.sh
 termux-wake-lock
-tmux new-session -d -s mthadmin './watchdog.sh'
-sleep 2
-tmux attach -t mthadmin
+tmux new-session -d -s jtzin './watchdog_all.sh'
+tmux attach -t jtzin
 ```
 
-O `--ff-only` impede que uma atualização automática crie um merge inesperado. Se houver alterações locais, faça backup delas antes de executar o pull.
+O `watchdog_all.sh` inicia `bot.py` e `bot_v2.py` separadamente, reinicia cada processo com backoff próprio e grava os logs em arquivos distintos. Se o `.env.bot` estiver ausente, o Userbot pode iniciar e o Bot API ficará aguardando a configuração.
 
-## 7. Diagnóstico básico
+Para sair da visualização sem encerrar os serviços, pressione `Ctrl+B` e depois `D`. Para retornar:
 
-Após iniciar, envie os seguintes comandos em uma conversa permitida:
+```bash
+tmux attach -t jtzin
+```
+
+## 7. Comandos do Bot API
+
+O Bot API usa comandos tradicionais com `/`:
 
 ```text
-.status
-.health
-.latency
-.help
+/blacklist
+/banperm
+/allban
 ```
 
-`.status` mostra o estado operacional, `.health` verifica conexão, sessão, banco e permissões, `.latency` separa idade do update de latência E2E, e `.help` exibe o guia interno.
+Responda à mensagem do alvo ou informe um ID numérico. Usernames só podem ser resolvidos quando o bot já os conhece ou quando foram registrados anteriormente. O bot precisa ser administrador do grupo com permissões adequadas.
 
-## 8. Segurança operacional
+`/blacklist` é local ao grupo atual. `/banperm` também afeta somente o grupo atual. `/allban` é global e só pode ser executado pelo `OWNER_ID`; ele tenta aplicar banimento nos chats conhecidos em que o bot tenha acesso.
 
-O Userbot atua como uma conta de usuário e não como um Bot API tradicional. Para banir, silenciar, apagar ou restringir mensagens, a conta precisa possuir as permissões correspondentes no chat. Usuários autorizados podem utilizar comandos conforme a configuração, mas não ganham imunidade automaticamente.
+## 8. Comandos do Userbot
 
-Use `.salvar` antes de qualquer clonagem de perfil e mantenha o backup apenas no dispositivo. O comando `.clonar` pode copiar nome, bio e foto; o username só é tentado quando a confirmação explícita `--tag --confirmar` é fornecida.
+O Userbot usa o prefixo `.` e só aceita comandos enviados pelo `OWNER_ID`. Não há mais subproprietários nem autorização de terceiros. Os comandos `.autorizar`, `.desautorizar` e `.listauth` foram removidos.
 
-Se `API_HASH`, sessão ou qualquer token for exposto, interrompa o Userbot e substitua ou revogue a credencial antes de continuar. Não publique screenshots do `.env`, do terminal de login ou do diretório `data/`.
+A autorização de links, quando usada pelo proprietário, continua sendo uma configuração específica do AntiLink e não concede acesso ao Userbot. Os comandos que mantêm `.jt` por conflito com o Group Help são `.jtban`, `.jtmute`, `.jtdel`, `.jtdelwarn`, `.jtpurge`, `.jtpurgeall` e `.jtwarn`.
 
-## 9. Estrutura dos arquivos
+## 9. Atualização segura
+
+```bash
+cd ~/mth-admin
+(tmux kill-session -t jtzin 2>/dev/null || true)
+git pull --ff-only origin master
+chmod +x update_bot.sh watchdog.sh watchdog_all.sh
+./update_bot.sh
+termux-wake-lock
+tmux new-session -d -s jtzin './watchdog_all.sh'
+sleep 2
+tmux attach -t jtzin
+```
+
+O atualizador interrompe o fluxo quando há alterações locais, instala dependências, compila `bot.py`, `bot_v2.py` e `migrate_db.py`, executa a migração idempotente e prepara os scripts de supervisão.
+
+## 10. Diagnóstico e logs
+
+Logs do Bot API e Userbot:
+
+```bash
+tail -f ~/mth-admin/logs/bot_api.log
+tail -f ~/mth-admin/logs/userbot.log
+```
+
+O Userbot oferece `.status`, `.health` e `.latency`. Para interromper os dois processos:
+
+```bash
+tmux kill-session -t jtzin
+```
+
+## 11. Estrutura dos arquivos
 
 | Arquivo ou pasta | Uso |
 |---|---|
-| `bot_v2.py` | Source ativa do Userbot |
-| `migrate_db.py` | Criação e migração idempotente do SQLite |
-| `requirements.txt` | Dependências Python |
-| `.env.example` | Modelo seguro de configuração |
-| `.env` | Configuração privada criada pelo comprador |
-| `watchdog.sh` | Reinício após falhas inesperadas |
-| `update_bot.sh` | Atualização e instalação |
-| `data/` | Banco local e backups privados |
-| `assets/exu/` | Imagens JPEG e stickers WebP do `.exu` |
-| `TUTORIAL_TERMUX.md` | Este tutorial |
-| `COMANDOS.md` | Catálogo operacional |
+| `bot.py` | Bot API mínimo |
+| `bot_v2.py` | Userbot Telethon |
+| `migrate_db.py` | Migração idempotente do banco do Userbot |
+| `requirements.txt` | Dependências dos dois processos |
+| `.env.example` | Modelo público do Userbot |
+| `.env.bot.example` | Modelo público do Bot API |
+| `.env` / `.env.bot` | Credenciais privadas |
+| `watchdog.sh` | Supervisor individual legado do Userbot |
+| `watchdog_all.sh` | Supervisor dos dois processos |
+| `update_bot.sh` | Atualização e validação |
+| `data/` | Bancos e dados privados |
+| `logs/` | Logs locais ignorados pelo Git |
+| `assets/exu/` | Assets do comando `.exu` |
 
-## 10. Limitações conhecidas
+## 12. Segurança operacional
 
-O Userbot não pode recuperar uma mensagem Telegram apagada; o Antiblack apenas republica mensagens recentes quando recebe o evento e ainda possui a cópia temporária. O envio de mídia, banimento ou edição de perfil pode ser recusado pelo Telegram quando faltarem permissões, quando houver FloodWait ou quando a conta estiver limitada.
+Nunca publique tokens, `API_HASH`, sessões, bancos, backups ou logs com dados privados. O Bot API e o Userbot não devem compartilhar tokens ou arquivos de sessão. Se uma credencial for exposta, revogue-a ou substitua-a antes de continuar.
+
+O Telegram pode recusar banimentos, exclusões e edições quando faltarem permissões, houver FloodWait, limitações da conta ou restrições específicas do chat. O `/allban` não consegue operar em chats que o Bot API não acessa.

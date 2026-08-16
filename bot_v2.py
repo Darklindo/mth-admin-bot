@@ -51,31 +51,17 @@ def _setting_int(settings, key, default, minimum, maximum):
     return max(minimum, min(value, maximum))
 
 
-def _optional_owner_env(name: str) -> int:
-    value = os.getenv(name, "0").strip()
-    if not value:
-        return 0
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"{name} deve ser um ID numérico ou 0 no .env") from exc
-    if parsed < 0:
-        raise RuntimeError(f"{name} não pode ser negativo")
-    return parsed
-
-
 try:
     API_ID = int(_required_env("API_ID"))
     API_HASH = _required_env("API_HASH")
     OWNER_ID = int(_required_env("OWNER_ID"))
 except ValueError as exc:
-    raise RuntimeError("API_ID e OWNER_ID devem ser números inteiros no .env") from exc
-SECOND_OWNER_ID = _optional_owner_env("SECOND_OWNER_ID")
-THIRD_OWNER_ID = _optional_owner_env("THIRD_OWNER_ID")
-OWNER_IDS = frozenset(
-    owner_id for owner_id in (OWNER_ID, SECOND_OWNER_ID, THIRD_OWNER_ID)
-    if owner_id is not None
-)
+    raise RuntimeError("API_ID, API_HASH e OWNER_ID devem estar corretamente configurados no .env") from exc
+if OWNER_ID <= 0:
+    raise RuntimeError("OWNER_ID deve ser um ID numérico positivo no .env")
+
+# O Userbot pessoal possui exatamente um proprietário. Não há subdonos ou delegação.
+OWNER_IDS = frozenset({OWNER_ID})
 
 MIN_PURGE_LIMIT = 5
 MAX_PURGE_LIMIT = 100
@@ -109,7 +95,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V8.8"
+VERSION = "V9.0"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 TELETHON_LOG_LEVEL = os.getenv("TELETHON_LOG_LEVEL", "WARNING").upper()
 
@@ -1820,42 +1806,31 @@ def get_performance_snapshot():
 
 
 def is_owner(user_id: int) -> bool:
-    """Retorna se o ID é proprietário configurado ou a conta da sessão local."""
+    """Retorna verdadeiro somente para o único OWNER_ID configurado."""
     try:
-        normalized_id = int(user_id or 0)
+        return int(user_id or 0) == OWNER_ID
     except (TypeError, ValueError):
         return False
-    session_id = getattr(cache.me, "id", None) if cache.me_loaded else None
-    configured_owner = (
-        normalized_id == OWNER_ID
-        or normalized_id == SECOND_OWNER_ID
-        or normalized_id == THIRD_OWNER_ID
-    )
-    return normalized_id != 0 and (configured_owner or normalized_id in OWNER_IDS or normalized_id == session_id)
+
 
 def is_authorized(user_id: int) -> bool:
-    if is_owner(user_id):
-        return True
-    user_id = int(user_id or 0)
-    if user_id not in cache.authorized_users:
-        return False
-    expires_at = cache.authorized_expirations.get(user_id)
-    return expires_at is None or expires_at > int(time.time())
+    """Compatibilidade interna: não existe autorização delegada nesta versão."""
+    return is_owner(user_id)
 
 
 def is_outgoing_event(event) -> bool:
-    """Identifica mensagens enviadas pela própria sessão sem depender do sender_id."""
+    """Identifica mensagens enviadas pela própria sessão."""
     return bool(getattr(event, "out", False))
 
 
 def is_owner_event(event) -> bool:
-    """Permite comandos de proprietário à sessão local ou aos proprietários configurados."""
-    return is_outgoing_event(event) or is_owner(getattr(event, "sender_id", 0))
+    """Permite comandos somente ao único proprietário configurado."""
+    return is_owner(getattr(event, "sender_id", 0))
 
 
 def is_authorized_event(event) -> bool:
-    """Aceita a sessão local, proprietários e usuários autorizados nos handlers."""
-    return is_owner_event(event) or is_authorized(getattr(event, "sender_id", 0))
+    """Compatibilidade interna: autorização equivale exclusivamente ao OWNER_ID."""
+    return is_owner_event(event)
 
 
 ADMIN_CACHE_TTL = _env_int("ADMIN_CACHE_TTL", 180, 10, 900)
@@ -3326,9 +3301,8 @@ async def chat_lock_filter(event):
     user_id = event.sender_id
     if not user_id or is_immune(user_id):
         return
-    # O lock restringe mensagens comuns, mas não deve atrasar ou bloquear
-    # comandos de uma conta já autorizada pelo Userbot.
-    if (event.raw_text or "").startswith(".") and is_authorized(user_id):
+    # O lock restringe mensagens comuns, mas não deve atrasar comandos do proprietário.
+    if (event.raw_text or "").startswith(".") and is_owner(user_id):
         return
     admin_state = await admin_state_for_filter(event.chat_id, user_id)
     if admin_state is not False:
@@ -3830,7 +3804,7 @@ _KNOWN_COMMAND_PROGRESS = frozenset({
     ".unwarn", ".clearwarns", ".warns", ".start", ".antiblack", ".unantiblack",
     ".listantiblack", ".kick", ".jtban", ".unban", ".jtmute", ".unmute",
     ".blacklist", ".unblacklist", ".banperm", ".unbanperm", ".shadow", ".unshadow",
-    ".allban", ".allblack", ".unallblack", ".autorizar", ".desautorizar", ".listauth",
+    ".allban", ".allblack", ".unallblack",
     ".logs", ".listdn", ".status", ".latency", ".health", ".help", ".antispy",
     ".listspy", ".delspy", ".jtpurgeall", ".jtpurge", ".purgeme", ".id", ".infojt",
     ".exu", ".msg", ".chats",
@@ -5276,78 +5250,6 @@ async def cmd_unallblack(event):
     user_info = await asyncio.to_thread(db.get_user_info, target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido da blacklist global.", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.autorizar(?:\s|$)', func=is_owner_event))
-async def cmd_autorizar(event):
-    target_id, duration = await get_authorization_target_and_expiry(event)
-    if not target_id:
-        await reply_or_edit(event, "❌ Especifique o usuário por resposta, ID ou username.", delete_after=5)
-        return
-    if is_immune(target_id):
-        await reply_or_edit(event, "❌ Os proprietários já possuem acesso permanente.", delete_after=5)
-        return
-    expires_at = int(time.time()) + duration if duration is not None else None
-    previous_auth = await asyncio.to_thread(db.get_authorized_record, target_id)
-    if previous_auth and _record_is_active(previous_auth):
-        await reply_or_edit(event, f"ℹ️ Este usuário já está autorizado {_active_state_suffix(previous_auth)}; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
-        return
-    if not await asyncio.to_thread(db.add_authorized, target_id, expires_at=expires_at):
-        await reply_or_edit(event, "❌ Não foi possível registrar a autorização no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
-        return
-    user_info = await asyncio.to_thread(db.get_user_info, target_id)
-    if expires_at is None:
-        access_text = "permanentemente"
-        audit_reason = "Controle; autorização permanente"
-    else:
-        access_text = f"por <b>{escape(format_duration(duration))}</b> (expira em {format_timestamp(expires_at)})"
-        audit_reason = f"Controle; autorização temporária por {format_duration(duration)}"
-    queue_audit_log(event.chat_id, target_id, "Ação: Autorizar", audit_reason, admin_id=event.sender_id)
-    await reply_or_edit(
-        event,
-        f"✅ Usuário {user_info} (<code>{target_id}</code>) autorizado {access_text}.",
-        delete_after=5,
-    )
-
-@client.on(events.NewMessage(pattern=r'^\.desautorizar(?:\s|$)', func=is_owner_event))
-async def cmd_desautorizar(event):
-    target_id = await get_target_from_event(event)
-    if not target_id:
-        await reply_or_edit(event, "❌ Especifique o usuário.", delete_after=5)
-        return
-    previous_auth = await asyncio.to_thread(db.get_authorized_record, target_id)
-    if previous_auth is None:
-        await reply_or_edit(event, "❌ Não foi possível consultar a autorização no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
-        return
-    if not previous_auth:
-        await reply_or_edit(event, "ℹ️ Este usuário não possui autorização ativa; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
-        return
-    if not _record_is_active(previous_auth):
-        await asyncio.to_thread(db.remove_authorized, target_id)
-        await reply_or_edit(event, "ℹ️ A autorização já estava vencida e foi limpa; nenhuma alteração adicional foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
-        return
-    if not await asyncio.to_thread(db.remove_authorized, target_id):
-        await reply_or_edit(event, "❌ Não foi possível revogar a autorização no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
-        return
-    user_info = await asyncio.to_thread(db.get_user_info, target_id)
-    queue_audit_log(event.chat_id, target_id, "Ação: Desautorizar", "Controle", admin_id=event.sender_id)
-    await reply_or_edit(event, f"❌ Acesso revogado para {user_info} (<code>{target_id}</code>).", delete_after=5)
-
-@client.on(events.NewMessage(pattern=r'^\.listauth(?:\s|$)', func=is_authorized_event))
-async def cmd_listauth(event):
-    auths = await asyncio.to_thread(db.get_all_authorized)
-    if not auths:
-        await reply_or_edit(event, "📭 Nenhum usuário autorizado no momento.", delete_after=10)
-        return
-    info_map = await asyncio.to_thread(db.get_user_info_many, [row["user_id"] for row in auths])
-    text = "👥 <b>LISTA DE USUÁRIOS AUTORIZADOS</b>\n\n"
-    for row in auths:
-        user_id = int(row["user_id"])
-        info = info_map.get(user_id, str(user_id))
-        date_str = format_timestamp(row["created_at"])
-        expires_at = row.get("expires_at")
-        access_text = "permanente" if not expires_at else f"expira em {format_timestamp(expires_at)}"
-        text += f"• {info} (<code>{user_id}</code>)\n└ 📅 {date_str} | {access_text}\n"
-    await reply_or_edit(event, text, delete_after=15)
-
 @client.on(events.NewMessage(pattern=r'^\.logs(?:\s|$)', func=is_authorized_event))
 async def cmd_logs(event):
     await audit_buffer.flush()
@@ -5573,7 +5475,6 @@ async def cmd_help(event):
         "👑 <b>CONTROLE GLOBAL:</b>\n"
         "• <code>.allban [duração] [--purge N]</code> | <code>.allblack [duração]</code> | <code>.unallblack</code>\n"
         "• <code>.maintenance on/off</code> (somente proprietário)\n"
-        "• <code>.autorizar [duração]</code> | <code>.desautorizar</code> | <code>.listauth</code> (Acessos permanentes ou temporários: 10s, 30m, 10h, 10d)\n\n"
         "👤 <b>PERFIL DA CONTA (somente proprietário):</b>\n"
         "• <code>.salvar</code> (faz backup local de nome, bio, username e foto)\n"
         "• <code>.clonar</code> respondendo, por ID ou @username (aplica nome, bio e foto)\n"
@@ -5625,7 +5526,7 @@ async def cmd_antispy(event):
         }
         for entry in result.events:
             uid = entry.user_id
-            if not uid or uid in [OWNER_ID, SECOND_OWNER_ID, THIRD_OWNER_ID] or uid in cache.authorized_users:
+            if not uid or uid == OWNER_ID:
                 continue
             action_name = type(getattr(entry, "action", None)).__name__
             label, weight = action_weights.get(action_name, (action_name or "evento administrativo", 5))
@@ -5952,20 +5853,8 @@ async def cmd_infojt(event):
             f"• Shadow Ban: {'✅ Sim' if shadow_banned else '❌ Não'}",
         ])
 
-    if is_owner(target_id):
-        authorization_label = "Proprietário (imune)"
-    elif target_id in cache.authorized_users:
-        expires_at = cache.authorized_expirations.get(target_id)
-        if expires_at is None:
-            authorization_label = "Sim (permanente)"
-        elif int(expires_at) > int(time.time()):
-            authorization_label = f"Sim (expira em {format_timestamp(expires_at)})"
-        else:
-            authorization_label = "Expirada"
-    else:
-        authorization_label = "Não"
-
-    lines.extend(["", f"🔑 <b>Autorização:</b> {authorization_label}"])
+    lines.append("")
+    lines.append("🔐 <b>Acesso ao Userbot:</b> somente o proprietário configurado")
     await reply_or_edit(event, "\n".join(lines), delete_after=15)
 
 
