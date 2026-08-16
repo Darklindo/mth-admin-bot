@@ -109,7 +109,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V8.6"
+VERSION = "V8.7"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 TELETHON_LOG_LEVEL = os.getenv("TELETHON_LOG_LEVEL", "WARNING").upper()
 
@@ -351,9 +351,16 @@ class Database:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA temp_store=MEMORY")
-        self.conn.execute("PRAGMA cache_size=-8192")
+        self.conn.execute("PRAGMA cache_size=-16384")
+        self.conn.execute("PRAGMA mmap_size=134217728")
+        self.conn.execute("PRAGMA wal_autocheckpoint=1000")
+        self.conn.execute("PRAGMA journal_size_limit=16777216")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            self.conn.execute("PRAGMA optimize")
+        except sqlite3.DatabaseError:
+            pass
 
     def execute(self, query, params=(), commit=False):
         try:
@@ -2503,16 +2510,28 @@ async def get_chat_permission_health(chat_id):
         return "⚠️ não foi possível consultar as permissões"
 
 
+_DURATION_TOKEN_RE = re.compile(r"^\d+[smhdw]$", re.IGNORECASE)
+_PERMANENT_DURATION_TOKENS = frozenset({"perm", "permanent", "permanente"})
+
+
+def _looks_like_duration_token(token):
+    normalized = str(token or "").strip().lower()
+    return normalized in _PERMANENT_DURATION_TOKENS or bool(_DURATION_TOKEN_RE.fullmatch(normalized))
+
+
 def parse_duration_token(token):
     token = str(token or "").strip().lower()
-    if token in {"perm", "permanent", "permanente"}:
+    if token in _PERMANENT_DURATION_TOKENS:
         return None
-    match = re.fullmatch(r"(\d+)(s|m|h|d|w)", token)
+    match = _DURATION_TOKEN_RE.fullmatch(token)
     if not match:
         return None
-    amount, unit = int(match.group(1)), match.group(2)
-    multiplier = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[unit]
-    seconds = amount * multiplier
+    try:
+        amount, unit = int(match.group(0)[:-1]), match.group(0)[-1]
+        multiplier = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[unit]
+        seconds = amount * multiplier
+    except (TypeError, ValueError, OverflowError):
+        return None
     if seconds < MIN_DURATION_SECONDS or seconds > MAX_DURATION_SECONDS:
         return None
     return seconds
@@ -2544,8 +2563,10 @@ def parse_moderation_options(event, allow_purge=False):
             index += 1
             continue
         parsed_duration = parse_duration_token(token)
-        if parsed_duration is not None or lower in {"perm", "permanent", "permanente"}:
+        if parsed_duration is not None or lower in _PERMANENT_DURATION_TOKENS:
             duration = parsed_duration
+        elif _looks_like_duration_token(token):
+            raise ValueError("A duração deve estar entre 30s e o limite configurado, usando s, m, h, d ou w.")
         else:
             reason_tokens.append(token)
         index += 1
@@ -2780,6 +2801,53 @@ async def delete_security_message(event, chat_id, user_id, content_text, reason)
 
 
 _response_cleanup_tasks = set()
+_pending_command_status = {}
+
+
+def _event_response_key(event):
+    try:
+        return (int(getattr(event, "chat_id", 0) or 0), int(getattr(event, "id", 0) or 0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _take_pending_command_status(event):
+    key = _event_response_key(event)
+    return _pending_command_status.pop(key, None) if key is not None else None
+
+
+def _store_pending_command_status(event, message):
+    key = _event_response_key(event)
+    if key is not None and message is not None:
+        _pending_command_status[key] = message
+
+
+def _clear_pending_command_status(event):
+    key = _event_response_key(event)
+    if key is not None:
+        _pending_command_status.pop(key, None)
+
+
+def _safe_command_error(exc, action="concluir a operação"):
+    """Converte exceções técnicas em mensagens profissionais e acionáveis.
+
+    O detalhe completo permanece nos logs; a interface nunca expõe SQL, nomes de
+    métodos, IDs internos ou mensagens RPC desnecessariamente extensas.
+    """
+    if isinstance(exc, FloodWaitError):
+        seconds = max(1, int(getattr(exc, "seconds", 0) or 0))
+        return f"⚠️ O Telegram solicitou uma espera de {seconds}s antes de {action}."
+    if isinstance(exc, ChatAdminRequiredError):
+        return "❌ Não tenho permissão de administrador suficiente para executar esta ação."
+    if isinstance(exc, UserAdminInvalidError):
+        return "❌ O Telegram recusou a ação por causa da hierarquia ou das permissões do alvo."
+    if isinstance(exc, UserNotParticipantError):
+        return "ℹ️ O usuário não está presente neste chat; nenhuma alteração foi necessária."
+    if isinstance(exc, MessageNotModifiedError):
+        return "ℹ️ Nenhuma alteração foi necessária."
+    if isinstance(exc, RPCError):
+        return f"❌ O Telegram recusou a solicitação ao tentar {action}. Verifique minhas permissões e tente novamente."
+    return f"❌ Não foi possível {action}. A operação foi interrompida com segurança."
 
 
 async def _cleanup_response_later(message, event, delay, label):
@@ -2828,56 +2896,82 @@ async def _edit_response_now(message, text):
 
 
 async def reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER):
-    """Responde sem bloquear o handler durante o período de autoexclusão."""
+    """Responde ou edita com fallback seguro e autoexclusão não bloqueante."""
     command_metrics.start(event)
+    if event is None:
+        command_metrics.finish(event, success=False)
+        return None
+    outgoing = is_outgoing_event(event)
     msg = None
+    pending = _take_pending_command_status(event)
+    if pending is not None:
+        msg = await _edit_response_now(pending, text)
+        if msg:
+            msg = pending
     try:
-        if event.out:
+        if msg is not None:
+            pass
+        elif outgoing and callable(getattr(event, "edit", None)):
             msg = await event.edit(text, parse_mode="html")
-        else:
+        elif callable(getattr(event, "reply", None)):
             msg = await event.reply(text, parse_mode="html")
+        elif callable(getattr(event, "respond", None)):
+            msg = await event.respond(text, parse_mode="html")
     except MessageNotModifiedError:
-        # O comando já contém exatamente o texto solicitado; ainda assim,
-        # ele deve seguir o ciclo normal de autoexclusão.
+        # A mensagem já possui o estado desejado; ela continua no ciclo normal
+        # de limpeza para não deixar comandos antigos no chat.
         msg = event
     except Exception as exc:
-        logger.warning(f"Resposta HTML falhou; tentando texto simples: {exc}")
+        logger.warning("Resposta HTML falhou; tentando texto simples: %s", exc)
         try:
-            if event.out:
+            if outgoing and callable(getattr(event, "edit", None)):
                 msg = await event.edit(text, parse_mode=None)
-            else:
+            elif callable(getattr(event, "reply", None)):
                 msg = await event.reply(text, parse_mode=None)
+            elif callable(getattr(event, "respond", None)):
+                msg = await event.respond(text, parse_mode=None)
         except MessageNotModifiedError:
             msg = event
         except Exception as fallback_exc:
-            logger.error(f"Erro ao enviar/editar resposta: {fallback_exc}")
+            logger.error("Erro ao enviar/editar resposta: %s", fallback_exc)
 
     command_metrics.finish(event, success=msg is not None)
-    if msg is not None:
-        schedule_response_cleanup(msg, event, delete_after)
-    elif delete_after:
-        schedule_response_cleanup(None, event, delete_after)
+    _clear_pending_command_status(event)
+    schedule_response_cleanup(msg, event, delete_after) if msg is not None else schedule_response_cleanup(None, event, delete_after)
     return msg
 
 
 async def begin_fast_response(event, text, label="status de moderação"):
-    """Mostra o processamento imediatamente, editando o comando quando possível."""
+    """Mostra o processamento imediatamente e usa edição quando disponível."""
     command_metrics.start(event)
+    if event is None:
+        return None
+    outgoing = is_outgoing_event(event)
+    pending = _take_pending_command_status(event)
+    if pending is not None:
+        if await _edit_response_now(pending, text):
+            return pending
     try:
-        if event.out:
+        if outgoing and callable(getattr(event, "edit", None)):
             return await event.edit(text, parse_mode="html")
-        return await event.respond(text, parse_mode="html")
+        if callable(getattr(event, "respond", None)):
+            return await event.respond(text, parse_mode="html")
+        if callable(getattr(event, "reply", None)):
+            return await event.reply(text, parse_mode="html")
     except MessageNotModifiedError:
         return event
     except Exception as exc:
         logger.warning("Falha ao mostrar %s: %s", label, exc)
         try:
-            if event.out:
+            if outgoing and callable(getattr(event, "edit", None)):
                 return await event.edit(text, parse_mode=None)
-            return await event.respond(text, parse_mode=None)
+            if callable(getattr(event, "respond", None)):
+                return await event.respond(text, parse_mode=None)
+            if callable(getattr(event, "reply", None)):
+                return await event.reply(text, parse_mode=None)
         except Exception as fallback_exc:
             logger.error("Falha no fallback de %s: %s", label, fallback_exc)
-            return None
+    return None
 
 
 async def finish_fast_response(event, status_message, text, delete_after=DEFAULT_DELETE_AFTER, label="resposta de moderação"):
@@ -2897,10 +2991,40 @@ async def finish_fast_response(event, status_message, text, delete_after=DEFAULT
 
 
 async def send_status_safely(event, text, label="mensagem de status"):
+    """Cria um status compatível com eventos self/incoming e registra cleanup."""
+    if event is None:
+        return None
+    command_metrics.start(event)
+    pending = _take_pending_command_status(event)
+    if pending is not None:
+        if await _edit_response_now(pending, text):
+            return pending
     try:
-        return await event.respond(text)
+        outgoing = is_outgoing_event(event)
+        if outgoing and callable(getattr(event, "edit", None)):
+            message = await event.edit(text, parse_mode="html")
+        elif callable(getattr(event, "respond", None)):
+            message = await event.respond(text, parse_mode="html")
+        elif callable(getattr(event, "reply", None)):
+            message = await event.reply(text, parse_mode="html")
+        else:
+            return None
+        return message
+    except MessageNotModifiedError:
+        return event
     except Exception as exc:
         logger.warning("Falha ao enviar %s: %s", label, exc)
+        try:
+            if callable(getattr(event, "respond", None)):
+                message = await event.respond(text, parse_mode=None)
+            elif callable(getattr(event, "reply", None)):
+                message = await event.reply(text, parse_mode=None)
+            else:
+                message = None
+            if message is not None:
+                return message
+        except Exception as fallback_exc:
+            logger.error("Falha no fallback de %s: %s", label, fallback_exc)
         await delete_command_safely(event)
         return None
 
@@ -2908,14 +3032,7 @@ async def send_status_safely(event, text, label="mensagem de status"):
 async def edit_and_delete_safely(message, text, delete_after=DEFAULT_DELETE_AFTER, label="mensagem de status"):
     if message is None:
         return False
-    edited = False
-    try:
-        await message.edit(text, parse_mode="html")
-        edited = True
-    except MessageNotModifiedError:
-        edited = True
-    except Exception as exc:
-        logger.warning("Falha ao editar %s: %s", label, exc)
+    edited = await _edit_response_now(message, text)
     # Não retenha o handler por vários segundos: a resposta e o comando
     # serão removidos pelo agendador compartilhado em segundo plano.
     schedule_response_cleanup(message, message, delete_after, label)
@@ -3601,6 +3718,46 @@ async def cmd_restaurar(event):
         await finish_fast_response(event, status, "❌ Não foi possível restaurar o perfil com segurança.", label="erro do restaurar")
 
 
+_KNOWN_COMMAND_PROGRESS = frozenset({
+    ".salvar", ".clonar", ".restaurar", ".maintenance", ".lock", ".unlock",
+    ".quarantine", ".antispam", ".pinned", ".antilink", ".autorizarlink",
+    ".desautorizarlink", ".listlinkauth", ".jtdel", ".jtwarn", ".jtdelwarn",
+    ".unwarn", ".clearwarns", ".warns", ".start", ".antiblack", ".unantiblack",
+    ".listantiblack", ".kick", ".jtban", ".unban", ".jtmute", ".unmute",
+    ".blacklist", ".unblacklist", ".banperm", ".unbanperm", ".shadow", ".unshadow",
+    ".allban", ".allblack", ".unallblack", ".autorizar", ".desautorizar", ".listauth",
+    ".logs", ".listdn", ".status", ".latency", ".health", ".help", ".antispy",
+    ".listspy", ".delspy", ".jtpurgeall", ".jtpurge", ".purgeme", ".id", ".infojt",
+    ".exu", ".msg", ".chats",
+})
+
+
+@client.on(events.NewMessage(pattern=r'^\.[a-z0-9_]+(?:\s|$)'))
+async def command_progress_filter(event):
+    """Exibe um status local antes dos RPCs e permite que qualquer handler o edite."""
+    if not is_authorized_event(event):
+        return
+    command = (event.raw_text or "").split(maxsplit=1)[0].lower()
+    if command not in _KNOWN_COMMAND_PROGRESS:
+        return
+    if cache.maintenance_enabled and not is_owner_event(event) and command not in {".maintenance", ".status", ".health", ".latency"}:
+        return
+    try:
+        label = escape(command.lstrip("."))
+        text = f"⏳ Processando <code>.{label}</code>..."
+        if is_outgoing_event(event) and callable(getattr(event, "edit", None)):
+            status = await event.edit(text, parse_mode="html")
+        elif callable(getattr(event, "respond", None)):
+            status = await event.respond(text, parse_mode="html")
+        elif callable(getattr(event, "reply", None)):
+            status = await event.reply(text, parse_mode="html")
+        else:
+            return
+        _store_pending_command_status(event, status)
+    except Exception as exc:
+        logger.debug("Não foi possível exibir progresso do comando %s: %s", command, exc)
+
+
 @client.on(events.NewMessage(incoming=True, pattern=r'^\.[a-z0-9_]+(?:\s|$)'))
 async def maintenance_filter(event):
     if not cache.maintenance_enabled or is_owner(event.sender_id):
@@ -3894,7 +4051,11 @@ async def cmd_del(event):
 @client.on(events.NewMessage(pattern=r'^\.jtwarn(?:\s|$)', func=is_authorized_event))
 async def cmd_warn(event):
     target_id = await get_target_from_event(event)
-    _, _, reason = parse_moderation_options(event)
+    try:
+        _, _, reason = parse_moderation_options(event)
+    except ValueError as exc:
+        await reply_or_edit(event, f"❌ {escape(str(exc))}", delete_after=DEFAULT_DELETE_AFTER)
+        return
     if await reject_moderation_target(event, target_id):
         return
     settings = await get_settings_async(event.chat_id)
@@ -4214,7 +4375,7 @@ async def cmd_kick(event):
         await finish_fast_response(
             event,
             status_message,
-            f"❌ Não foi possível interpretar o comando: {exc}",
+            _safe_command_error(exc, "interpretar o comando"),
             label="erro ao interpretar o kick",
         )
         return
@@ -4250,7 +4411,7 @@ async def cmd_kick(event):
         await finish_fast_response(event, status_message, "❌ Erro: Não é possível expulsar outro administrador (hierarquia).", label="erro do kick")
     except Exception as exc:
         logger.exception("Erro ao aplicar .kick")
-        await finish_fast_response(event, status_message, f"❌ Erro ao expulsar: {exc}", label="erro do kick")
+        await finish_fast_response(event, status_message, _safe_command_error(exc, "expulsar o usuário"), label="erro do kick")
 
 @client.on(events.NewMessage(pattern=r'^\.jtban(?:\s|$)', func=is_authorized_event))
 async def cmd_ban(event):
@@ -4269,7 +4430,7 @@ async def cmd_ban(event):
         await finish_fast_response(
             event,
             status_message,
-            f"❌ Não foi possível interpretar o comando: {exc}",
+            _safe_command_error(exc, "interpretar o comando"),
             label="erro ao interpretar o ban",
         )
         return
@@ -4370,7 +4531,7 @@ async def cmd_ban(event):
         await finish_fast_response(event, status_message, "❌ Erro: Não é possível banir outro administrador (hierarquia).", label="erro do ban")
     except Exception as e:
         logger.exception("Erro ao aplicar .jtban")
-        await finish_fast_response(event, status_message, f"❌ Erro ao banir: {e}", label="erro do ban")
+        await finish_fast_response(event, status_message, _safe_command_error(e, "banir o usuário"), label="erro do ban")
 
 @client.on(events.NewMessage(pattern=r'^\.unban(?:\s|$)', func=is_authorized_event))
 async def cmd_unban(event):
@@ -4421,7 +4582,7 @@ async def cmd_unban(event):
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
     except Exception as e:
-        await reply_or_edit(event, f"❌ Erro ao desbanir: {e}", delete_after=DEFAULT_DELETE_AFTER)
+        await reply_or_edit(event, _safe_command_error(e, "desbanir o usuário"), delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.jtmute(?:\s|$)', func=is_authorized_event))
 async def cmd_mute(event):
@@ -4438,7 +4599,7 @@ async def cmd_mute(event):
         await finish_fast_response(
             event,
             status_message,
-            f"❌ Não foi possível interpretar o comando: {exc}",
+            _safe_command_error(exc, "interpretar o comando"),
             label="erro ao interpretar o mute",
         )
         return
@@ -4513,7 +4674,7 @@ async def cmd_mute(event):
         await finish_fast_response(event, status_message, "❌ Erro: Não é possível silenciar outro administrador (hierarquia).", label="erro do mute")
     except Exception as exc:
         logger.exception("Erro ao aplicar .jtmute")
-        await finish_fast_response(event, status_message, f"❌ Erro ao silenciar: {exc}", label="erro do mute")
+        await finish_fast_response(event, status_message, _safe_command_error(exc, "silenciar o usuário"), label="erro do mute")
 
 @client.on(events.NewMessage(pattern=r'^\.unmute(?:\s|$)', func=is_authorized_event))
 async def cmd_unmute(event):
@@ -4543,12 +4704,16 @@ async def cmd_unmute(event):
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
     except Exception as e:
-        await reply_or_edit(event, f"❌ Erro ao desmutar: {e}", delete_after=DEFAULT_DELETE_AFTER)
+        await reply_or_edit(event, _safe_command_error(e, "desmutar o usuário"), delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.blacklist(?:\s|$)', func=is_authorized_event))
 async def cmd_blacklist(event):
     target_id = await get_target_from_event(event)
-    duration, _, reason = parse_moderation_options(event)
+    try:
+        duration, _, reason = parse_moderation_options(event)
+    except ValueError as exc:
+        await reply_or_edit(event, f"❌ {escape(str(exc))}", delete_after=DEFAULT_DELETE_AFTER)
+        return
     if await reject_moderation_target(event, target_id):
         return
     expires_at = int(time.time()) + duration if duration is not None else None
@@ -4593,7 +4758,11 @@ async def cmd_unblacklist(event):
 @client.on(events.NewMessage(pattern=r'^\.banperm(?:\s|$)', func=is_authorized_event))
 async def cmd_banperm(event):
     target_id = await get_target_from_event(event)
-    duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
+    try:
+        duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
+    except ValueError as exc:
+        await reply_or_edit(event, f"❌ {escape(str(exc))}", delete_after=DEFAULT_DELETE_AFTER)
+        return
     if await reject_moderation_target(event, target_id):
         return
     if duration is not None and duration < MIN_TELEGRAM_TEMP_DURATION_SECONDS:
@@ -4638,7 +4807,7 @@ async def cmd_banperm(event):
     except UserAdminInvalidError:
         await reply_or_edit(event, "❌ Erro: Não é possível banir permanentemente outro administrador.", delete_after=DEFAULT_DELETE_AFTER)
     except Exception as e:
-        await reply_or_edit(event, f"❌ Erro ao banir: {e}", delete_after=DEFAULT_DELETE_AFTER)
+        await reply_or_edit(event, _safe_command_error(e, "banir o usuário"), delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.unbanperm(?:\s|$)', func=is_authorized_event))
 async def cmd_unbanperm(event):
@@ -4685,12 +4854,16 @@ async def cmd_unbanperm(event):
     except ChatAdminRequiredError:
         await reply_or_edit(event, "❌ Erro: Não tenho permissão de administrador.", delete_after=DEFAULT_DELETE_AFTER)
     except Exception as e:
-        await reply_or_edit(event, f"❌ Erro ao desbanir: {e}", delete_after=DEFAULT_DELETE_AFTER)
+        await reply_or_edit(event, _safe_command_error(e, "desbanir o usuário"), delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.shadow(?:\s|$)', func=is_authorized_event))
 async def cmd_shadow(event):
     target_id = await get_target_from_event(event)
-    duration, _, reason = parse_moderation_options(event)
+    try:
+        duration, _, reason = parse_moderation_options(event)
+    except ValueError as exc:
+        await reply_or_edit(event, f"❌ {escape(str(exc))}", delete_after=DEFAULT_DELETE_AFTER)
+        return
     if await reject_moderation_target(event, target_id):
         return
     expires_at = int(time.time()) + duration if duration is not None else None
@@ -4809,7 +4982,11 @@ async def cmd_allban(event):
     if await reject_fast_moderation_target(event, status, target_id, label="resultado do allban"):
         return
 
-    duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
+    try:
+        duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
+    except ValueError as exc:
+        await finish_fast_response(event, status, f"❌ {escape(str(exc))}", label="resultado do allban")
+        return
     if duration is not None and duration < MIN_TELEGRAM_TEMP_DURATION_SECONDS:
         await finish_fast_response(
             event,
@@ -5168,7 +5345,8 @@ async def cmd_latency(event):
         api_state = "✅ disponível"
     except Exception as exc:
         api_ms = 0.0
-        api_state = f"⚠️ falhou: {escape(str(exc)[:120])}"
+        logger.warning("Falha no RPC de latência: %s", exc)
+        api_state = "⚠️ indisponível"
     performance = get_performance_snapshot()
     delete_failures = performance.get("failed", performance.get("delete_failed", 0))
     elapsed_ms = (time.perf_counter() - started) * 1000
@@ -5308,14 +5486,13 @@ async def cmd_antispy(event):
     bait_msg = await send_status_safely(event, "🕵️‍♂️ [AntiSpy] Varrendo o chat em busca de espiões... Analisando logs de moderação...", label="status do antispy")
     if bait_msg is None:
         return
-    await asyncio.sleep(5)
     try:
-        result = await client(functions.channels.GetAdminLogRequest(
+        result = await asyncio.wait_for(client(functions.channels.GetAdminLogRequest(
             channel=event.chat_id,
             q='',
             events_filter=types.ChannelAdminLogEventsFilter(delete=True, edit=True, ban=True, unban=True, kick=True, unkick=True),
             admins=None, max_id=0, min_id=0, limit=15
-        ))
+        )), timeout=15)
         evidence = {}
         action_weights = {
             "ChannelAdminLogEventActionDeleteMessage": ("exclusão", 20),
@@ -5347,6 +5524,12 @@ async def cmd_antispy(event):
         else:
             text = "✅ <b>Nenhum conjunto suficiente de sinais foi encontrado neste grupo.</b>\n\n<i>O Telegram não informa diretamente se uma conta utiliza userbot.</i>"
         await edit_and_delete_safely(bait_msg, text, delete_after=15, label="resultado do antispy")
+    except asyncio.TimeoutError:
+        await edit_and_delete_safely(
+            bait_msg,
+            "⏱️ A varredura AntiSpy excedeu o tempo seguro e foi encerrada sem alterar punições.",
+            label="timeout do antispy",
+        )
     except ChatAdminRequiredError:
         await edit_and_delete_safely(
             bait_msg,
@@ -5369,12 +5552,14 @@ async def cmd_listspy(event):
         await reply_or_edit(event, "✅ <b>Nenhum espião registrado no banco de dados.</b>", delete_after=5)
         return
     text = "🕵️‍♂️ <b>LISTA DE ESPIÕES DETECTADOS (.listspy)</b>\n\n"
+    info_map = await asyncio.to_thread(db.get_user_info_many, [s['user_id'] for s in spies])
     for s in spies:
-        info = await asyncio.to_thread(db.get_user_info, s['user_id'])
+        user_id = int(s['user_id'])
+        info = info_map.get(user_id, str(user_id))
         date_str = datetime.fromtimestamp(s['detected_at']).strftime('%d/%m/%Y %H:%M')
         signals = escape(s.get('signals') or 'não informado')
         confidence = int(s.get('confidence') or 0)
-        text += f"• {info} (<code>{s['user_id']}</code>)\n└ 🕒 {date_str} | Chat: <code>{s['chat_id']}</code> | Confiança: <code>{confidence}%</code>\n└ Sinais: {signals}\n"
+        text += f"• {info} (<code>{user_id}</code>)\n└ 🕒 {date_str} | Chat: <code>{s['chat_id']}</code> | Confiança: <code>{confidence}%</code>\n└ Sinais: {signals}\n"
     await reply_or_edit(event, text, delete_after=15)
 
 @client.on(events.NewMessage(pattern=r'^\.delspy(?:\s|$)', func=is_authorized_event))
@@ -5842,6 +6027,9 @@ async def cmd_msg(event):
         chat for chat in chats
         if chat.get('active') and chat.get('chat_type') not in ['private', 'User']
     ]
+    if not targets:
+        await reply_or_edit(event, "ℹ️ Nenhum grupo ou canal ativo está registrado para receber a transmissão.", delete_after=DEFAULT_DELETE_AFTER)
+        return
     semaphore = asyncio.Semaphore(BROADCAST_CONCURRENCY)
 
     async def _broadcast_one(chat):
@@ -5888,8 +6076,9 @@ async def cmd_chats(event):
     if grupos: text += "👥 <b>GRUPOS:</b>\n" + "\n".join(grupos) + "\n\n"
     if canais: text += "📣 <b>CANAIS:</b>\n" + "\n".join(canais) + "\n\n"
     if privados: text += "👤 <b>USUÁRIOS NO PRIVADO:</b>\n" + "\n".join(privados) + "\n\n"
+    active_count = sum(1 for row in chats if row.get('active'))
     text += "📊 <b>RESUMO:</b>\n"
-    text += f"• Grupos/Canais: {len(grupos) + len(canais)}\n• Usuários: {len(privados)}"
+    text += f"• Grupos/Canais: {len(grupos) + len(canais)}\n• Ativos p/ transmissão: {active_count}\n• Usuários no privado: {len(privados)}"
     await reply_or_edit(event, text, delete_after=15)
 
 # --- INICIALIZAÇÃO ---
