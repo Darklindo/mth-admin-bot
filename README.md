@@ -1,6 +1,6 @@
 # Jtzin Bot API + Userbot V9.0
 
-Projeto de administração para Telegram com dois processos independentes no Termux: um **bot comum da Bot API**, limitado a três funções, e um **Userbot Telethon**, destinado exclusivamente à conta proprietária JT Cacique.
+Projeto de administração para Telegram com dois processos independentes no Termux: um **bot comum da Bot API**, dedicado à moderação local e global, e um **Userbot Telethon**, destinado exclusivamente à conta proprietária JT Cacique.
 
 > **Segurança:** o token do Bot API nunca deve ser publicado, versionado ou enviado em mensagens. Como o token anterior foi exposto, ele deve ser revogado no `@BotFather` e substituído por um token novo antes da operação.
 
@@ -8,24 +8,27 @@ Projeto de administração para Telegram com dois processos independentes no Ter
 
 | Processo | Arquivo | Prefixo | Acesso | Banco |
 |---|---|---|---|---|
-| Bot comum | `bot.py` | `/` | Administradores dos grupos; `/allban` exige um dos proprietários | `data/bot_api.db` |
+| Bot comum | `bot.py` | `/` e `.` | Administradores dos grupos; `/allban` e `/unallban` exigem um dos proprietários | `data/bot_api.db` |
 | Userbot | `bot_v2.py` | `.` | Somente o `OWNER_ID` configurado | `data/bot.db` |
 
 O Bot API e o Userbot não compartilham sessão, token, banco nem estado de autorização. O Userbot não possui mais subproprietários ou autorização delegada; os comandos `.autorizar`, `.desautorizar` e `.listauth` não fazem parte da superfície operacional da V9.0.
 
 ## Funções do Bot API
 
-O bot comum possui somente estas funções:
+O bot comum oferece moderação local e global. Todos os comandos abaixo aceitam o prefixo tradicional `/` e o alias com ponto `.`, além de reply à mensagem do alvo ou ID/username previamente conhecido pelo bot.
 
 | Comando | Função | Permissão |
 |---|---|---|
-| `/blacklist` | Cadastra o alvo na blacklist local do grupo e apaga as mensagens dele enquanto o bot estiver ativo | Administrador do grupo |
-| `/banperm` | Bane permanentemente o alvo no grupo atual | Administrador do grupo |
-| `/allban` | Registra o alvo na blacklist global e tenta bani-lo em todos os grupos conhecidos | Somente um dos `OWNER_IDS` |
+| `/blacklist` ou `.blacklist` | Cadastra o alvo na blacklist local do grupo e apaga as mensagens dele enquanto o bot estiver ativo | Administrador do grupo |
+| `/unblacklist` ou `.unblacklist` | Remove o alvo da blacklist local do grupo | Administrador do grupo |
+| `/banperm` ou `.banperm` | Bane permanentemente o alvo no grupo atual | Administrador do grupo |
+| `/unbanperm` ou `.unbanperm` | Retira o banimento permanente do alvo no grupo atual | Administrador do grupo |
+| `/allban` ou `.allban` | Registra o alvo na blacklist global e tenta bani-lo em todos os grupos conhecidos | Somente um dos `OWNER_IDS` |
+| `/unallban` ou `.unallban` | Remove o alvo da lista global e tenta desbaní-lo nos grupos conhecidos | Somente um dos `OWNER_IDS` |
 
-O alvo pode ser informado respondendo à mensagem dele ou usando um ID numérico ou username previamente conhecido pelo bot. O banco mantém a lista por chat e o Bot API possui cache próprio. O bot precisa estar presente e ter permissões administrativas para apagar mensagens ou restringir usuários; o `/allban` só pode alcançar grupos nos quais ele esteja presente e autorizado.
+O banco mantém a lista por chat e o Bot API possui cache próprio. O bot precisa estar presente e ter permissões administrativas para apagar mensagens ou restringir usuários; os comandos globais só podem alcançar grupos nos quais ele esteja presente e autorizado.
 
-As respostas e os comandos são removidos automaticamente após alguns segundos. O bot é deliberadamente mínimo: não contém o restante dos recursos do Userbot, não aceita autorização de terceiros e não possui subproprietários.
+As respostas e os comandos são removidos automaticamente após alguns segundos. O bot é deliberadamente independente: não contém o restante dos recursos do Userbot, não aceita autorização de terceiros e não possui subproprietários.
 
 ## Funções do Userbot
 

@@ -2,7 +2,7 @@
 
 ## 1. O que esta distribuição contém
 
-Esta distribuição contém dois processos independentes: o **Bot API** mínimo, com `blacklist`, `banperm` e `allban`, e o **Userbot Telethon**, com os recursos avançados históricos. Eles usam credenciais, bancos e estados separados.
+Esta distribuição contém dois processos independentes: o **Bot API** de moderação local/global e o **Userbot Telethon**, com os recursos avançados históricos. Eles usam credenciais, bancos e estados separados.
 
 A source não contém `API_HASH`, sessão do Telegram, bancos, backups de perfil, token real do Bot API ou logs. Cada instalação deve usar credenciais próprias.
 
@@ -101,17 +101,18 @@ tmux attach -t jtzin
 
 ## 7. Comandos do Bot API
 
-O Bot API usa comandos tradicionais com `/`:
+O Bot API aceita comandos tradicionais com `/` e aliases equivalentes com `.`:
 
 ```text
-/blacklist
-/banperm
-/allban
+/blacklist   ou   .blacklist
+/unblacklist ou   .unblacklist
+/banperm     ou   .banperm
+/unbanperm   ou   .unbanperm
+/allban      ou   .allban
+/unallban    ou   .unallban
 ```
 
-Responda à mensagem do alvo ou informe um ID numérico. Usernames só podem ser resolvidos quando o bot já os conhece ou quando foram registrados anteriormente. O bot precisa ser administrador do grupo com permissões adequadas.
-
-`/blacklist` é local ao grupo atual. `/banperm` também afeta somente o grupo atual. `/allban` é global e só pode ser executado por um dos IDs configurados em `OWNER_IDS`; ele tenta aplicar banimento nos chats conhecidos em que o bot tenha acesso.
+Responda à mensagem do alvo ou informe um ID numérico. Usernames só podem ser resolvidos quando o bot já os conhece ou quando foram registrados anteriormente. `/blacklist` e `/banperm` exigem administração real do grupo. `/allban` e `/unallban` são exclusivos dos dois IDs configurados em `OWNER_IDS`; eles tentam operar nos chats conhecidos em que o bot tenha acesso.
 
 ## 8. Comandos do Userbot
 

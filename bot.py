@@ -285,6 +285,30 @@ class Database:
         )
         return cursor.rowcount >= 0
 
+    def remove_blacklist(self, user_id: int, chat_id: int) -> bool:
+        cursor = self._execute(
+            "DELETE FROM blacklist WHERE chat_id=? AND user_id=?",
+            (int(chat_id), int(user_id)),
+            commit=True,
+        )
+        return cursor.rowcount > 0
+
+    def remove_banperm(self, user_id: int, chat_id: int) -> bool:
+        cursor = self._execute(
+            "DELETE FROM banperm WHERE chat_id=? AND user_id=?",
+            (int(chat_id), int(user_id)),
+            commit=True,
+        )
+        return cursor.rowcount > 0
+
+    def remove_allban(self, user_id: int) -> bool:
+        cursor = self._execute(
+            "DELETE FROM allban WHERE user_id=?",
+            (int(user_id),),
+            commit=True,
+        )
+        return cursor.rowcount > 0
+
     def active_chats(self):
         return self._execute(
             "SELECT chat_id,title,chat_type FROM chats WHERE active=1 AND chat_type IN ('group','supergroup') ORDER BY chat_id"
@@ -421,7 +445,12 @@ async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return Target(uid, username, full_name)
         row = await asyncio.to_thread(db.resolve_username, raw[1:])
         if row:
-            return Target(int(row["user_id"]), row.get("username", ""), row.get("full_name", ""))
+            keys = row.keys()
+            return Target(
+                int(row["user_id"]),
+                row["username"] if "username" in keys else "",
+                row["full_name"] if "full_name" in keys else "",
+            )
     return None
 
 
@@ -432,8 +461,8 @@ def _reason(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 def _target_error(command: str) -> str:
     return (
-        f"❌ Informe o alvo para <code>/{command}</code>: responda à mensagem do usuário "
-        f"ou use um ID numérico/@username conhecido."
+        f"❌ Informe o alvo para <code>/{command}</code> ou <code>.{command}</code>: "
+        f"responda à mensagem do usuário ou use um ID numérico/@username conhecido."
     )
 
 
@@ -473,12 +502,63 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update,
         "🛡️ <b>Jtzin Administrator Bot</b>\n\n"
         "<b>Comandos disponíveis</b>\n"
-        "<code>/blacklist</code> — adiciona o alvo à blacklist deste grupo e apaga as mensagens dele.\n"
-        "<code>/banperm</code> — bane permanentemente o alvo deste grupo.\n"
-        "<code>/allban</code> — o proprietário bane o alvo em todos os grupos registrados.\n\n"
+        "<code>/blacklist</code> ou <code>.blacklist</code> — adiciona o alvo à blacklist deste grupo.\n"
+        "<code>/unblacklist</code> ou <code>.unblacklist</code> — remove a blacklist local.\n"
+        "<code>/banperm</code> ou <code>.banperm</code> — bane permanentemente o alvo deste grupo.\n"
+        "<code>/unbanperm</code> ou <code>.unbanperm</code> — remove o banimento deste grupo.\n"
+        "<code>/allban</code> ou <code>.allban</code> — o proprietário bane o alvo nos grupos registrados.\n"
+        "<code>/unallban</code> ou <code>.unallban</code> — remove o allban global e tenta desbanir o alvo.\n\n"
         "Use respondendo à mensagem do alvo ou informe o ID. O bot precisa ser administrador "
-        "com permissão para apagar mensagens e restringir membros. O allban é exclusivo do proprietário.",
+        "com permissão para apagar mensagens e restringir membros. Os comandos allban são exclusivos dos proprietários.",
     )
+
+
+async def cmd_unblacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group_admin(update, context):
+        return
+    target = await _resolve_target(update, context)
+    if target is None:
+        await _reply_and_cleanup(update, _target_error("unblacklist"))
+        return
+    chat_id = update.effective_chat.id
+    was_cached = target.user_id in BLACKLIST_CACHE.get(chat_id, set())
+    removed = await asyncio.to_thread(db.remove_blacklist, target.user_id, chat_id)
+    BLACKLIST_CACHE.get(chat_id, set()).discard(target.user_id)
+    if not removed and not was_cached:
+        await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> não estava na blacklist deste grupo.")
+        return
+    await _reply_and_cleanup(update, f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) removido da blacklist local.")
+
+
+DOT_COMMAND_RE = re.compile(r"^\.(unblacklist|unbanperm|unallban|blacklist|banperm|allban)(?:\s+.*)?$", re.IGNORECASE)
+DOT_COMMANDS = {
+    "blacklist": "cmd_blacklist",
+    "unblacklist": "cmd_unblacklist",
+    "banperm": "cmd_banperm",
+    "unbanperm": "cmd_unbanperm",
+    "allban": "cmd_allban",
+    "unallban": "cmd_unallban",
+}
+
+
+async def on_dot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    text = (message.text or "").strip() if message else ""
+    match = DOT_COMMAND_RE.fullmatch(text)
+    if not match:
+        return
+    parts = text.split()
+    command = parts[0][1:].lower()
+    handler_name = DOT_COMMANDS.get(command)
+    handler = globals().get(handler_name) if handler_name else None
+    if handler is None:
+        return
+    original_args = getattr(context, "args", None)
+    context.args = parts[1:]
+    try:
+        await handler(update, context)
+    finally:
+        context.args = original_args
 
 
 async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -540,6 +620,35 @@ async def cmd_banperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_and_cleanup(update, f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) banido permanentemente neste grupo.")
 
 
+async def cmd_unbanperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group_admin(update, context):
+        return
+    target = await _resolve_target(update, context)
+    if target is None:
+        await _reply_and_cleanup(update, _target_error("unbanperm"))
+        return
+    chat_id = update.effective_chat.id
+    was_cached = target.user_id in BANPERM_CACHE.get(chat_id, set())
+    if not was_cached:
+        await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> não estava banido permanentemente neste grupo.")
+        return
+    try:
+        await context.bot.unban_chat_member(chat_id, target.user_id, only_if_banned=True)
+    except BadRequest as exc:
+        text = str(exc).lower()
+        if "not banned" not in text and "user is not banned" not in text:
+            logger.warning("Falha ao retirar banperm em %s/%s: %s", chat_id, target.user_id, exc)
+            await _reply_and_cleanup(update, "❌ Não foi possível retirar o banimento neste grupo.")
+            return
+    except TelegramError:
+        logger.exception("Falha ao retirar banperm em %s/%s", chat_id, target.user_id)
+        await _reply_and_cleanup(update, "❌ Não foi possível retirar o banimento neste grupo.")
+        return
+    await asyncio.to_thread(db.remove_banperm, target.user_id, chat_id)
+    BANPERM_CACHE.get(chat_id, set()).discard(target.user_id)
+    await _reply_and_cleanup(update, f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) desbanido neste grupo.")
+
+
 async def _ban_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, target: Target):
     try:
         await context.bot.ban_chat_member(chat_id, target.user_id)
@@ -560,6 +669,61 @@ async def _ban_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, target:
         return "failed"
     except TelegramError:
         return "failed"
+
+
+async def _unban_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, target: Target):
+    try:
+        await context.bot.unban_chat_member(chat_id, target.user_id, only_if_banned=True)
+        return "ok"
+    except BadRequest as exc:
+        text = str(exc).lower()
+        if "not banned" in text or "user is not banned" in text:
+            return "skipped"
+        return "failed"
+    except Forbidden:
+        return "forbidden"
+    except TelegramError:
+        return "failed"
+
+
+async def cmd_unallban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not _is_owner(update.effective_user.id):
+        await _reply_and_cleanup(update, "⛔ Este comando é exclusivo dos proprietários configurados.")
+        return
+    if _is_group(update):
+        await _remember_message_context(update)
+    target = await _resolve_target(update, context)
+    if target is None:
+        await _reply_and_cleanup(update, _target_error("unallban"))
+        return
+    if target.user_id not in ALLBAN_CACHE:
+        await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> não estava no allban global.")
+        return
+    if not await asyncio.to_thread(db.remove_allban, target.user_id):
+        await _reply_and_cleanup(update, "❌ Não foi possível remover o allban global do banco.")
+        return
+    ALLBAN_CACHE.discard(target.user_id)
+    rows = await asyncio.to_thread(db.active_chats)
+    if not rows:
+        await _reply_and_cleanup(update, f"✅ Allban removido para <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>).")
+        return
+    semaphore = asyncio.Semaphore(ALLBAN_CONCURRENCY)
+
+    async def apply(row):
+        async with semaphore:
+            return await _unban_in_chat(context, int(row["chat_id"]), target)
+
+    results = await asyncio.gather(*(apply(row) for row in rows))
+    counts = {key: results.count(key) for key in {"ok", "failed", "forbidden", "skipped"}}
+    await _reply_and_cleanup(
+        update,
+        f"✅ <b>Allban removido</b> para {_safe_html(target.label)} (<code>{target.user_id}</code>).\n\n"
+        f"✅ Desbanidos: <b>{counts['ok']}</b>\n"
+        f"ℹ️ Já livres: <b>{counts['skipped']}</b>\n"
+        f"🔒 Sem permissão: <b>{counts['forbidden']}</b>\n"
+        f"❌ Falhas: <b>{counts['failed']}</b>\n"
+        f"📊 Grupos processados: <b>{len(rows)}</b>",
+    )
 
 
 async def cmd_allban(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -658,8 +822,11 @@ async def post_init(app: Application):
             BotCommand("start", "Iniciar o bot"),
             BotCommand("help", "Ver instruções"),
             BotCommand("blacklist", "Adicionar à blacklist local"),
+            BotCommand("unblacklist", "Remover a blacklist local"),
             BotCommand("banperm", "Banir permanentemente no grupo"),
+            BotCommand("unbanperm", "Remover o banimento do grupo"),
             BotCommand("allban", "Banir em todos os grupos — proprietário"),
+            BotCommand("unallban", "Remover o allban — proprietário"),
         ]
     )
     logger.info("Jtzin Bot API online; proprietários=%s", ",".join(str(owner_id) for owner_id in sorted(OWNER_IDS)))
@@ -686,8 +853,12 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("blacklist", cmd_blacklist))
+    app.add_handler(CommandHandler("unblacklist", cmd_unblacklist))
     app.add_handler(CommandHandler("banperm", cmd_banperm))
+    app.add_handler(CommandHandler("unbanperm", cmd_unbanperm))
     app.add_handler(CommandHandler("allban", cmd_allban))
+    app.add_handler(CommandHandler("unallban", cmd_unallban))
+    app.add_handler(MessageHandler(filters.ChatType.ALL & filters.Regex(DOT_COMMAND_RE), on_dot_command))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_message), group=1)
     app.add_error_handler(error_handler)
     logger.info("Iniciando polling do Jtzin Bot API")
