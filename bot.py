@@ -162,6 +162,7 @@ class Database:
                     created_at INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_chats_active ON chats(active);
+                CREATE INDEX IF NOT EXISTS idx_users_username_nocase ON users(username COLLATE NOCASE);
                 CREATE INDEX IF NOT EXISTS idx_blacklist_chat ON blacklist(chat_id);
                 CREATE INDEX IF NOT EXISTS idx_banperm_chat ON banperm(chat_id);
                 """
@@ -235,7 +236,7 @@ class Database:
 
     def resolve_username(self, username: str):
         row = self._execute(
-            "SELECT user_id,username,full_name FROM users WHERE lower(username)=lower(?) LIMIT 1",
+            "SELECT user_id,username,full_name FROM users WHERE username = ? COLLATE NOCASE LIMIT 1",
             (username.lstrip("@"),),
         ).fetchone()
         return dict(row) if row else None
@@ -329,13 +330,28 @@ except sqlite3.Error:
 BOT_USER_ID = 0
 _cleanup_tasks: set[asyncio.Task] = set()
 _chat_registration_seen = set(KNOWN_CHAT_IDS)
+KNOWN_USERNAME_IDS = {
+    username.lower(): int(user_id)
+    for user_id, (username, _full_name) in KNOWN_USERS.items()
+    if username
+}
+CHAT_MEMBER_CACHE_TTL = 5.0
+CHAT_MEMBER_ERROR_TTL = 1.5
+CHAT_MEMBER_CACHE: dict[tuple[int, int], tuple[float, object | None]] = {}
+ALLOWED_UPDATES = ["message", "my_chat_member"]
 
 
 def _remember_user_in_memory(user) -> Target:
     username = (getattr(user, "username", "") or "").lstrip("@")
     full_name = getattr(user, "full_name", "") or ""
     user_id = int(user.id)
+    previous = KNOWN_USERS.get(user_id)
+    if previous and previous[0] and previous[0].lower() != username.lower():
+        if KNOWN_USERNAME_IDS.get(previous[0].lower()) == user_id:
+            KNOWN_USERNAME_IDS.pop(previous[0].lower(), None)
     KNOWN_USERS[user_id] = (username, full_name)
+    if username:
+        KNOWN_USERNAME_IDS[username.lower()] = user_id
     return Target(user_id, username, full_name)
 
 
@@ -382,16 +398,37 @@ def _is_group(update: Update) -> bool:
     return bool(chat and chat.type in {ChatType.GROUP, ChatType.SUPERGROUP})
 
 
+async def _get_chat_member_cached(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    key = (int(chat_id), int(user_id))
+    now = time.monotonic()
+    cached = CHAT_MEMBER_CACHE.get(key)
+    if cached and cached[0] > now:
+        return cached[1]
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+    except TelegramError:
+        CHAT_MEMBER_CACHE[key] = (now + CHAT_MEMBER_ERROR_TTL, None)
+        return None
+    CHAT_MEMBER_CACHE[key] = (now + CHAT_MEMBER_CACHE_TTL, member)
+    if len(CHAT_MEMBER_CACHE) > 4096:
+        expired = [cache_key for cache_key, (expires, _member) in CHAT_MEMBER_CACHE.items() if expires <= now]
+        for cache_key in expired[:1024]:
+            CHAT_MEMBER_CACHE.pop(cache_key, None)
+    return member
+
+
+def _invalidate_chat_member_cache(chat_id: int):
+    for key in [cache_key for cache_key in CHAT_MEMBER_CACHE if cache_key[0] == int(chat_id)]:
+        CHAT_MEMBER_CACHE.pop(key, None)
+
+
 async def _is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     chat = update.effective_chat
     if not user or not chat:
         return False
-    try:
-        member = await context.bot.get_chat_member(chat.id, user.id)
-        return member.status in {"administrator", "creator"}
-    except TelegramError:
-        return False
+    member = await _get_chat_member_cached(chat.id, user.id, context)
+    return bool(member and member.status in {"administrator", "creator"})
 
 
 async def _require_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -409,24 +446,24 @@ async def _require_group_admin(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def _bot_can_restrict(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     global BOT_USER_ID
-    try:
-        if not BOT_USER_ID:
+    if not BOT_USER_ID:
+        try:
             BOT_USER_ID = (await context.bot.get_me()).id
-        member = await context.bot.get_chat_member(chat_id, BOT_USER_ID)
-        return member.status == "creator" or bool(getattr(member, "can_restrict_members", False))
-    except TelegramError:
-        return False
+        except TelegramError:
+            return False
+    member = await _get_chat_member_cached(chat_id, BOT_USER_ID, context)
+    return bool(member and (member.status == "creator" or getattr(member, "can_restrict_members", False)))
 
 
 async def _bot_can_delete(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     global BOT_USER_ID
-    try:
-        if not BOT_USER_ID:
+    if not BOT_USER_ID:
+        try:
             BOT_USER_ID = (await context.bot.get_me()).id
-        member = await context.bot.get_chat_member(chat_id, BOT_USER_ID)
-        return member.status == "creator" or bool(getattr(member, "can_delete_messages", False))
-    except TelegramError:
-        return False
+        except TelegramError:
+            return False
+    member = await _get_chat_member_cached(chat_id, BOT_USER_ID, context)
+    return bool(member and (member.status == "creator" or getattr(member, "can_delete_messages", False)))
 
 
 async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Target | None:
@@ -435,8 +472,10 @@ async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return None
     reply = message.reply_to_message
     if reply and reply.from_user and not reply.from_user.is_bot:
+        previous = KNOWN_USERS.get(int(reply.from_user.id))
         target = _remember_user_in_memory(reply.from_user)
-        await asyncio.to_thread(db.remember_user, target.user_id, target.username, target.full_name)
+        if previous != (target.username, target.full_name):
+            await asyncio.to_thread(db.remember_user, target.user_id, target.username, target.full_name)
         return target
 
     args = list(context.args or [])
@@ -449,10 +488,7 @@ async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return Target(user_id, username, full_name)
     if raw.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{5,32}", raw):
         username_key = raw[1:].lower()
-        uid = next(
-            (candidate_id for candidate_id, value in KNOWN_USERS.items() if value[0].lower() == username_key),
-            None,
-        )
+        uid = KNOWN_USERNAME_IDS.get(username_key)
         if uid is not None:
             username, full_name = KNOWN_USERS[uid]
             return Target(uid, username, full_name)
@@ -830,6 +866,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = change.new_chat_member.status
     if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
         return
+    _invalidate_chat_member_cache(chat.id)
     active = status not in {"left", "kicked"}
     if active:
         KNOWN_CHAT_IDS.add(chat.id)
@@ -899,7 +936,7 @@ def main():
         .token(BOT_TOKEN)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
-        .concurrent_updates(False)
+        .concurrent_updates(8)
         .build()
     )
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
@@ -916,7 +953,7 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_message), group=1)
     app.add_error_handler(error_handler)
     logger.info("Iniciando polling do Jtzin Bot API")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    app.run_polling(allowed_updates=ALLOWED_UPDATES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
