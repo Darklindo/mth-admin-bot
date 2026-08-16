@@ -8,7 +8,7 @@ A V9.0 possui duas superfícies independentes. O **Bot API** usa comandos com `/
 |---|---|---|
 | `/blacklist` | Registra o alvo na blacklist local do grupo atual e apaga mensagens dele enquanto o bot estiver ativo. Use respondendo à mensagem ou com ID/username conhecido. | Administrador do grupo |
 | `/banperm` | Bane permanentemente o alvo somente no grupo atual. Use respondendo à mensagem ou com ID/username conhecido. | Administrador do grupo |
-| `/allban` | Registra o alvo na lista global e tenta bani-lo em todos os grupos conhecidos do Bot API. | Somente `OWNER_ID` |
+| `/allban` | Registra o alvo na lista global e tenta bani-lo em todos os grupos conhecidos do Bot API. | Somente um dos `OWNER_IDS` |
 
 O Bot API precisa estar no grupo e possuir as permissões administrativas correspondentes. A função global não consegue operar em chats que o bot não conhece, não acessa ou onde não pode restringir membros. O banco do Bot API é separado do banco do Userbot.
 

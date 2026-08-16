@@ -59,7 +59,7 @@ O `.env.bot` deve conter:
 
 ```dotenv
 BOT_TOKEN=TOKEN_NOVO_GERADO_PELO_BOTFATHER
-OWNER_ID=SEU_ID_JT_CACIQUE
+OWNER_IDS=ID1,ID2
 ```
 
 Não use `@` nos IDs, não coloque espaços extras e não compartilhe esses arquivos. Os campos `SECOND_OWNER_ID` e `THIRD_OWNER_ID` não existem mais na V9.0.
@@ -79,17 +79,19 @@ Na primeira execução, o Telethon solicitará telefone, código do Telegram e, 
 
 O Bot API não exige login interativo: ele usará o token privado do `.env.bot` quando o supervisor for iniciado.
 
-## 6. Iniciar Bot API e Userbot juntos
+## 6. Iniciar somente o Bot API
+
+Enquanto o Userbot estiver desligado, use somente o supervisor abaixo:
 
 ```bash
 cd ~/mth-admin
-chmod +x update_bot.sh watchdog.sh watchdog_all.sh
+chmod +x watchdog_bot_only.sh update_bot_only.sh
 termux-wake-lock
-tmux new-session -d -s jtzin './watchdog_all.sh'
-tmux attach -t jtzin
+tmux kill-session -t jtzin 2>/dev/null || true
+tmux new-session -d -s jtzin './watchdog_bot_only.sh'
 ```
 
-O `watchdog_all.sh` inicia `bot.py` e `bot_v2.py` separadamente, reinicia cada processo com backoff próprio e grava os logs em arquivos distintos. Se o `.env.bot` estiver ausente, o Userbot pode iniciar e o Bot API ficará aguardando a configuração.
+O `watchdog_bot_only.sh` inicia `bot.py`, reinicia o Bot API com backoff e grava `logs/bot_api.log`. O `watchdog_all.sh` só deve ser usado quando o Userbot for reativado deliberadamente.
 
 Para sair da visualização sem encerrar os serviços, pressione `Ctrl+B` e depois `D`. Para retornar:
 
@@ -109,7 +111,7 @@ O Bot API usa comandos tradicionais com `/`:
 
 Responda à mensagem do alvo ou informe um ID numérico. Usernames só podem ser resolvidos quando o bot já os conhece ou quando foram registrados anteriormente. O bot precisa ser administrador do grupo com permissões adequadas.
 
-`/blacklist` é local ao grupo atual. `/banperm` também afeta somente o grupo atual. `/allban` é global e só pode ser executado pelo `OWNER_ID`; ele tenta aplicar banimento nos chats conhecidos em que o bot tenha acesso.
+`/blacklist` é local ao grupo atual. `/banperm` também afeta somente o grupo atual. `/allban` é global e só pode ser executado por um dos IDs configurados em `OWNER_IDS`; ele tenta aplicar banimento nos chats conhecidos em que o bot tenha acesso.
 
 ## 8. Comandos do Userbot
 
@@ -117,21 +119,19 @@ O Userbot usa o prefixo `.` e só aceita comandos enviados pelo `OWNER_ID`. Não
 
 A autorização de links, quando usada pelo proprietário, continua sendo uma configuração específica do AntiLink e não concede acesso ao Userbot. Os comandos que mantêm `.jt` por conflito com o Group Help são `.jtban`, `.jtmute`, `.jtdel`, `.jtdelwarn`, `.jtpurge`, `.jtpurgeall` e `.jtwarn`.
 
-## 9. Atualização segura
+## 9. Atualização segura do Bot API-only
 
 ```bash
 cd ~/mth-admin
-(tmux kill-session -t jtzin 2>/dev/null || true)
-git pull --ff-only origin master
-chmod +x update_bot.sh watchdog.sh watchdog_all.sh
-./update_bot.sh
+tmux kill-session -t jtzin 2>/dev/null || true
+./update_bot_only.sh
 termux-wake-lock
-tmux new-session -d -s jtzin './watchdog_all.sh'
+tmux new-session -d -s jtzin './watchdog_bot_only.sh'
 sleep 2
-tmux attach -t jtzin
+tmux list-sessions
 ```
 
-O atualizador interrompe o fluxo quando há alterações locais, instala dependências, compila `bot.py`, `bot_v2.py` e `migrate_db.py`, executa a migração idempotente e prepara os scripts de supervisão.
+O `update_bot_only.sh` instala dependências, compila somente `bot.py`, preserva o `.env.bot` local e não inicia o Userbot. O atualizador interrompe o fluxo quando existem alterações locais relevantes, para evitar sobrescrever trabalho.
 
 ## 10. Diagnóstico e logs
 
@@ -160,8 +160,10 @@ tmux kill-session -t jtzin
 | `.env.bot.example` | Modelo público do Bot API |
 | `.env` / `.env.bot` | Credenciais privadas |
 | `watchdog.sh` | Supervisor individual legado do Userbot |
-| `watchdog_all.sh` | Supervisor dos dois processos |
-| `update_bot.sh` | Atualização e validação |
+| `watchdog_all.sh` | Supervisor dos dois processos, somente quando o Userbot for reativado |
+| `watchdog_bot_only.sh` | Supervisor atual, somente do Bot API |
+| `update_bot.sh` | Atualização dos dois processos |
+| `update_bot_only.sh` | Atualização atual somente do Bot API |
 | `data/` | Bancos e dados privados |
 | `logs/` | Logs locais ignorados pelo Git |
 | `assets/exu/` | Assets do comando `.exu` |

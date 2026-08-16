@@ -73,7 +73,10 @@ OWNER_ID = min(OWNER_IDS)
 
 
 def _is_owner(user_id: int | None) -> bool:
-    return user_id is not None and int(user_id) in OWNER_IDS
+    try:
+        return int(user_id or 0) in OWNER_IDS
+    except (TypeError, ValueError):
+        return False
 
 DB_PATH = DATA_DIR / "bot_api.db"
 DELETE_AFTER_SECONDS = 5
@@ -85,6 +88,9 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
 )
 logger = logging.getLogger("jtzin-bot-api")
+# httpx inclui a URL completa nas mensagens INFO; para a Bot API isso exporia o token.
+for noisy_logger in ("httpx", "httpcore"):
+    logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
 
 @dataclass(frozen=True)
@@ -357,8 +363,6 @@ async def _is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat = update.effective_chat
     if not user or not chat:
         return False
-    if _is_owner(user.id):
-        return True
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
         return member.status in {"administrator", "creator"}
@@ -370,6 +374,7 @@ async def _require_group_admin(update: Update, context: ContextTypes.DEFAULT_TYP
     if not _is_group(update):
         await _reply_and_cleanup(update, "❌ Este comando só pode ser usado em grupos ou supergrupos.")
         return False
+    await _remember_message_context(update)
     if await _is_chat_admin(update, context):
         return True
     await _reply_and_cleanup(update, "⛔ Apenas administradores do grupo podem usar este comando.")
@@ -406,10 +411,14 @@ async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         username, full_name = KNOWN_USERS.get(user_id, ("", ""))
         return Target(user_id, username, full_name)
     if raw.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{5,32}", raw):
-        known = KNOWN_USERS.get(next((uid for uid, value in KNOWN_USERS.items() if value[0].lower() == raw[1:].lower()), 0), None)
-        if known:
-            uid = next(uid for uid, value in KNOWN_USERS.items() if value == known)
-            return Target(uid, known[0], known[1])
+        username_key = raw[1:].lower()
+        uid = next(
+            (candidate_id for candidate_id, value in KNOWN_USERS.items() if value[0].lower() == username_key),
+            None,
+        )
+        if uid is not None:
+            username, full_name = KNOWN_USERS[uid]
+            return Target(uid, username, full_name)
         row = await asyncio.to_thread(db.resolve_username, raw[1:])
         if row:
             return Target(int(row["user_id"]), row.get("username", ""), row.get("full_name", ""))
@@ -557,6 +566,8 @@ async def cmd_allban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not _is_owner(update.effective_user.id):
         await _reply_and_cleanup(update, "⛔ Este comando é exclusivo do proprietário configurado.")
         return
+    if _is_group(update):
+        await _remember_message_context(update)
     target = await _resolve_target(update, context)
     if target is None:
         await _reply_and_cleanup(update, _target_error("allban"))
@@ -677,7 +688,7 @@ def main():
     app.add_handler(CommandHandler("blacklist", cmd_blacklist))
     app.add_handler(CommandHandler("banperm", cmd_banperm))
     app.add_handler(CommandHandler("allban", cmd_allban))
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, on_group_message), group=1)
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_message), group=1)
     app.add_error_handler(error_handler)
     logger.info("Iniciando polling do Jtzin Bot API")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)

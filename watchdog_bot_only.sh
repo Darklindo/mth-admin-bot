@@ -29,7 +29,9 @@ shutdown() {
     stop_requested=1
     log "Encerrando somente o Bot API..."
     stop_bot "$botapi_pid"
-    wait "$botapi_pid" 2>/dev/null || true
+    if [[ -n "$botapi_pid" ]]; then
+        wait "$botapi_pid" 2>/dev/null || true
+    fi
     exit 0
 }
 trap shutdown INT TERM
@@ -40,18 +42,24 @@ start_botapi() {
         return 1
     fi
     if [[ ! -f ".env.bot" ]]; then
-        log "Arquivo .env.bot ausente; Bot API aguardará a configuração local."
+        log "Arquivo .env.bot ausente; nova tentativa em ${delay}s."
         return 1
     fi
     log "Iniciando somente o Bot API; Userbot permanece desligado."
     .venv/bin/python -u bot.py >>logs/bot_api.log 2>&1 &
     botapi_pid=$!
+    return 0
 }
 
-start_botapi || exit 1
-
 while [[ "$stop_requested" -eq 0 ]]; do
-    if [[ -n "$botapi_pid" ]] && ! kill -0 "$botapi_pid" 2>/dev/null; then
+    if [[ -z "$botapi_pid" ]]; then
+        if start_botapi; then
+            delay=5
+        else
+            sleep "$delay"
+            (( delay < 60 )) && delay=$((delay * 2))
+        fi
+    elif ! kill -0 "$botapi_pid" 2>/dev/null; then
         code=0
         wait "$botapi_pid" 2>/dev/null || code=$?
         botapi_pid=""
@@ -61,7 +69,6 @@ while [[ "$stop_requested" -eq 0 ]]; do
         log "Bot API encerrou com código ${code}; reinício em ${delay}s."
         sleep "$delay"
         (( delay < 60 )) && delay=$((delay * 2))
-        start_botapi || true
     else
         delay=5
     fi

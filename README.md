@@ -8,7 +8,7 @@ Projeto de administração para Telegram com dois processos independentes no Ter
 
 | Processo | Arquivo | Prefixo | Acesso | Banco |
 |---|---|---|---|---|
-| Bot comum | `bot.py` | `/` | Administradores dos grupos; `.allban` exige o proprietário | `data/bot_api.db` |
+| Bot comum | `bot.py` | `/` | Administradores dos grupos; `/allban` exige um dos proprietários | `data/bot_api.db` |
 | Userbot | `bot_v2.py` | `.` | Somente o `OWNER_ID` configurado | `data/bot.db` |
 
 O Bot API e o Userbot não compartilham sessão, token, banco nem estado de autorização. O Userbot não possui mais subproprietários ou autorização delegada; os comandos `.autorizar`, `.desautorizar` e `.listauth` não fazem parte da superfície operacional da V9.0.
@@ -21,7 +21,7 @@ O bot comum possui somente estas funções:
 |---|---|---|
 | `/blacklist` | Cadastra o alvo na blacklist local do grupo e apaga as mensagens dele enquanto o bot estiver ativo | Administrador do grupo |
 | `/banperm` | Bane permanentemente o alvo no grupo atual | Administrador do grupo |
-| `/allban` | Registra o alvo na blacklist global e tenta bani-lo em todos os grupos conhecidos | Somente `OWNER_ID` |
+| `/allban` | Registra o alvo na blacklist global e tenta bani-lo em todos os grupos conhecidos | Somente um dos `OWNER_IDS` |
 
 O alvo pode ser informado respondendo à mensagem dele ou usando um ID numérico ou username previamente conhecido pelo bot. O banco mantém a lista por chat e o Bot API possui cache próprio. O bot precisa estar presente e ter permissões administrativas para apagar mensagens ou restringir usuários; o `/allban` só pode alcançar grupos nos quais ele esteja presente e autorizado.
 
@@ -60,26 +60,28 @@ API_HASH=SEU_API_HASH
 OWNER_ID=SEU_ID_JT_CACIQUE
 ```
 
-O arquivo `.env.bot` deve conter um token novo do BotFather e o mesmo proprietário:
+O arquivo `.env.bot` deve conter o token do BotFather e os dois proprietários do Bot API:
 
 ```dotenv
 BOT_TOKEN=COLE_UM_TOKEN_NOVO_DO_BOTFATHER
-OWNER_ID=SEU_ID_JT_CACIQUE
+OWNER_IDS=ID1,ID2
 ```
 
 Nunca substitua os valores de exemplo por credenciais dentro de arquivos versionados. `.env`, `.env.bot`, sessões, bancos, logs e arquivos de pesquisa são ignorados pelo Git.
 
-## Inicialização dos dois processos
+## Inicialização atual: somente Bot API
+
+Enquanto o Userbot estiver desligado, use exclusivamente o supervisor Bot API-only:
 
 ```bash
 cd ~/mth-admin
-chmod +x update_bot.sh watchdog.sh watchdog_all.sh
+chmod +x watchdog_bot_only.sh update_bot_only.sh
 termux-wake-lock
-tmux new-session -d -s jtzin './watchdog_all.sh'
-tmux attach -t jtzin
+tmux kill-session -t jtzin 2>/dev/null || true
+tmux new-session -d -s jtzin './watchdog_bot_only.sh'
 ```
 
-O `watchdog_all.sh` inicia o Bot API e o Userbot como processos separados, grava logs independentes em `logs/bot_api.log` e `logs/userbot.log` e aplica backoff de reinício individual. Se `.env.bot` ainda não existir, o Userbot pode iniciar enquanto o Bot API aguarda a configuração segura.
+O `watchdog_bot_only.sh` inicia apenas `bot.py`, grava o log em `logs/bot_api.log` e reinicia o Bot API com backoff. O `watchdog_all.sh` só deve ser usado quando o Userbot for reativado deliberadamente.
 
 Para sair da sessão sem encerrar os processos, use `Ctrl+B` e depois `D`. Para retornar:
 
@@ -87,21 +89,17 @@ Para sair da sessão sem encerrar os processos, use `Ctrl+B` e depois `D`. Para 
 tmux attach -t jtzin
 ```
 
-## Atualização
+## Atualização Bot API-only
 
 ```bash
 cd ~/mth-admin && \
-(tmux kill-session -t jtzin 2>/dev/null || true) && \
-git pull --ff-only origin master && \
-chmod +x update_bot.sh watchdog.sh watchdog_all.sh && \
-./update_bot.sh && \
+tmux kill-session -t jtzin 2>/dev/null || true && \
+./update_bot_only.sh && \
 termux-wake-lock && \
-tmux new-session -d -s jtzin './watchdog_all.sh' && \
-sleep 2 && \
-tmux attach -t jtzin
+tmux new-session -d -s jtzin './watchdog_bot_only.sh'
 ```
 
-O script instala as dependências, compila `bot.py`, `bot_v2.py` e `migrate_db.py`, executa a migração idempotente do Userbot e deixa os dois serviços prontos para o supervisor.
+O `update_bot_only.sh` instala as dependências, compila somente `bot.py`, preserva o `.env.bot` local e deixa apenas o Bot API pronto para o supervisor. Ele não inicia nem migra o Userbot.
 
 ## Diagnóstico e segurança
 
