@@ -359,6 +359,31 @@ def _safe_html(text: str) -> str:
     return escape(str(text or ""))
 
 
+def _track_task(coro):
+    task = asyncio.create_task(coro)
+    _cleanup_tasks.add(task)
+    task.add_done_callback(_cleanup_tasks.discard)
+    return task
+
+
+async def _delete_now(message):
+    try:
+        await message.delete()
+    except (BadRequest, Forbidden, TelegramError):
+        return False
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("Falha inesperada ao apagar mensagem imediatamente", exc_info=True)
+        return False
+    return True
+
+
+def _schedule_delete_now(message):
+    if message is not None:
+        _track_task(_delete_now(message))
+
+
 def _schedule_delete(message, delay: int = DELETE_AFTER_SECONDS):
     if message is None:
         return
@@ -374,9 +399,7 @@ def _schedule_delete(message, delay: int = DELETE_AFTER_SECONDS):
         except Exception:
             logger.debug("Falha inesperada ao apagar mensagem agendada", exc_info=True)
 
-    task = asyncio.create_task(worker())
-    _cleanup_tasks.add(task)
-    task.add_done_callback(_cleanup_tasks.discard)
+    _track_task(worker())
 
 
 async def _reply_and_cleanup(update: Update, text: str, *, parse_mode: str | None = "HTML"):
@@ -887,17 +910,20 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not message or not user or not chat or user.is_bot:
         return
-    await _remember_message_context(update)
-    target = _remember_user_in_memory(user)
-    user_id = target.user_id
 
-    # Allban tem prioridade e tenta reforçar o banimento em chats onde o bot foi adicionado depois.
+    # Fast path: decidir apenas com estruturas em memória antes de qualquer SQLite/RPC auxiliar.
+    user_id = int(user.id)
     if user_id in ALLBAN_CACHE and not _is_owner(user_id):
-        await _safe_delete(message)
-        await _ban_in_chat(context, chat.id, target)
+        target = _remember_user_in_memory(user)
+        _schedule_delete_now(message)
+        _track_task(_ban_in_chat(context, chat.id, target))
         return
     if user_id in BANPERM_CACHE.get(chat.id, set()) or user_id in BLACKLIST_CACHE.get(chat.id, set()):
-        await _safe_delete(message)
+        _schedule_delete_now(message)
+        return
+
+    # Mensagens normais podem atualizar contexto e persistência sem atrasar a exclusão do fast path.
+    await _remember_message_context(update)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
