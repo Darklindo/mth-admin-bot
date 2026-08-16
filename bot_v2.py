@@ -3409,6 +3409,39 @@ async def get_active_temporary_punishment(chat_id, user_id, action):
     return record, False
 
 
+def _classify_chat_status(permissions):
+    """Classifica o estado real do participante sem confundir saída com banimento.
+
+    ``ChannelParticipantLeft`` indica que a pessoa saiu do chat; somente
+    ``is_banned`` ou ``ChannelParticipantBanned`` deve produzir ``Banido``.
+    Direitos de envio revogados produzem ``Silenciado`` quando o participante
+    continua presente. O helper é deliberadamente puro para ser reutilizado
+    por comandos e testes sem adicionar RPC ao caminho quente.
+    """
+    if permissions is None:
+        return "Indisponível"
+
+    participant = getattr(permissions, "participant", None)
+    participant_type = type(participant).__name__ if participant is not None else ""
+
+    if bool(getattr(permissions, "is_creator", False)) or participant_type == "ChannelParticipantCreator":
+        return "Criador"
+    if bool(getattr(permissions, "is_admin", False)) or participant_type == "ChannelParticipantAdmin":
+        return "Administrador"
+    if bool(getattr(permissions, "is_banned", False)) or participant_type == "ChannelParticipantBanned":
+        return "Banido"
+    if participant_type == "ChannelParticipantLeft":
+        return "Saiu do chat"
+
+    banned_rights = getattr(participant, "banned_rights", None)
+    if banned_rights is None:
+        banned_rights = getattr(permissions, "banned_rights", None)
+    send_messages = getattr(permissions, "send_messages", None)
+    if send_messages is False or bool(getattr(banned_rights, "send_messages", False)):
+        return "Silenciado"
+    return "Membro"
+
+
 async def get_telegram_restriction_state(chat_id, user_id):
     """Lê restrições atuais apenas sob demanda de um comando de moderação."""
     if not callable(getattr(client, "get_permissions", None)):
@@ -5871,26 +5904,16 @@ async def cmd_infojt(event):
         try:
             permissions = await client.get_permissions(event.chat_id, target_id)
             participant = getattr(permissions, "participant", None)
-            participant_type = type(participant).__name__
-            if bool(getattr(permissions, "is_creator", False)) or participant_type == "ChannelParticipantCreator":
-                chat_status = "Criador"
-            elif bool(getattr(permissions, "is_admin", False)) or participant_type == "ChannelParticipantAdmin":
-                chat_status = "Administrador"
-            elif bool(getattr(permissions, "is_banned", False)) or participant_type in {
-                "ChannelParticipantBanned",
-                "ChannelParticipantLeft",
-            }:
-                chat_status = "Banido"
-            elif getattr(permissions, "send_messages", True) is False:
-                chat_status = "Silenciado"
-            else:
-                chat_status = "Membro"
+            chat_status = _classify_chat_status(permissions)
 
             joined_at = getattr(participant, "date", None)
             if isinstance(joined_at, datetime):
                 join_label = joined_at.strftime("%d/%m/%Y %H:%M")
             elif joined_at:
                 join_label = format_timestamp(joined_at)
+        except UserNotParticipantError:
+            chat_status = "Não participa do chat"
+            join_label = "Indisponível"
         except Exception as exc:
             logger.debug("Não foi possível consultar permissões do .infojt para %s/%s: %s", event.chat_id, target_id, exc)
 
