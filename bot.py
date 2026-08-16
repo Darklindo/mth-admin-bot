@@ -858,7 +858,7 @@ def main():
     app.add_handler(CommandHandler("unbanperm", cmd_unbanperm))
     app.add_handler(CommandHandler("allban", cmd_allban))
     app.add_handler(CommandHandler("unallban", cmd_unallban))
-    app.add_handler(MessageHandler(filters.ChatType.ALL & filters.Regex(DOT_COMMAND_RE), on_dot_command))
+    app.add_handler(MessageHandler(filters.Regex(DOT_COMMAND_RE), on_dot_command))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_message), group=1)
     app.add_error_handler(error_handler)
     logger.info("Iniciando polling do Jtzin Bot API")
