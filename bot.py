@@ -399,9 +399,11 @@ async def _require_group_admin(update: Update, context: ContextTypes.DEFAULT_TYP
         await _reply_and_cleanup(update, "❌ Este comando só pode ser usado em grupos ou supergrupos.")
         return False
     await _remember_message_context(update)
+    if update.effective_user and _is_owner(update.effective_user.id):
+        return True
     if await _is_chat_admin(update, context):
         return True
-    await _reply_and_cleanup(update, "⛔ Apenas administradores do grupo podem usar este comando.")
+    await _reply_and_cleanup(update, "⛔ Apenas administradores do grupo ou os proprietários configurados podem usar este comando.")
     return False
 
 
@@ -412,6 +414,17 @@ async def _bot_can_restrict(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
             BOT_USER_ID = (await context.bot.get_me()).id
         member = await context.bot.get_chat_member(chat_id, BOT_USER_ID)
         return member.status == "creator" or bool(getattr(member, "can_restrict_members", False))
+    except TelegramError:
+        return False
+
+
+async def _bot_can_delete(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    global BOT_USER_ID
+    try:
+        if not BOT_USER_ID:
+            BOT_USER_ID = (await context.bot.get_me()).id
+        member = await context.bot.get_chat_member(chat_id, BOT_USER_ID)
+        return member.status == "creator" or bool(getattr(member, "can_delete_messages", False))
     except TelegramError:
         return False
 
@@ -507,9 +520,44 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/banperm</code> ou <code>.banperm</code> — bane permanentemente o alvo deste grupo.\n"
         "<code>/unbanperm</code> ou <code>.unbanperm</code> — remove o banimento deste grupo.\n"
         "<code>/allban</code> ou <code>.allban</code> — o proprietário bane o alvo nos grupos registrados.\n"
-        "<code>/unallban</code> ou <code>.unallban</code> — remove o allban global e tenta desbanir o alvo.\n\n"
-        "Use respondendo à mensagem do alvo ou informe o ID. O bot precisa ser administrador "
+        "<code>/unallban</code> ou <code>.unallban</code> — remove o allban global e tenta desbanir o alvo.\n"
+        "<code>/latency</code> ou <code>.latency</code> — mede uma chamada real à API do Telegram.\n\n"
+        "Use respondendo à mensagem do alvo ou informe o ID. Os proprietários configurados podem usar "
+        "a moderação local mesmo sem serem administradores do grupo; o bot ainda precisa ser administrador "
         "com permissão para apagar mensagens e restringir membros. Os comandos allban são exclusivos dos proprietários.",
+    )
+
+
+async def _require_operator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if user and _is_owner(user.id):
+        return True
+    if _is_group(update) and await _is_chat_admin(update, context):
+        return True
+    await _reply_and_cleanup(update, "⛔ Este diagnóstico está disponível aos administradores do grupo e aos proprietários configurados.")
+    return False
+
+
+async def cmd_latency(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_operator(update, context):
+        return
+    started = time.perf_counter()
+    try:
+        await context.bot.get_me()
+        api_ms = (time.perf_counter() - started) * 1000
+        api_status = f"✅ disponível ({api_ms:.0f} ms)"
+    except TelegramError as exc:
+        api_ms = None
+        api_status = f"❌ indisponível ({type(exc).__name__})"
+    total_ms = (time.perf_counter() - started) * 1000
+    await _reply_and_cleanup(
+        update,
+        "⚡ <b>Diagnóstico de latência — Bot API</b>\n\n"
+        f"• API Telegram: {api_status}\n"
+        f"• Tempo total: <code>{total_ms:.0f} ms</code>\n"
+        "• Polling: ✅ processo monitorado pelo watchdog\n"
+        "• Userbot: ⏸️ desligado\n"
+        "\nO valor mede uma chamada real à API no momento do diagnóstico.",
     )
 
 
@@ -530,7 +578,7 @@ async def cmd_unblacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_and_cleanup(update, f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) removido da blacklist local.")
 
 
-DOT_COMMAND_RE = re.compile(r"^\.(unblacklist|unbanperm|unallban|blacklist|banperm|allban)(?:\s+.*)?$", re.IGNORECASE)
+DOT_COMMAND_RE = re.compile(r"^\.(unblacklist|unbanperm|unallban|blacklist|banperm|allban|latency)(?:\s+.*)?$", re.IGNORECASE)
 DOT_COMMANDS = {
     "blacklist": "cmd_blacklist",
     "unblacklist": "cmd_unblacklist",
@@ -538,6 +586,7 @@ DOT_COMMANDS = {
     "unbanperm": "cmd_unbanperm",
     "allban": "cmd_allban",
     "unallban": "cmd_unallban",
+    "latency": "cmd_latency",
 }
 
 
@@ -572,6 +621,9 @@ async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_and_cleanup(update, "❌ O proprietário não pode ser colocado na blacklist.")
         return
     chat_id = update.effective_chat.id
+    if not await _bot_can_delete(chat_id, context):
+        await _reply_and_cleanup(update, "❌ O bot precisa ser administrador com permissão para apagar mensagens neste grupo.")
+        return
     if target.user_id in BLACKLIST_CACHE[chat_id]:
         await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> já está na blacklist deste grupo.")
         return
@@ -827,6 +879,7 @@ async def post_init(app: Application):
             BotCommand("unbanperm", "Remover o banimento do grupo"),
             BotCommand("allban", "Banir em todos os grupos — proprietário"),
             BotCommand("unallban", "Remover o allban — proprietário"),
+            BotCommand("latency", "Medir latência da API"),
         ]
     )
     logger.info("Jtzin Bot API online; proprietários=%s", ",".join(str(owner_id) for owner_id in sorted(OWNER_IDS)))
@@ -858,6 +911,7 @@ def main():
     app.add_handler(CommandHandler("unbanperm", cmd_unbanperm))
     app.add_handler(CommandHandler("allban", cmd_allban))
     app.add_handler(CommandHandler("unallban", cmd_unallban))
+    app.add_handler(CommandHandler("latency", cmd_latency))
     app.add_handler(MessageHandler(filters.Regex(DOT_COMMAND_RE), on_dot_command))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_message), group=1)
     app.add_error_handler(error_handler)

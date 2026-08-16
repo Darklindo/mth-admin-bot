@@ -143,7 +143,7 @@ tail -f ~/mth-admin/logs/bot_api.log
 tail -f ~/mth-admin/logs/userbot.log
 ```
 
-O Userbot oferece `.status`, `.health` e `.latency`. Para interromper os dois processos:
+O Bot API oferece `/latency` e `.latency` para proprietários e administradores de grupo. O Userbot oferece `.status`, `.health` e `.latency` quando for reativado. Para interromper o processo atual do Bot API:
 
 ```bash
 tmux kill-session -t jtzin
