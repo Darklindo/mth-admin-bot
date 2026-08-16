@@ -105,7 +105,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V8.2"
+VERSION = "V8.3"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 TELETHON_LOG_LEVEL = os.getenv("TELETHON_LOG_LEVEL", "WARNING").upper()
 
@@ -1694,6 +1694,21 @@ def is_authorized(user_id: int) -> bool:
         return False
     expires_at = cache.authorized_expirations.get(user_id)
     return expires_at is None or expires_at > int(time.time())
+
+
+def is_outgoing_event(event) -> bool:
+    """Identifica mensagens enviadas pela própria sessão sem depender do sender_id."""
+    return bool(getattr(event, "out", False))
+
+
+def is_owner_event(event) -> bool:
+    """Permite comandos de proprietário à sessão local ou aos proprietários configurados."""
+    return is_outgoing_event(event) or is_owner(getattr(event, "sender_id", 0))
+
+
+def is_authorized_event(event) -> bool:
+    """Aceita a sessão local, proprietários e usuários autorizados nos handlers."""
+    return is_owner_event(event) or is_authorized(getattr(event, "sender_id", 0))
 
 
 ADMIN_CACHE_TTL = _env_int("ADMIN_CACHE_TTL", 180, 10, 900)
@@ -3292,7 +3307,7 @@ async def antispam_filter(event):
 # --- COMANDOS ---
 
 
-@client.on(events.NewMessage(pattern=r'^\.salvar(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.salvar(?:\s|$)', func=is_owner_event))
 async def cmd_salvar(event):
     status = await begin_fast_response(event, "⏳ Salvando o perfil atual com segurança...", label="status do salvar")
     try:
@@ -3313,7 +3328,7 @@ async def cmd_salvar(event):
         await finish_fast_response(event, status, "❌ Não foi possível salvar o perfil com segurança. Nenhuma alteração foi aplicada.", label="erro do salvar")
 
 
-@client.on(events.NewMessage(pattern=r'^\.clonar(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.clonar(?:\s|$)', func=is_owner_event))
 async def cmd_clonar(event):
     wants_username = _profile_clone_username_requested(event)
     if wants_username and not _profile_clone_confirmation_requested(event):
@@ -3364,7 +3379,7 @@ async def cmd_clonar(event):
             logger.debug("Não foi possível remover a foto temporária da clonagem")
 
 
-@client.on(events.NewMessage(pattern=r'^\.restaurar(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.restaurar(?:\s|$)', func=is_owner_event))
 async def cmd_restaurar(event):
     status = await begin_fast_response(event, "⏳ Restaurando o perfil original salvo...", label="status do restaurar")
     try:
@@ -3397,7 +3412,7 @@ async def maintenance_filter(event):
     raise events.StopPropagation
 
 
-@client.on(events.NewMessage(pattern=r'^\.maintenance(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.maintenance(?:\s|$)', func=is_owner_event))
 async def cmd_maintenance(event):
     args = (event.raw_text or "").split()
     if len(args) < 2 or args[1].lower() not in {"on", "off", "1", "0"}:
@@ -3413,7 +3428,7 @@ async def cmd_maintenance(event):
     await reply_or_edit(event, f"🛠️ Modo manutenção <b>{'ATIVADO' if enabled else 'DESATIVADO'}</b>.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.lock(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.lock(?:\s|$)', func=is_authorized_event))
 async def cmd_lock(event):
     if not (event.is_group or event.is_channel):
         await reply_or_edit(event, "❌ O lock só pode ser usado em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
@@ -3450,7 +3465,7 @@ async def cmd_lock(event):
         await reply_or_edit(event, "❌ Não foi possível bloquear o grupo com segurança.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.unlock(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.unlock(?:\s|$)', func=is_authorized_event))
 async def cmd_unlock(event):
     if not (event.is_group or event.is_channel):
         await reply_or_edit(event, "❌ O unlock só pode ser usado em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
@@ -3489,7 +3504,7 @@ async def cmd_unlock(event):
         await reply_or_edit(event, "❌ Não foi possível desbloquear o grupo com segurança.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.quarantine(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.quarantine(?:\s|$)', func=is_authorized_event))
 async def cmd_quarantine(event):
     if not await require_chat_admin(event, "alterar a quarentena"):
         return
@@ -3510,7 +3525,7 @@ async def cmd_quarantine(event):
     await reply_or_edit(event, f"🛡️ Quarentena antispam <b>{'ATIVADA' if enabled else 'DESATIVADA'}</b> neste chat.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.antispam(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.antispam(?:\s|$)', func=is_authorized_event))
 async def cmd_antispam_new(event):
     if not await require_chat_admin(event, "alterar o antispam"):
         return
@@ -3531,7 +3546,7 @@ async def cmd_antispam_new(event):
     await reply_or_edit(event, f"🛡️ Antispam <b>{'ATIVADO' if enabled else 'DESATIVADO'}</b> neste chat.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.pinned(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.pinned(?:\s|$)', func=is_authorized_event))
 async def cmd_pinned(event):
     if not await require_chat_admin(event, "alterar a proteção de mensagens fixadas"):
         return
@@ -3552,7 +3567,7 @@ async def cmd_pinned(event):
     await reply_or_edit(event, f"📌 Proteção de mensagens fixadas <b>{'ATIVADA' if enabled else 'DESATIVADA'}</b>.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.antilink(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.antilink(?:\s|$)', func=is_authorized_event))
 async def cmd_antilink(event):
     if not (event.is_group or event.is_channel):
         await reply_or_edit(event, "❌ O antilink só pode ser configurado em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
@@ -3585,7 +3600,7 @@ async def cmd_antilink(event):
     )
 
 
-@client.on(events.NewMessage(pattern=r'^\.autorizarlink(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.autorizarlink(?:\s|$)', func=is_authorized_event))
 async def cmd_autorizarlink(event):
     if not (event.is_group or event.is_channel):
         await reply_or_edit(event, "❌ A autorização de links só pode ser configurada em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
@@ -3613,7 +3628,7 @@ async def cmd_autorizarlink(event):
     )
 
 
-@client.on(events.NewMessage(pattern=r'^\.desautorizarlink(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.desautorizarlink(?:\s|$)', func=is_authorized_event))
 async def cmd_desautorizarlink(event):
     if not (event.is_group or event.is_channel):
         await reply_or_edit(event, "❌ A autorização de links só pode ser configurada em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
@@ -3641,7 +3656,7 @@ async def cmd_desautorizarlink(event):
     )
 
 
-@client.on(events.NewMessage(pattern=r'^\.listlinkauth(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.listlinkauth(?:\s|$)', func=is_authorized_event))
 async def cmd_listlinkauth(event):
     if not (event.is_group or event.is_channel):
         await reply_or_edit(event, "❌ A whitelist de links só pode ser consultada em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
@@ -3661,7 +3676,7 @@ async def cmd_listlinkauth(event):
     await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtdel(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.jtdel(?:\s|$)', func=is_authorized_event))
 async def cmd_del(event):
     target = await resolve_message_for_delete(event)
     if target is None or getattr(target, "id", None) == getattr(event, "id", None):
@@ -3676,7 +3691,7 @@ async def cmd_del(event):
     await reply_or_edit(event, "❌ Não foi possível apagar a mensagem. Verifique minhas permissões neste chat.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtwarn(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.jtwarn(?:\s|$)', func=is_authorized_event))
 async def cmd_warn(event):
     target_id = await get_target_from_event(event)
     _, _, reason = parse_moderation_options(event)
@@ -3710,7 +3725,7 @@ async def cmd_warn(event):
     await reply_or_edit(event, f"⚠️ <b>{user_info}</b> (<code>{target_id}</code>): {result}.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtdelwarn(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.jtdelwarn(?:\s|$)', func=is_authorized_event))
 async def cmd_delwarn(event):
     target = await event.get_reply_message() if getattr(event, "is_reply", False) else None
     target_id = int(getattr(target, "sender_id", 0) or 0) if target is not None else 0
@@ -3753,7 +3768,7 @@ async def cmd_delwarn(event):
     await reply_or_edit(event, f"🗑️⚠️ Mensagem de <b>{user_info}</b> apagada e advertência aplicada: {result}.", delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.unwarn(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.unwarn(?:\s|$)', func=is_authorized_event))
 async def cmd_unwarn(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -3779,7 +3794,7 @@ async def cmd_unwarn(event):
     await reply_or_edit(event, result, delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.clearwarns(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.clearwarns(?:\s|$)', func=is_authorized_event))
 async def cmd_clearwarns(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -3801,7 +3816,7 @@ async def cmd_clearwarns(event):
     await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
 
 
-@client.on(events.NewMessage(pattern=r'^\.warns(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.warns(?:\s|$)', func=is_authorized_event))
 async def cmd_warns(event):
     rows = await asyncio.to_thread(db.get_warnings_report, event.chat_id)
     if not rows:
@@ -3816,12 +3831,12 @@ async def cmd_warns(event):
     await reply_or_edit(event, text, delete_after=15)
 
 
-@client.on(events.NewMessage(pattern=r'^\.start(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.start(?:\s|$)', func=is_authorized_event))
 async def cmd_start(event):
     text = f"🛡️ <b>Jtzin Userbot {VERSION} (Status e Health)</b>\n\nEquipe Diamond — Operacional."
     await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.antiblack(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.antiblack(?:\s|$)', func=is_authorized_event))
 async def cmd_antiblack(event):
     if not await require_chat_admin(event, "alterar o Modo Fênix"):
         return
@@ -3851,7 +3866,7 @@ async def cmd_antiblack(event):
     else:
         await reply_or_edit(event, "❌ Use <code>.antiblack on</code> ou <code>.antiblack off</code>", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.kick(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.kick(?:\s|$)', func=is_authorized_event))
 async def cmd_kick(event):
     status_message = await begin_fast_response(
         event,
@@ -3903,7 +3918,7 @@ async def cmd_kick(event):
         logger.exception("Erro ao aplicar .kick")
         await finish_fast_response(event, status_message, f"❌ Erro ao expulsar: {exc}", label="erro do kick")
 
-@client.on(events.NewMessage(pattern=r'^\.jtban(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.jtban(?:\s|$)', func=is_authorized_event))
 async def cmd_ban(event):
     # O status é mostrado antes da resolução de reply/username, que também pode
     # exigir um RPC. Assim o usuário recebe retorno visual imediatamente.
@@ -4023,7 +4038,7 @@ async def cmd_ban(event):
         logger.exception("Erro ao aplicar .jtban")
         await finish_fast_response(event, status_message, f"❌ Erro ao banir: {e}", label="erro do ban")
 
-@client.on(events.NewMessage(pattern=r'^\.unban(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.unban(?:\s|$)', func=is_authorized_event))
 async def cmd_unban(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -4074,7 +4089,7 @@ async def cmd_unban(event):
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao desbanir: {e}", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.jtmute(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.jtmute(?:\s|$)', func=is_authorized_event))
 async def cmd_mute(event):
     status_message = await begin_fast_response(
         event,
@@ -4166,7 +4181,7 @@ async def cmd_mute(event):
         logger.exception("Erro ao aplicar .jtmute")
         await finish_fast_response(event, status_message, f"❌ Erro ao silenciar: {exc}", label="erro do mute")
 
-@client.on(events.NewMessage(pattern=r'^\.unmute(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.unmute(?:\s|$)', func=is_authorized_event))
 async def cmd_unmute(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -4196,7 +4211,7 @@ async def cmd_unmute(event):
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao desmutar: {e}", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.blacklist(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.blacklist(?:\s|$)', func=is_authorized_event))
 async def cmd_blacklist(event):
     target_id = await get_target_from_event(event)
     duration, _, reason = parse_moderation_options(event)
@@ -4219,7 +4234,7 @@ async def cmd_blacklist(event):
     queue_audit_log(event.chat_id, target_id, "Ação: Blacklist Local", "Moderação", admin_id=event.sender_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist local ({duration_label(duration)}).", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.unblacklist(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.unblacklist(?:\s|$)', func=is_authorized_event))
 async def cmd_unblacklist(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -4241,7 +4256,7 @@ async def cmd_unblacklist(event):
     user_info = await asyncio.to_thread(db.get_user_info, target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido da blacklist local deste chat.", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.banperm(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.banperm(?:\s|$)', func=is_authorized_event))
 async def cmd_banperm(event):
     target_id = await get_target_from_event(event)
     duration, purge_limit, reason = parse_moderation_options(event, allow_purge=True)
@@ -4291,7 +4306,7 @@ async def cmd_banperm(event):
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao banir: {e}", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.unbanperm(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.unbanperm(?:\s|$)', func=is_authorized_event))
 async def cmd_unbanperm(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -4338,7 +4353,7 @@ async def cmd_unbanperm(event):
     except Exception as e:
         await reply_or_edit(event, f"❌ Erro ao desbanir: {e}", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.shadow(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.shadow(?:\s|$)', func=is_authorized_event))
 async def cmd_shadow(event):
     target_id = await get_target_from_event(event)
     duration, _, reason = parse_moderation_options(event)
@@ -4361,7 +4376,7 @@ async def cmd_shadow(event):
     queue_audit_log(event.chat_id, target_id, "Ação: Shadow Ban", "Moderação", admin_id=event.sender_id)
     await reply_or_edit(event, f"🌑 {user_info} (<code>{target_id}</code>) em Shadow Ban (mensagens serão apagadas globalmente).", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.unshadow(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.unshadow(?:\s|$)', func=is_authorized_event))
 async def cmd_unshadow(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -4449,7 +4464,7 @@ async def _apply_allban_to_chat(chat, target_id, expires_at, purge_limit, includ
             return False, type(exc).__name__
 
 
-@client.on(events.NewMessage(pattern=r'^\.allban(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.allban(?:\s|$)', func=is_owner_event))
 async def cmd_allban(event):
     status = await begin_fast_response(
         event,
@@ -4573,7 +4588,7 @@ async def cmd_allban(event):
         result_text += f" Limpeza opcional com falhas parciais: {partial_cleanup}."
     await finish_fast_response(event, status, result_text, label="resultado do allban")
 
-@client.on(events.NewMessage(pattern=r'^\.allblack(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.allblack(?:\s|$)', func=is_owner_event))
 async def cmd_allblack(event):
     target_id = await get_target_from_event(event)
     duration, _, reason = parse_moderation_options(event)
@@ -4595,7 +4610,7 @@ async def cmd_allblack(event):
     queue_audit_log(event.chat_id, target_id, "Ação: Allblack Global", "Moderação Global", admin_id=event.sender_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) em blacklist global.", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.unallblack(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.unallblack(?:\s|$)', func=is_owner_event))
 async def cmd_unallblack(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -4628,7 +4643,7 @@ async def cmd_unallblack(event):
     user_info = await asyncio.to_thread(db.get_user_info, target_id)
     await reply_or_edit(event, f"✅ {user_info} (<code>{target_id}</code>) removido da blacklist global.", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.autorizar(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.autorizar(?:\s|$)', func=is_owner_event))
 async def cmd_autorizar(event):
     target_id, duration = await get_authorization_target_and_expiry(event)
     if not target_id:
@@ -4659,7 +4674,7 @@ async def cmd_autorizar(event):
         delete_after=5,
     )
 
-@client.on(events.NewMessage(pattern=r'^\.desautorizar(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.desautorizar(?:\s|$)', func=is_owner_event))
 async def cmd_desautorizar(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -4683,7 +4698,7 @@ async def cmd_desautorizar(event):
     queue_audit_log(event.chat_id, target_id, "Ação: Desautorizar", "Controle", admin_id=event.sender_id)
     await reply_or_edit(event, f"❌ Acesso revogado para {user_info} (<code>{target_id}</code>).", delete_after=5)
 
-@client.on(events.NewMessage(pattern=r'^\.listauth(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.listauth(?:\s|$)', func=is_authorized_event))
 async def cmd_listauth(event):
     auths = await asyncio.to_thread(db.get_all_authorized)
     if not auths:
@@ -4700,7 +4715,7 @@ async def cmd_listauth(event):
         text += f"• {info} (<code>{user_id}</code>)\n└ 📅 {date_str} | {access_text}\n"
     await reply_or_edit(event, text, delete_after=15)
 
-@client.on(events.NewMessage(pattern=r'^\.logs(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.logs(?:\s|$)', func=is_authorized_event))
 async def cmd_logs(event):
     await audit_buffer.flush()
     logs = await asyncio.to_thread(db.get_latest_logs, 10)
@@ -4727,7 +4742,7 @@ async def cmd_logs(event):
         text += "------------------\n"
     await reply_or_edit(event, text, delete_after=15)
 
-@client.on(events.NewMessage(pattern=r'^\.listdn(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.listdn(?:\s|$)', func=is_authorized_event))
 async def cmd_listdn(event):
     shadow, glob = await asyncio.to_thread(db.get_all_banned_list_detailed)
     all_rows = list(shadow) + list(glob)
@@ -4755,7 +4770,7 @@ async def cmd_listdn(event):
         text += "Nenhuma punição global registrada."
     await reply_or_edit(event, text, delete_after=15)
 
-@client.on(events.NewMessage(pattern=r'^\.status(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.status(?:\s|$)', func=is_authorized_event))
 async def cmd_status(event):
     started = time.perf_counter()
     api_state = "⚠️ indisponível"
@@ -4809,7 +4824,7 @@ async def cmd_status(event):
     await reply_or_edit(event, text, delete_after=15)
 
 
-@client.on(events.NewMessage(pattern=r'^\.latency(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.latency(?:\s|$)', func=is_authorized_event))
 async def cmd_latency(event):
     started = time.perf_counter()
     try:
@@ -4843,7 +4858,7 @@ async def cmd_latency(event):
     await reply_or_edit(event, text, delete_after=15)
 
 
-@client.on(events.NewMessage(pattern=r'^\.health(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.health(?:\s|$)', func=is_authorized_event))
 async def cmd_health(event):
     checks = []
     critical_ok = True
@@ -4898,7 +4913,7 @@ async def cmd_health(event):
     await reply_or_edit(event, text, delete_after=15)
 
 
-@client.on(events.NewMessage(pattern=r'^\.help(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.help(?:\s|$)', func=is_authorized_event))
 async def cmd_help(event):
     text = (
         f"📖 <b>GUIA DE COMANDOS — Jtzin Userbot {VERSION}</b>\n\n"
@@ -4943,12 +4958,13 @@ async def cmd_help(event):
         "• <code>.logs</code> (Auditoria de Deleções)\n"
         "• <code>.id</code> (Mostra o ID do usuário)\n"
         "• <code>.infojt</code> (Informações detalhadas por reply, ID ou username)\n"
-        "• <code>.exu</code> (imagem aleatória de Exu; usa sticker como fallback)\n"
+        "• <code>.exu [raridade]</code> (imagem de Exu com raridade; sticker como fallback)\n"
+        "  Raridades: <code>comum</code>, <code>incomum</code>, <code>rara</code>, <code>épica</code> e <code>lendária</code>\n"
         "• <code>.help</code>"
     )
     await reply_or_edit(event, text, delete_after=15)
 
-@client.on(events.NewMessage(pattern=r'^\.antispy(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.antispy(?:\s|$)', func=is_authorized_event))
 async def cmd_antispy(event):
     if not event.is_group and not event.is_channel:
         await reply_or_edit(event, "❌ Este comando só pode ser usado em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
@@ -5010,7 +5026,7 @@ async def cmd_antispy(event):
         )
     await delete_command_safely(event)
 
-@client.on(events.NewMessage(pattern=r'^\.listspy(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.listspy(?:\s|$)', func=is_authorized_event))
 async def cmd_listspy(event):
     spies = await asyncio.to_thread(db.get_all_spies)
     if not spies:
@@ -5025,7 +5041,7 @@ async def cmd_listspy(event):
         text += f"• {info} (<code>{s['user_id']}</code>)\n└ 🕒 {date_str} | Chat: <code>{s['chat_id']}</code> | Confiança: <code>{confidence}%</code>\n└ Sinais: {signals}\n"
     await reply_or_edit(event, text, delete_after=15)
 
-@client.on(events.NewMessage(pattern=r'^\.delspy(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.delspy(?:\s|$)', func=is_authorized_event))
 async def cmd_delspy(event):
     target_id = await get_target_from_event(event)
     if not target_id:
@@ -5037,7 +5053,7 @@ async def cmd_delspy(event):
     info = await asyncio.to_thread(db.get_user_info, target_id)
     await reply_or_edit(event, f"✅ <b>{info} (<code>{target_id}</code>) removido da lista de espiões.</b>", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.jtpurgeall(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.jtpurgeall(?:\s|$)', func=is_owner_event))
 async def cmd_purgeall(event):
     """Apaga mensagens recentes de todos os remetentes no chat atual."""
     if not event.is_group and not event.is_channel:
@@ -5096,7 +5112,7 @@ async def cmd_purgeall(event):
     await delete_command_safely(event)
 
 
-@client.on(events.NewMessage(pattern=r'^\.jtpurge(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.jtpurge(?:\s|$)', func=is_authorized_event))
 async def cmd_purge(event):
     if not event.is_group and not event.is_channel:
         await reply_or_edit(event, "❌ Este comando só pode ser usado em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
@@ -5141,7 +5157,7 @@ async def cmd_purge(event):
 
     await delete_command_safely(event)
 
-@client.on(events.NewMessage(pattern=r'^\.purgeme(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.purgeme(?:\s|$)', func=is_authorized_event))
 async def cmd_purgeme(event):
     if not event.is_group and not event.is_channel:
         await reply_or_edit(event, "❌ Este comando só pode ser usado em grupos ou canais.", delete_after=DEFAULT_DELETE_AFTER)
@@ -5179,12 +5195,12 @@ async def cmd_purgeme(event):
 
     await delete_command_safely(event)
 
-@client.on(events.NewMessage(pattern=r'^\.id(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.id(?:\s|$)', func=is_authorized_event))
 async def cmd_id(event):
     target_id = await get_target_from_event(event) or event.sender_id
     await reply_or_edit(event, f"🆔 ID: <code>{target_id}</code>", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.infojt(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.infojt(?:\s|$)', func=is_authorized_event))
 async def cmd_infojt(event):
     """Exibe informações detalhadas de um usuário por reply, ID ou username."""
     target_id = await get_target_from_event(event)
@@ -5321,6 +5337,36 @@ _EXU_LABELS = {
     "exu_tranca_rua": "Exu Tranca-Rua",
     "exu_caveira": "Exu Caveira",
     "exu_mirim": "Exu Mirim",
+    "exu_marabo": "Exu Marabô",
+    "exu_tiriri": "Exu Tiriri",
+    "exu_veludo": "Exu Veludo",
+    "exu_sete_encruzilhadas": "Exu Sete Encruzilhadas",
+    "exu_meia_noite": "Exu Meia-Noite",
+    "exu_capa_preta": "Exu Capa Preta",
+}
+
+# A raridade é escolhida antes do personagem. Os pesos somam 100 e podem ser
+# ajustados sem mudar a lógica de envio; assets ausentes são ignorados.
+_EXU_RARITIES = (
+    {"key": "comum", "label": "Comum", "badge": "⚪", "weight": 55, "stems": ("exu_mirim", "exu_caveira", "exu_tranca_rua")},
+    {"key": "incomum", "label": "Incomum", "badge": "🟢", "weight": 25, "stems": ("exu_marabo", "exu_tiriri")},
+    {"key": "rara", "label": "Rara", "badge": "🔵", "weight": 12, "stems": ("exu_veludo", "exu_meia_noite")},
+    {"key": "épica", "label": "Épica", "badge": "🟣", "weight": 6, "stems": ("exu_capa_preta", "exu_sete_encruzilhadas")},
+    {"key": "lendária", "label": "Lendária", "badge": "🟡", "weight": 2, "stems": ("exu_ze_pelintra",)},
+)
+_EXU_RARITY_ALIASES = {
+    "comum": "comum",
+    "incomum": "incomum",
+    "rara": "rara",
+    "raro": "rara",
+    "epica": "épica",
+    "épica": "épica",
+    "epico": "épica",
+    "épico": "épica",
+    "lendaria": "lendária",
+    "lendária": "lendária",
+    "lendario": "lendária",
+    "lendário": "lendária",
 }
 
 
@@ -5331,6 +5377,31 @@ def _exu_assets(extension):
     except OSError as exc:
         logger.warning("Não foi possível listar assets do .exu: %s", exc)
         return ()
+
+
+def _normalize_exu_rarity(value):
+    """Normaliza a raridade opcional sem aceitar texto arbitrário como filtro."""
+    normalized = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode().lower()
+    return _EXU_RARITY_ALIASES.get(normalized)
+
+
+def _exu_select_asset(image_assets, sticker_assets, requested_rarity=None):
+    """Escolhe um asset disponível por raridade, ignorando arquivos incompletos."""
+    image_by_stem = {path.stem: path for path in image_assets}
+    sticker_by_stem = {path.stem: path for path in sticker_assets}
+    available = set(image_by_stem) | set(sticker_by_stem)
+    tiers = [
+        tier for tier in _EXU_RARITIES
+        if any(stem in available for stem in tier["stems"])
+        and (requested_rarity is None or tier["key"] == requested_rarity)
+    ]
+    if not tiers:
+        return None, None
+    tier = random.choices(tiers, weights=[tier["weight"] for tier in tiers], k=1)[0]
+    stems = [stem for stem in tier["stems"] if stem in available]
+    selected_stem = random.choice(stems)
+    selected_path = image_by_stem.get(selected_stem) or sticker_by_stem.get(selected_stem)
+    return selected_path, tier
 
 
 async def _finish_exu_text(event, text):
@@ -5352,56 +5423,73 @@ async def _finish_exu_text(event, text):
     return message
 
 
-@client.on(events.NewMessage(pattern=r'^\.exu(?:\s|$)', func=lambda e: is_authorized(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.exu(?:\s|$)', func=is_authorized_event))
 async def cmd_exu(event):
-    """Envia uma imagem de Exu e usa sticker local como fallback de mídia."""
+    """Envia um Exu por raridade e usa sticker local como fallback de mídia."""
     command_metrics.start(event)
+    args = (event.raw_text or "").split()
+    requested_rarity = _normalize_exu_rarity(args[1]) if len(args) > 1 else None
+    if len(args) > 1 and requested_rarity is None:
+        return await _finish_exu_text(
+            event,
+            "❌ Raridade inválida. Use: <code>comum</code>, <code>incomum</code>, "
+            "<code>rara</code>, <code>épica</code> ou <code>lendária</code>.",
+        )
+
     image_assets = _exu_assets("jpg")
     sticker_assets = _exu_assets("webp")
-    selected_name = None
+    selected, rarity = _exu_select_asset(image_assets, sticker_assets, requested_rarity)
+    if selected is None or rarity is None:
+        return await _finish_exu_text(
+            event,
+            "❌ Nenhum asset compatível com essa raridade foi encontrado em <code>assets/exu</code>.",
+        )
+
+    selected_name = selected.stem
+    label = _EXU_LABELS.get(selected_name, "Exu")
+    rarity_text = f"{rarity['badge']} {rarity['label']}"
+    caption = f"🕯️ <b>{escape(label)}</b>\n✨ <b>Raridade:</b> {escape(rarity_text)}"
     sent_message = None
 
-    if image_assets:
-        selected = random.choice(image_assets)
-        selected_name = selected.stem
-        label = _EXU_LABELS.get(selected.stem, "Exu")
+    if selected.suffix.lower() == ".jpg":
         try:
             sent_message = await client.send_file(
                 event.chat_id,
                 str(selected),
-                caption=f"🕯️ <b>{escape(label)}</b>",
+                caption=caption,
                 parse_mode="html",
                 force_document=False,
             )
         except Exception as exc:
             logger.warning("Envio da imagem do .exu falhou (%s): %s", selected.name, exc)
+            fallback = next((path for path in sticker_assets if path.stem == selected_name), None)
+            if fallback is not None:
+                selected = fallback
 
-    if sent_message is None and sticker_assets:
-        sticker = random.choice(sticker_assets)
-        selected_name = sticker.stem
+    if sent_message is None and selected.suffix.lower() == ".webp":
         try:
             sent_message = await client.send_file(
                 event.chat_id,
-                str(sticker),
+                str(selected),
                 force_document=False,
             )
+            # Stickers não recebem caption de forma consistente no Telegram;
+            # a raridade vai em uma mensagem curta e também é autoapagada.
+            rarity_message = await client.send_message(event.chat_id, caption, parse_mode="html")
+            schedule_response_cleanup(rarity_message, event, DEFAULT_DELETE_AFTER, "raridade do .exu")
         except Exception as exc:
-            logger.warning("Fallback para sticker do .exu falhou (%s): %s", sticker.name, exc)
+            logger.warning("Fallback para sticker do .exu falhou (%s): %s", selected.name, exc)
 
     if sent_message is not None:
         command_metrics.finish(event, success=True)
         schedule_response_cleanup(sent_message, event, DEFAULT_DELETE_AFTER, "mídia do .exu")
-        logger.debug(".exu enviou o asset %s no chat %s", selected_name, event.chat_id)
+        logger.debug(".exu enviou %s (%s) no chat %s", selected_name, rarity["key"], event.chat_id)
         return sent_message
 
-    if not image_assets and not sticker_assets:
-        text = "❌ Nenhum asset do <code>.exu</code> foi encontrado em <code>assets/exu</code>."
-    else:
-        text = "❌ Não foi possível enviar a imagem nem o sticker do <code>.exu</code>."
-    return await _finish_exu_text(event, text)
+    return await _finish_exu_text(event, "❌ Não foi possível enviar a imagem nem o sticker do <code>.exu</code>.")
 
 
-@client.on(events.NewMessage(pattern=r'^\.msg(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.msg(?:\s|$)', func=is_owner_event))
 async def cmd_msg(event):
     reply = await event.get_reply_message()
     command_args = event.raw_text.split(maxsplit=1)
@@ -5441,7 +5529,7 @@ async def cmd_msg(event):
     success = sum(1 for result in results if result)
     await reply_or_edit(event, f"📢 Transmissão concluída: {success}/{len(targets)} chats receberam.", delete_after=DEFAULT_DELETE_AFTER)
 
-@client.on(events.NewMessage(pattern=r'^\.chats(?:\s|$)', func=lambda e: is_owner(e.sender_id)))
+@client.on(events.NewMessage(pattern=r'^\.chats(?:\s|$)', func=is_owner_event))
 async def cmd_chats(event):
     chats = await asyncio.to_thread(db.all_chats_detailed)
     private_ids = [r.get('chat_id') for r in chats if r.get('chat_type') in ['private', 'User']]
