@@ -511,7 +511,8 @@ def _reason(context: ContextTypes.DEFAULT_TYPE) -> str:
 def _target_error(command: str) -> str:
     return (
         f"❌ Informe o alvo para <code>/{command}</code> ou <code>.{command}</code>: "
-        f"responda à mensagem do usuário ou use um ID numérico/@username conhecido."
+        f"responda à mensagem do usuário, use um ID numérico ou um @username que o bot já tenha registrado. "
+        f"Um username pessoal desconhecido não pode ser convertido em ID pela Bot API."
     )
 
 
@@ -524,9 +525,12 @@ async def _remember_message_context(update: Update):
         _chat_registration_seen.add(chat.id)
         KNOWN_CHAT_IDS.add(chat.id)
         await asyncio.to_thread(db.register_chat, chat.id, chat.title or "", chat.type)
-    if not user.is_bot and int(user.id) not in KNOWN_USERS:
+    if not user.is_bot:
+        user_id = int(user.id)
+        previous = KNOWN_USERS.get(user_id)
         target = _remember_user_in_memory(user)
-        await asyncio.to_thread(db.remember_user, target.user_id, target.username, target.full_name)
+        if previous != (target.username, target.full_name):
+            await asyncio.to_thread(db.remember_user, target.user_id, target.username, target.full_name)
 
 
 async def _safe_delete(message) -> bool:
@@ -558,7 +562,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/allban</code> ou <code>.allban</code> — o proprietário bane o alvo nos grupos registrados.\n"
         "<code>/unallban</code> ou <code>.unallban</code> — remove o allban global e tenta desbanir o alvo.\n"
         "<code>/latency</code> ou <code>.latency</code> — mede uma chamada real à API do Telegram.\n\n"
-        "Use respondendo à mensagem do alvo ou informe o ID. Os proprietários configurados podem usar "
+        "Use respondendo à mensagem do alvo, informe o ID ou use um @username já registrado pelo bot. Os proprietários configurados podem usar "
         "a moderação local mesmo sem serem administradores do grupo; o bot ainda precisa ser administrador "
         "com permissão para apagar mensagens e restringir membros. Os comandos allban são exclusivos dos proprietários.",
     )
