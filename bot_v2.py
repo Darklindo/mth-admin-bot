@@ -109,7 +109,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V8.7"
+VERSION = "V8.8"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 TELETHON_LOG_LEVEL = os.getenv("TELETHON_LOG_LEVEL", "WARNING").upper()
 
@@ -346,7 +346,11 @@ class Database:
         self._connect()
 
     def _connect(self):
-        self.conn = sqlite3.connect(self.path, check_same_thread=False)
+        self.conn = sqlite3.connect(
+            self.path,
+            check_same_thread=False,
+            cached_statements=256,
+        )
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
@@ -1573,6 +1577,10 @@ class CommandMetrics:
         self._max_update_age_ms = 0.0
         self.max_commands = max(16, int(max_commands))
         self.max_arrivals = max(128, int(max_arrivals))
+        # A limpeza de chegadas antigas é amortizada; varrer milhares de
+        # entradas a cada comando criava trabalho desnecessário no hot path.
+        self._arrival_sweep_counter = 0
+        self._arrival_sweep_interval = max(64, min(256, self.max_arrivals // 8))
 
     @staticmethod
     def _name(event):
@@ -1589,11 +1597,9 @@ class CommandMetrics:
         if message_date is None:
             return None
         try:
-            if getattr(message_date, "tzinfo", None) is not None:
-                now = datetime.now(message_date.tzinfo)
-            else:
-                now = datetime.now()
-            age_ms = (now - message_date).total_seconds() * 1000.0
+            # timestamp() evita construir dois objetos datetime por comando e
+            # mantém a medição correta para datas com ou sem timezone.
+            age_ms = (time.time() - message_date.timestamp()) * 1000.0
             # Relógios locais podem ter pequena diferença do servidor. Valores
             # absurdos não devem contaminar o diagnóstico.
             if age_ms < 0 or age_ms > 10 * 60 * 1000:
@@ -1608,11 +1614,34 @@ class CommandMetrics:
         if not raw_text.startswith("."):
             return
         now = time.perf_counter()
-        # Comandos interrompidos por outro filtro não terão finish(); remova
-        # somente observações antigas para manter o limite de memória.
-        stale = [key for key, value in self._arrivals.items() if now - value[0] > 300]
-        for key in stale:
-            self._arrivals.pop(key, None)
+        # Comandos interrompidos por outro filtro não terão finish(). A limpeza
+        # é periódica para que a telemetria nunca se torne um custo por evento.
+        self._arrival_sweep_counter += 1
+        cutoff = now - 300
+        # O dicionário preserva a ordem de inserção. Remover alguns itens antigos
+        # diretamente mantém o contrato de expiração imediata com custo O(1)
+        # amortizado, sem reconstruir uma lista de todos os elementos.
+        cleanup_budget = 4
+        while self._arrivals and cleanup_budget:
+            oldest_key, oldest_value = next(iter(self._arrivals.items()))
+            if oldest_value[0] >= cutoff:
+                break
+            self._arrivals.pop(oldest_key, None)
+            cleanup_budget -= 1
+        if (
+            self._arrival_sweep_counter >= self._arrival_sweep_interval
+            or len(self._arrivals) >= int(self.max_arrivals * 0.75)
+        ):
+            self._arrival_sweep_counter = 0
+            # A maior parte das entradas já foi eliminada acima; este segundo
+            # limite cobre rajadas antigas sem deixar o hot path crescer.
+            cleanup_budget = 32
+            while self._arrivals and cleanup_budget:
+                oldest_key, oldest_value = next(iter(self._arrivals.items()))
+                if oldest_value[0] >= cutoff:
+                    break
+                self._arrivals.pop(oldest_key, None)
+                cleanup_budget -= 1
         key = id(event)
         if len(self._arrivals) >= self.max_arrivals:
             self._arrivals.pop(next(iter(self._arrivals)), None)
@@ -2802,6 +2831,8 @@ async def delete_security_message(event, chat_id, user_id, content_text, reason)
 
 _response_cleanup_tasks = set()
 _pending_command_status = {}
+_status_command_events = {}
+_MAX_STATUS_COMMAND_EVENTS = 512
 
 
 def _event_response_key(event):
@@ -2826,6 +2857,34 @@ def _clear_pending_command_status(event):
     key = _event_response_key(event)
     if key is not None:
         _pending_command_status.pop(key, None)
+
+
+def _status_message_key(message):
+    if message is None:
+        return None
+    try:
+        chat_id = getattr(message, "chat_id", None)
+        message_id = getattr(message, "id", None)
+        if chat_id is not None and message_id is not None:
+            return (int(chat_id), int(message_id))
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return ("object", id(message))
+
+
+def _track_status_command(message, event):
+    """Relaciona o status inicial ao evento para concluir a métrica E2E."""
+    key = _status_message_key(message)
+    if key is None or event is None:
+        return
+    if len(_status_command_events) >= _MAX_STATUS_COMMAND_EVENTS:
+        _status_command_events.pop(next(iter(_status_command_events)), None)
+    _status_command_events[key] = event
+
+
+def _take_status_command(message):
+    key = _status_message_key(message)
+    return _status_command_events.pop(key, None) if key is not None else None
 
 
 def _safe_command_error(exc, action="concluir a operação"):
@@ -2998,6 +3057,7 @@ async def send_status_safely(event, text, label="mensagem de status"):
     pending = _take_pending_command_status(event)
     if pending is not None:
         if await _edit_response_now(pending, text):
+            _track_status_command(pending, event)
             return pending
     try:
         outgoing = is_outgoing_event(event)
@@ -3008,9 +3068,12 @@ async def send_status_safely(event, text, label="mensagem de status"):
         elif callable(getattr(event, "reply", None)):
             message = await event.reply(text, parse_mode="html")
         else:
+            command_metrics.finish(event, success=False)
             return None
+        _track_status_command(message, event)
         return message
     except MessageNotModifiedError:
+        _track_status_command(event, event)
         return event
     except Exception as exc:
         logger.warning("Falha ao enviar %s: %s", label, exc)
@@ -3022,10 +3085,12 @@ async def send_status_safely(event, text, label="mensagem de status"):
             else:
                 message = None
             if message is not None:
+                _track_status_command(message, event)
                 return message
         except Exception as fallback_exc:
             logger.error("Falha no fallback de %s: %s", label, fallback_exc)
         await delete_command_safely(event)
+        command_metrics.finish(event, success=False)
         return None
 
 
@@ -3033,6 +3098,9 @@ async def edit_and_delete_safely(message, text, delete_after=DEFAULT_DELETE_AFTE
     if message is None:
         return False
     edited = await _edit_response_now(message, text)
+    tracked_event = _take_status_command(message)
+    if tracked_event is not None:
+        command_metrics.finish(tracked_event, success=edited)
     # Não retenha o handler por vários segundos: a resposta e o comando
     # serão removidos pelo agendador compartilhado em segundo plano.
     schedule_response_cleanup(message, message, delete_after, label)
@@ -3281,7 +3349,10 @@ async def get_settings_async(chat_id):
     chat_id = int(chat_id)
     if chat_id in cache.settings_loaded:
         cache._touch_settings(chat_id)
-        return dict(cache.settings.get(chat_id, {}))
+        # Os consumidores desta função apenas leem os valores. Evitar uma cópia
+        # por mensagem reduz alocações no antilink e no antispam; mutações devem
+        # ocorrer exclusivamente pelos métodos de configuração da Database.
+        return cache.settings.get(chat_id, {})
 
     task = cache.settings_inflight.get(chat_id)
     if task is None:
@@ -3386,10 +3457,11 @@ async def antilink_filter(event):
     """Remove links de não administradores sem consultar permissões repetidamente."""
     if not event.chat_id or not (event.is_group or event.is_channel):
         return
-    # Mensagens iniciadas por ponto sem link continuam fora do caminho quente,
-    # mas um membro não autorizado não pode esconder um convite dentro de um
-    # comando ou texto iniciado por ponto.
-    if (event.raw_text or "").startswith(".") and not message_contains_link(event.message, event.raw_text or ""):
+    raw_text = event.raw_text or ""
+    # Calcule uma vez: comandos com link não podem escapar e comandos sem link
+    # não devem pagar duas passagens pelo detector.
+    contains_link = message_contains_link(event.message, raw_text)
+    if raw_text.startswith(".") and not contains_link:
         return
     user_id = event.sender_id
     if not user_id or is_immune(user_id):
@@ -3397,7 +3469,7 @@ async def antilink_filter(event):
     settings = await get_settings_async(event.chat_id)
     if not _setting_int(settings, "antilink", 0, 0, 1):
         return
-    if not message_contains_link(event.message, event.raw_text or ""):
+    if not contains_link:
         return
     if user_id in cache.link_whitelist.get(int(event.chat_id), set()):
         return
@@ -3731,6 +3803,21 @@ _KNOWN_COMMAND_PROGRESS = frozenset({
     ".exu", ".msg", ".chats",
 })
 
+# Esses handlers já exibem o status imediatamente e depois o editam. Se o
+# dispatcher global também responder antes deles, a mesma ação paga dois RPCs.
+_COMMANDS_WITH_INTERNAL_FAST_STATUS = frozenset({
+    ".salvar", ".clonar", ".restaurar", ".kick", ".jtban", ".jtmute", ".allban",
+    ".exu",
+})
+
+# O status preventivo só vale o custo de um RPC extra em operações que podem
+# durar perceptivelmente mais. Comandos simples respondem diretamente pelo
+# handler, evitando uma edição intermediária desnecessária.
+_COMMANDS_WITH_PRESTATUS = frozenset({
+    ".lock", ".unlock", ".allblack", ".antispy", ".jtpurgeall", ".jtpurge",
+    ".purgeme", ".msg",
+})
+
 
 @client.on(events.NewMessage(pattern=r'^\.[a-z0-9_]+(?:\s|$)'))
 async def command_progress_filter(event):
@@ -3739,6 +3826,8 @@ async def command_progress_filter(event):
         return
     command = (event.raw_text or "").split(maxsplit=1)[0].lower()
     if command not in _KNOWN_COMMAND_PROGRESS:
+        return
+    if command in _COMMANDS_WITH_INTERNAL_FAST_STATUS or command not in _COMMANDS_WITH_PRESTATUS:
         return
     if cache.maintenance_enabled and not is_owner_event(event) and command not in {".maintenance", ".status", ".health", ".latency"}:
         return
