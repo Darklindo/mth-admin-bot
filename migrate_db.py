@@ -14,7 +14,7 @@ def ensure_column(conn, table, column, definition):
 
 
 def migrate():
-    print("Iniciando Migração V8.5 (modernização da versão pessoal e inicialização compatível com Python 3.14)...")
+    print("Iniciando Migração V8.6 (AntiBlack multiusuário e modernização da versão pessoal)...")
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
@@ -31,6 +31,7 @@ def migrate():
             CREATE TABLE IF NOT EXISTS global_ban_snapshots (user_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, previous_permissions TEXT, created_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_id, chat_id));
             CREATE TABLE IF NOT EXISTS shadow_ban (user_id INTEGER PRIMARY KEY, reason TEXT, created_at INTEGER NOT NULL DEFAULT 0, expires_at INTEGER);
             CREATE TABLE IF NOT EXISTS link_whitelist (chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, PRIMARY KEY (chat_id, user_id));
+            CREATE TABLE IF NOT EXISTS antiblack_users (chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, username TEXT, added_by INTEGER, created_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (chat_id, user_id));
             CREATE TABLE IF NOT EXISTS authorized_users (user_id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL DEFAULT 0, expires_at INTEGER);
             CREATE TABLE IF NOT EXISTS deleted_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, user_id INTEGER, content TEXT, reason TEXT, created_at INTEGER NOT NULL DEFAULT 0, admin_id INTEGER);
             CREATE TABLE IF NOT EXISTS detected_spies (user_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, detected_at INTEGER NOT NULL DEFAULT 0, signals TEXT NOT NULL DEFAULT '', confidence INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_id, chat_id));
@@ -106,6 +107,7 @@ def migrate():
         for table, column, definition in columns_to_add:
             ensure_column(conn, table, column, definition)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_local_blacklist_chat_user ON local_blacklist(chat_id, user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_antiblack_users_chat ON antiblack_users(chat_id, created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_local_banperm_chat_user ON local_banperm(chat_id, user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_global_ban_snapshots_user ON global_ban_snapshots(user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_deleted_logs_created ON deleted_logs(created_at DESC)")
@@ -147,7 +149,7 @@ def migrate():
                 """
             )
         conn.commit()
-        print("Migração V8.5 concluída com sucesso.")
+        print("Migração V8.6 concluída com sucesso.")
     finally:
         conn.close()
 

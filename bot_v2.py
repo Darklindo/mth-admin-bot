@@ -109,7 +109,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V8.5"
+VERSION = "V8.6"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 TELETHON_LOG_LEVEL = os.getenv("TELETHON_LOG_LEVEL", "WARNING").upper()
 
@@ -144,6 +144,9 @@ class Cache:
         self.authorized_users = set()
         self.authorized_expirations = {}
         self.antiblack_chats = set()
+        # Usuários adicionais protegidos pelo AntiBlack, separados por chat.
+        # A sessão local continua protegida implicitamente quando o chat está ativo.
+        self.antiblack_users = defaultdict(set)
         self.locked_chats = set()
         self.settings = {}
         # LRU separado para limitar snapshots parciais e completos em instalações
@@ -224,6 +227,16 @@ class Cache:
             settings_access = OrderedDict()
             settings_loaded = set()
             antiblack_chats = set()
+            antiblack_users = defaultdict(set)
+            try:
+                for row in db_conn.execute(
+                    "SELECT chat_id, user_id FROM antiblack_users"
+                ).fetchall():
+                    antiblack_users[int(row[0])].add(int(row[1]))
+            except sqlite3.OperationalError:
+                # Bancos anteriores à V8.6 ainda não têm a tabela; a migração
+                # normal a criará, mas a carga continua segura em modo legado.
+                antiblack_users = defaultdict(set)
             locked_chats = set()
             for row in db_conn.execute("SELECT * FROM settings").fetchall():
                 chat_id = int(row["chat_id"])
@@ -260,6 +273,7 @@ class Cache:
             self.authorized_users = authorized_users
             self.authorized_expirations = authorized_expirations
             self.antiblack_chats = antiblack_chats
+            self.antiblack_users = antiblack_users
             self.locked_chats = locked_chats
             self.settings = settings
             self.settings_access = settings_access
@@ -372,6 +386,51 @@ class Database:
             else:
                 cache.antiblack_chats.discard(int(chat_id))
         return cursor is not None
+
+    def add_antiblack_user(self, chat_id, user_id, added_by=None, username=None):
+        """Cadastra um usuário protegido sem duplicar registros."""
+        chat_id = int(chat_id)
+        user_id = int(user_id)
+        added_by = int(added_by) if added_by is not None else None
+        cursor = self.execute(
+            "INSERT OR IGNORE INTO antiblack_users(chat_id, user_id, username, added_by, created_at) "
+            "VALUES(?,?,?,?,?)",
+            (chat_id, user_id, (username or "").lstrip("@") or None, added_by, int(time.time())),
+            commit=True,
+        )
+        if cursor is None:
+            return None
+        added = cursor.rowcount > 0
+        if added:
+            cache.antiblack_users[chat_id].add(user_id)
+        return added
+
+    def remove_antiblack_user(self, chat_id, user_id):
+        chat_id = int(chat_id)
+        user_id = int(user_id)
+        cursor = self.execute(
+            "DELETE FROM antiblack_users WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id),
+            commit=True,
+        )
+        if cursor is None:
+            return None
+        removed = cursor.rowcount > 0
+        if removed:
+            users = cache.antiblack_users.get(chat_id)
+            if users is not None:
+                users.discard(user_id)
+                if not users:
+                    cache.antiblack_users.pop(chat_id, None)
+        return removed
+
+    def get_antiblack_users(self, chat_id):
+        rows = self.fetchall(
+            "SELECT user_id, username, added_by, created_at "
+            "FROM antiblack_users WHERE chat_id=? ORDER BY created_at DESC, user_id ASC",
+            (int(chat_id),),
+        )
+        return [dict(row) for row in rows]
 
     def add_authorized(self, user_id, expires_at=None):
         user_id = int(user_id)
@@ -907,6 +966,26 @@ class Database:
             return None
         row = self.fetchone("SELECT user_id FROM users WHERE username=? LIMIT 1", (username,))
         return int(row["user_id"]) if row else None
+
+    def resolve_user_reference(self, reference):
+        """Resolve @username ou nome armazenado somente quando o resultado é inequívoco."""
+        raw = str(reference or "").strip()
+        if not raw:
+            return None
+        if raw.startswith("@"):
+            raw = raw[1:]
+        if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
+            return int(raw)
+        normalized = raw.casefold()
+        rows = self.fetchall(
+            "SELECT user_id FROM users "
+            "WHERE LOWER(COALESCE(username,''))=? OR LOWER(COALESCE(first_name,''))=? "
+            "ORDER BY user_id LIMIT 2",
+            (normalized, normalized),
+        )
+        if len(rows) != 1:
+            return None
+        return int(rows[0]["user_id"])
 
     def get_user_info(self, user_id):
         row = self.fetchone("SELECT username, first_name FROM users WHERE user_id=?", (int(user_id),))
@@ -2958,12 +3037,22 @@ def _antiblack_message_key(chat_id, message_id):
     return normalized_chat, normalized_message
 
 
-@client.on(events.NewMessage(outgoing=True))
+@client.on(events.NewMessage())
 async def antiblack_tracker(event):
     if not event.is_group and not event.is_channel:
         return
     chat_id = event.chat_id
-    if chat_id not in cache.antiblack_chats or (event.raw_text or "").startswith("."):
+    if chat_id not in cache.antiblack_chats:
+        return
+    sender_id = getattr(event, "sender_id", None)
+    is_session_message = is_outgoing_event(event)
+    protected_users = cache.antiblack_users.get(chat_id, ())
+    if not is_session_message and (not sender_id or int(sender_id) not in protected_users):
+        return
+    # Comandos da própria sessão são processados pelo Userbot e não devem ser
+    # repostados. Comandos enviados pelos usuários protegidos continuam sendo
+    # protegidos, pois pertencem a eles e podem ser apagados por outro bot.
+    if is_session_message and (event.raw_text or "").startswith("."):
         return
     key = _antiblack_message_key(chat_id, event.id)
     if key is None:
@@ -3947,35 +4036,169 @@ async def cmd_start(event):
     text = f"🛡️ <b>Jtzin Userbot {VERSION} (Status e Health)</b>\n\nEquipe Diamond — Operacional."
     await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
 
+async def _resolve_antiblack_user(event, reference_text=""):
+    """Resolve somente contas de usuário para o cadastro do AntiBlack."""
+    reply = await event.get_reply_message()
+    if reply is not None and getattr(reply, "id", None) != getattr(event, "id", None):
+        sender = await reply.get_sender()
+        if isinstance(sender, User):
+            await asyncio.to_thread(db.remember_user, sender.id, sender.username, sender.first_name)
+            return sender
+        return None
+
+    raw = (reference_text or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
+        try:
+            entity = await client.get_entity(int(raw))
+        except (ValueError, RPCError):
+            return None
+    elif raw.startswith("@"):
+        try:
+            entity = await client.get_entity(raw)
+        except (ValueError, RPCError):
+            user_id = await asyncio.to_thread(db.resolve_user_reference, raw)
+            return int(user_id) if user_id else None
+    else:
+        user_id = await asyncio.to_thread(db.resolve_user_reference, raw)
+        if not user_id:
+            return None
+        try:
+            entity = await client.get_entity(int(user_id))
+        except (ValueError, RPCError):
+            return int(user_id)
+    if isinstance(entity, User):
+        await asyncio.to_thread(db.remember_user, entity.id, entity.username, entity.first_name)
+        return entity
+    return None
+
+
+async def _format_antiblack_users(chat_id):
+    rows = await asyncio.to_thread(db.get_antiblack_users, chat_id)
+    lines = ["🛡️ <b>USUÁRIOS PROTEGIDOS PELO ANTI-BLACK</b>"]
+    if cache.me is not None:
+        me_label = escape((getattr(cache.me, "username", None) and f"@{cache.me.username}") or getattr(cache.me, "first_name", None) or "sessão local")
+        lines.append(f"• {me_label} (<code>{int(cache.me.id)}</code>) — sessão local")
+    if not rows:
+        lines.append("\nNenhum usuário adicional cadastrado neste chat.")
+        return "\n".join(lines)
+    info_map = await asyncio.to_thread(db.get_user_info_many, [int(row["user_id"]) for row in rows[:50]])
+    for row in rows[:50]:
+        user_id = int(row["user_id"])
+        added_label = info_map.get(user_id, str(user_id))
+        lines.append(f"• {added_label} (<code>{user_id}</code>)")
+    if len(rows) > 50:
+        lines.append(f"\n… e mais {len(rows) - 50} usuário(s).")
+    return "\n".join(lines)
+
+
 @client.on(events.NewMessage(pattern=r'^\.antiblack(?:\s|$)', func=is_authorized_event))
 async def cmd_antiblack(event):
     if not await require_chat_admin(event, "alterar o Modo Fênix"):
         return
-    args = event.raw_text.split()
-    if len(args) < 2:
+    args = (event.raw_text or "").split()
+    action = args[1].lower() if len(args) > 1 else ""
+    if not action:
         status = "ATIVADO 🛡️" if event.chat_id in cache.antiblack_chats else "DESATIVADO ❌"
-        await reply_or_edit(event, f"ℹ️ Anti-Black neste chat está: <b>{status}</b>\nUse <code>.antiblack on</code> ou <code>.antiblack off</code>", delete_after=5)
+        text = (
+            f"ℹ️ Anti-Black neste chat está: <b>{status}</b>\n"
+            "Use <code>.antiblack on</code> ou <code>.antiblack off</code>.\n"
+            "Cadastre uma conta com <code>.antiblack @username</code> ou respondendo à mensagem dela.\n"
+            "Gerencie com <code>.antiblack list</code> e <code>.unantiblack @username</code>."
+        )
+        await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
         return
-    
-    action = args[1].lower()
-    if action in ['on', 'ativar', '1']:
+
+    if action in {"on", "ativar", "1"}:
         if event.chat_id in cache.antiblack_chats:
             await reply_or_edit(event, "ℹ️ O Anti-Black já está ativado neste chat; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
             return
         if not await asyncio.to_thread(db.set_antiblack, event.chat_id, 1):
             await reply_or_edit(event, "❌ Não foi possível ativar o Anti-Black no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
             return
-        await reply_or_edit(event, "🛡️ <b>Anti-Black ATIVADO!</b> Se algum bot rival apagar suas mensagens, o Userbot irá repostá-las instantaneamente.", delete_after=DEFAULT_DELETE_AFTER)
-    elif action in ['off', 'desativar', '0']:
+        await reply_or_edit(event, "🛡️ <b>Anti-Black ATIVADO.</b> A sessão e as contas cadastradas serão protegidas neste chat.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if action in {"off", "desativar", "0"}:
         if event.chat_id not in cache.antiblack_chats:
             await reply_or_edit(event, "ℹ️ O Anti-Black já está desativado neste chat; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
             return
         if not await asyncio.to_thread(db.set_antiblack, event.chat_id, 0):
             await reply_or_edit(event, "❌ Não foi possível desativar o Anti-Black no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
             return
-        await reply_or_edit(event, "❌ <b>Anti-Black DESATIVADO.</b>", delete_after=DEFAULT_DELETE_AFTER)
+        await reply_or_edit(event, "🛡️ <b>Anti-Black DESATIVADO.</b>", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if action in {"list", "lista", "listar"}:
+        await reply_or_edit(event, await _format_antiblack_users(event.chat_id), delete_after=DEFAULT_DELETE_AFTER)
+        return
+
+    remove_mode = action in {"remove", "remover", "del", "delete", "offuser"}
+    reference = " ".join(args[2:] if action in {"add", "adicionar", "protect", "proteger", "remove", "remover", "del", "delete", "offuser"} else args[1:]).strip()
+    target = await _resolve_antiblack_user(event, reference)
+    target_id = int(target.id if isinstance(target, User) else target) if target is not None else None
+    if not target_id or target_id < 1:
+        await reply_or_edit(event, "❌ Alvo inválido. Responda à mensagem de uma conta ou informe um ID/@username já conhecido pelo Userbot.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if cache.me is not None and target_id == int(cache.me.id):
+        await reply_or_edit(event, "ℹ️ A sessão local já é protegida automaticamente quando o Anti-Black está ativo; nenhuma alteração foi necessária.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+
+    if remove_mode:
+        removed = await asyncio.to_thread(db.remove_antiblack_user, event.chat_id, target_id)
+        if removed is None:
+            text = "❌ Não foi possível atualizar os protegidos no banco de dados."
+        elif not removed:
+            text = f"ℹ️ O usuário <code>{target_id}</code> não estava cadastrado no Anti-Black deste chat."
+        else:
+            text = f"✅ Usuário <code>{target_id}</code> removido do Anti-Black neste chat."
+        await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
+        return
+
+    added = await asyncio.to_thread(
+        db.add_antiblack_user,
+        event.chat_id,
+        target_id,
+        event.sender_id,
+        getattr(target, "username", None) if isinstance(target, User) else None,
+    )
+    if added is None:
+        text = "❌ Não foi possível cadastrar o usuário no Anti-Black."
+    elif not added:
+        text = f"ℹ️ O usuário <code>{target_id}</code> já está protegido neste chat; nenhuma alteração foi necessária."
     else:
-        await reply_or_edit(event, "❌ Use <code>.antiblack on</code> ou <code>.antiblack off</code>", delete_after=DEFAULT_DELETE_AFTER)
+        text = f"✅ Usuário <code>{target_id}</code> cadastrado no Anti-Black deste chat."
+    await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
+
+
+@client.on(events.NewMessage(pattern=r'^\.unantiblack(?:\s|$)', func=is_authorized_event))
+async def cmd_unantiblack(event):
+    if not await require_chat_admin(event, "remover um usuário do Anti-Black"):
+        return
+    args = (event.raw_text or "").split()
+    reference = " ".join(args[1:]).strip()
+    target = await _resolve_antiblack_user(event, reference)
+    target_id = int(target.id if isinstance(target, User) else target) if target is not None else None
+    if not target_id or target_id < 1:
+        await reply_or_edit(event, "❌ Alvo inválido. Responda à mensagem ou informe um ID/@username válido.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    if cache.me is not None and target_id == int(cache.me.id):
+        await reply_or_edit(event, "ℹ️ A sessão local não pode ser removida da proteção implícita do Anti-Black.", delete_after=DEFAULT_DELETE_AFTER)
+        return
+    removed = await asyncio.to_thread(db.remove_antiblack_user, event.chat_id, target_id)
+    if removed is None:
+        text = "❌ Não foi possível atualizar os protegidos no banco de dados."
+    elif not removed:
+        text = f"ℹ️ O usuário <code>{target_id}</code> não estava cadastrado neste chat."
+    else:
+        text = f"✅ Usuário <code>{target_id}</code> removido do Anti-Black neste chat."
+    await reply_or_edit(event, text, delete_after=DEFAULT_DELETE_AFTER)
+
+
+@client.on(events.NewMessage(pattern=r'^\.listantiblack(?:\s|$)', func=is_authorized_event))
+async def cmd_listantiblack(event):
+    if not await require_chat_admin(event, "listar os protegidos do Anti-Black"):
+        return
+    await reply_or_edit(event, await _format_antiblack_users(event.chat_id), delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.kick(?:\s|$)', func=is_authorized_event))
 async def cmd_kick(event):
@@ -5058,7 +5281,9 @@ async def cmd_help(event):
         "• <code>.restaurar</code> (volta ao último backup salvo)\n\n"
 
         "🔍 <b>SEGURANÇA & CONTRA-ESPIONAGEM:</b>\n"
-        "• <code>.antiblack on/off</code> (Modo Fênix)\n"
+        "• <code>.antiblack on/off</code> (ativa ou desativa o Modo Fênix)\n"
+        "• <code>.antiblack @usuario</code> | <code>.antiblack ID</code> | resposta (cadastra conta protegida)\n"
+        "• <code>.antiblack add @usuario</code> | <code>.antiblack list</code> | <code>.unantiblack @usuario</code>\n"
         "• <code>.antispy</code> (Varredura de Espiões)\n"
         "• <code>.listspy</code> | <code>.delspy</code> (Gestão de Espiões)\n\n"
         "🛠️ <b>UTILITÁRIOS & RELATÓRIOS:</b>\n"
