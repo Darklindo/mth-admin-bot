@@ -14,7 +14,7 @@ def ensure_column(conn, table, column, definition):
 
 
 def migrate():
-    print("Iniciando Migração V8.3 (modernização da versão pessoal e inicialização compatível com Python 3.14)...")
+    print("Iniciando Migração V8.4 (modernização da versão pessoal e inicialização compatível com Python 3.14)...")
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
@@ -110,6 +110,29 @@ def migrate():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_global_ban_snapshots_user ON global_ban_snapshots(user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_deleted_logs_created ON deleted_logs(created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_temp_punishments_expiry ON temporary_punishments(expires_at)")
+        # Bancos legados podem conter duplicatas criadas antes de existir uma
+        # chave lógica. Preserve o registro com maior prazo; em empate, o mais
+        # recente. Isso evita que a criação do índice falhe ou restaure snapshot
+        # incorreto durante a expiração.
+        conn.execute(
+            """
+            DELETE FROM temporary_punishments AS old
+            WHERE EXISTS (
+                SELECT 1 FROM temporary_punishments AS newer
+                WHERE newer.chat_id = old.chat_id
+                  AND newer.user_id = old.user_id
+                  AND newer.action = old.action
+                  AND (
+                      newer.expires_at > old.expires_at
+                      OR (newer.expires_at = old.expires_at AND newer.rowid > old.rowid)
+                  )
+            )
+            """
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_temp_punishments_scope "
+            "ON temporary_punishments(chat_id, user_id, action)"
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_warnings_chat_last ON warnings(chat_id, last_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_authorized_users_expiry ON authorized_users(expires_at)")
         columns = {row[1] for row in conn.execute("PRAGMA table_info(detected_spies)")}
@@ -124,7 +147,7 @@ def migrate():
                 """
             )
         conn.commit()
-        print("Migração V8.3 concluída com sucesso.")
+        print("Migração V8.4 concluída com sucesso.")
     finally:
         conn.close()
 

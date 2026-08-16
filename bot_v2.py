@@ -72,6 +72,10 @@ except ValueError as exc:
     raise RuntimeError("API_ID e OWNER_ID devem ser números inteiros no .env") from exc
 SECOND_OWNER_ID = _optional_owner_env("SECOND_OWNER_ID")
 THIRD_OWNER_ID = _optional_owner_env("THIRD_OWNER_ID")
+OWNER_IDS = frozenset(
+    owner_id for owner_id in (OWNER_ID, SECOND_OWNER_ID, THIRD_OWNER_ID)
+    if owner_id is not None
+)
 
 MIN_PURGE_LIMIT = 5
 MAX_PURGE_LIMIT = 100
@@ -105,7 +109,7 @@ TELEGRAM_CONNECTION_RETRIES = _env_int("TELEGRAM_CONNECTION_RETRIES", 5, 1, 15)
 # tratamento rápido e mensagem controlada.
 FLOOD_SLEEP_THRESHOLD = _env_int("FLOOD_SLEEP_THRESHOLD", 5, 0, 60)
 STARTED_AT = time.time()
-VERSION = "V8.3"
+VERSION = "V8.4"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 TELETHON_LOG_LEVEL = os.getenv("TELETHON_LOG_LEVEL", "WARNING").upper()
 
@@ -157,117 +161,117 @@ class Cache:
         self.me_loaded = False
 
     def load_all(self, db_conn):
+        """Carrega o estado do banco e troca o cache apenas após uma leitura consistente."""
+        previous_me = self.me
+        previous_me_loaded = self.me_loaded
         try:
-            # Permite recarregar o cache sem manter punições removidas em memória.
-            self.global_blacklist.clear()
-            self.global_blacklist_types.clear()
-            self.local_blacklist.clear()
-            self.local_banperm.clear()
-            self.shadow_ban.clear()
-            self.link_whitelist.clear()
-            self.authorized_users.clear()
-            self.authorized_expirations.clear()
-            self.antiblack_chats.clear()
-            self.locked_chats.clear()
-            self.settings.clear()
-            self.settings_access.clear()
-            self.settings_loaded.clear()
-            self.settings_inflight.clear()
-            self.maintenance_enabled = False
-            self.maintenance_loaded = False
-            self.me = None
-            self.me_loaded = False
-
             now = int(time.time())
-            cursor = db_conn.execute(
+            global_rows = db_conn.execute(
                 "SELECT user_id, type FROM global_blacklist "
                 "WHERE expires_at IS NULL OR expires_at>?",
                 (now,),
-            )
-            global_rows = cursor.fetchall()
-            self.global_blacklist = {int(row[0]) for row in global_rows}
-            self.global_blacklist_types = {
+            ).fetchall()
+            global_blacklist = {int(row[0]) for row in global_rows}
+            global_blacklist_types = {
                 int(row[0]): str(row[1] or "black").lower() for row in global_rows
             }
-            
-            cursor = db_conn.execute(
+
+            local_blacklist = defaultdict(set)
+            for row in db_conn.execute(
                 "SELECT chat_id, user_id FROM local_blacklist "
                 "WHERE expires_at IS NULL OR expires_at>?",
                 (now,),
-            )
-            for row in cursor.fetchall():
-                self.local_blacklist[row[0]].add(row[1])
-                
-            cursor = db_conn.execute(
+            ).fetchall():
+                local_blacklist[int(row[0])].add(int(row[1]))
+
+            local_banperm = defaultdict(set)
+            for row in db_conn.execute(
                 "SELECT chat_id, user_id FROM local_banperm "
                 "WHERE expires_at IS NULL OR expires_at>?",
                 (now,),
-            )
-            for row in cursor.fetchall():
-                self.local_banperm[row[0]].add(row[1])
+            ).fetchall():
+                local_banperm[int(row[0])].add(int(row[1]))
 
-            cursor = db_conn.execute(
-                "SELECT user_id FROM shadow_ban WHERE expires_at IS NULL OR expires_at>?",
-                (now,),
-            )
-            self.shadow_ban = {row[0] for row in cursor.fetchall()}
-            
-            cursor = db_conn.execute("SELECT chat_id, user_id FROM link_whitelist")
-            for row in cursor.fetchall():
-                self.link_whitelist[row[0]].add(row[1])
+            shadow_ban = {
+                int(row[0]) for row in db_conn.execute(
+                    "SELECT user_id FROM shadow_ban "
+                    "WHERE expires_at IS NULL OR expires_at>?",
+                    (now,),
+                ).fetchall()
+            }
+
+            link_whitelist = defaultdict(set)
+            for row in db_conn.execute("SELECT chat_id, user_id FROM link_whitelist").fetchall():
+                link_whitelist[int(row[0])].add(int(row[1]))
 
             try:
-                cursor = db_conn.execute(
+                authorized_rows = db_conn.execute(
                     "SELECT user_id, expires_at FROM authorized_users "
                     "WHERE expires_at IS NULL OR expires_at>?",
                     (now,),
-                )
-                authorized_rows = cursor.fetchall()
+                ).fetchall()
             except sqlite3.OperationalError:
-                authorized_rows = db_conn.execute("SELECT user_id FROM authorized_users").fetchall()
-            self.authorized_users = {int(row[0]) for row in authorized_rows}
-            self.authorized_expirations = {
+                authorized_rows = db_conn.execute(
+                    "SELECT user_id FROM authorized_users"
+                ).fetchall()
+            authorized_users = {int(row[0]) for row in authorized_rows}
+            authorized_expirations = {
                 int(row[0]): (int(row[1]) if len(row) > 1 and row[1] is not None else None)
                 for row in authorized_rows
             }
-            
+
+            settings = {}
+            settings_access = OrderedDict()
+            settings_loaded = set()
+            antiblack_chats = set()
+            locked_chats = set()
+            for row in db_conn.execute("SELECT * FROM settings").fetchall():
+                chat_id = int(row["chat_id"])
+                snapshot = dict(row)
+                settings[chat_id] = snapshot
+                settings_loaded.add(chat_id)
+                if int(snapshot.get("antiblack") or 0) == 1:
+                    antiblack_chats.add(chat_id)
+                if int(snapshot.get("locked") or 0) == 1:
+                    locked_chats.add(chat_id)
+                settings_access[chat_id] = None
+                settings_access.move_to_end(chat_id)
+                while len(settings_access) > SETTINGS_CACHE_MAX_CHATS:
+                    expired_chat_id, _ = settings_access.popitem(last=False)
+                    settings.pop(expired_chat_id, None)
+                    settings_loaded.discard(expired_chat_id)
+
             try:
-                cursor = db_conn.execute("SELECT chat_id, antiblack FROM settings WHERE antiblack=1")
-                for row in cursor.fetchall():
-                    self.antiblack_chats.add(row[0])
+                row = db_conn.execute(
+                    "SELECT value FROM bot_state WHERE key='maintenance'"
+                ).fetchone()
+                maintenance_enabled = bool(row and str(row[0]) == "1")
             except sqlite3.OperationalError:
-                pass
+                maintenance_enabled = False
 
-            try:
-                cursor = db_conn.execute("SELECT * FROM settings")
-                for row in cursor.fetchall():
-                    chat_id = int(row["chat_id"])
-                    self.settings[chat_id] = dict(row)
-                    self.settings_loaded.add(chat_id)
-                    self._touch_settings(chat_id)
-            except (sqlite3.OperationalError, TypeError, KeyError):
-                # Compatibilidade defensiva com bancos de versões anteriores.
-                pass
-
-            try:
-                cursor = db_conn.execute("SELECT chat_id FROM settings WHERE locked=1")
-                self.locked_chats = {int(row[0]) for row in cursor.fetchall()}
-            except sqlite3.OperationalError:
-                # Compatibilidade defensiva com bancos de versões anteriores.
-                pass
-
-            try:
-                row = db_conn.execute("SELECT value FROM bot_state WHERE key='maintenance'").fetchone()
-                self.maintenance_enabled = bool(row and str(row[0]) == "1")
-                self.maintenance_loaded = True
-            except sqlite3.OperationalError:
-                self.maintenance_enabled = False
-                self.maintenance_loaded = True
-
+            # As estruturas só são substituídas depois de todas as leituras
+            # essenciais concluírem. Uma falha preserva o snapshot anterior.
+            self.global_blacklist = global_blacklist
+            self.global_blacklist_types = global_blacklist_types
+            self.local_blacklist = local_blacklist
+            self.local_banperm = local_banperm
+            self.shadow_ban = shadow_ban
+            self.link_whitelist = link_whitelist
+            self.authorized_users = authorized_users
+            self.authorized_expirations = authorized_expirations
+            self.antiblack_chats = antiblack_chats
+            self.locked_chats = locked_chats
+            self.settings = settings
+            self.settings_access = settings_access
+            self.settings_loaded = settings_loaded
+            self.settings_inflight.clear()
+            self.maintenance_enabled = maintenance_enabled
+            self.maintenance_loaded = True
+            self.me = previous_me
+            self.me_loaded = previous_me_loaded
             logger.info("Cache carregado com sucesso (%s - filtros de baixa latência).", VERSION)
-        except Exception as e:
-            logger.error(f"Erro ao carregar cache: {e}")
-
+        except Exception as exc:
+            logger.error("Erro ao carregar cache; snapshot anterior preservado: %s", exc)
     def _touch_settings(self, chat_id):
         """Atualiza o LRU e limita snapshots de settings em memória."""
         chat_id = int(chat_id)
@@ -433,8 +437,8 @@ class Database:
         chat_id, user_id = int(chat_id), int(user_id)
         now = int(time.time())
         cursor = self.execute(
-            "UPDATE local_banperm SET reason=?, created_at=?, expires_at=? WHERE chat_id=? AND user_id=?",
-            (reason, now, expires_at, chat_id, user_id),
+            "UPDATE local_banperm SET reason=?, created_at=?, expires_at=?, previous_permissions=? WHERE chat_id=? AND user_id=?",
+            (reason, now, expires_at, previous_permissions, chat_id, user_id),
             commit=True,
         )
         if cursor is None:
@@ -651,9 +655,18 @@ class Database:
             self.execute("INSERT OR IGNORE INTO settings(chat_id) VALUES(?)", (chat_id,), commit=True)
             row = self.fetchone("SELECT * FROM settings WHERE chat_id=?", (chat_id,))
         result = dict(row) if row else {}
-        cache.settings[chat_id] = result
-        cache.settings_loaded.add(chat_id)
-        cache._touch_settings(chat_id)
+        if result:
+            if int(result.get("antiblack") or 0) == 1:
+                cache.antiblack_chats.add(chat_id)
+            else:
+                cache.antiblack_chats.discard(chat_id)
+            if int(result.get("locked") or 0) == 1:
+                cache.locked_chats.add(chat_id)
+            else:
+                cache.locked_chats.discard(chat_id)
+            cache.settings[chat_id] = result
+            cache.settings_loaded.add(chat_id)
+            cache._touch_settings(chat_id)
         return dict(result)
 
     def get_chat_lock(self, chat_id):
@@ -757,8 +770,8 @@ class Database:
         chat_id, user_id, action = int(chat_id), int(user_id), str(action)
         now = int(time.time())
         cursor = self.execute(
-            "UPDATE temporary_punishments SET expires_at=?, reason=?, created_at=?, admin_id=? WHERE chat_id=? AND user_id=? AND action=?",
-            (int(expires_at), reason, now, admin_id, chat_id, user_id, action),
+            "UPDATE temporary_punishments SET expires_at=?, reason=?, created_at=?, admin_id=?, previous_permissions=? WHERE chat_id=? AND user_id=? AND action=?",
+            (int(expires_at), reason, now, admin_id, previous_permissions, chat_id, user_id, action),
             commit=True,
         )
         if cursor is None:
@@ -1042,8 +1055,16 @@ class Database:
     def get_all_spies(self):
         return [dict(r) for r in self.fetchall("SELECT * FROM detected_spies ORDER BY detected_at DESC")]
 
-    def remove_spy(self, user_id):
-        cursor = self.execute("DELETE FROM detected_spies WHERE user_id = ?", (int(user_id),), commit=True)
+    def remove_spy(self, user_id, chat_id=None):
+        user_id = int(user_id)
+        if chat_id is None:
+            cursor = self.execute("DELETE FROM detected_spies WHERE user_id = ?", (user_id,), commit=True)
+        else:
+            cursor = self.execute(
+                "DELETE FROM detected_spies WHERE user_id = ? AND chat_id = ?",
+                (user_id, int(chat_id)),
+                commit=True,
+            )
         return cursor is not None and cursor.rowcount > 0
 
     def get_warnings_report(self, chat_id=None):
@@ -1684,7 +1705,18 @@ def get_performance_snapshot():
 
 
 def is_owner(user_id: int) -> bool:
-    return user_id in [OWNER_ID, SECOND_OWNER_ID, THIRD_OWNER_ID]
+    """Retorna se o ID é proprietário configurado ou a conta da sessão local."""
+    try:
+        normalized_id = int(user_id or 0)
+    except (TypeError, ValueError):
+        return False
+    session_id = getattr(cache.me, "id", None) if cache.me_loaded else None
+    configured_owner = (
+        normalized_id == OWNER_ID
+        or normalized_id == SECOND_OWNER_ID
+        or normalized_id == THIRD_OWNER_ID
+    )
+    return normalized_id != 0 and (configured_owner or normalized_id in OWNER_IDS or normalized_id == session_id)
 
 def is_authorized(user_id: int) -> bool:
     if is_owner(user_id):
@@ -1713,6 +1745,9 @@ def is_authorized_event(event) -> bool:
 
 ADMIN_CACHE_TTL = _env_int("ADMIN_CACHE_TTL", 180, 10, 900)
 ADMIN_CACHE_MAX_ENTRIES = _env_int("ADMIN_CACHE_MAX_ENTRIES", 20000, 1000, 100000)
+# Em filtros de mensagens, uma carga fria tem uma janela curta para concluir o
+# RPC compartilhado. Isso reduz bypasses sem transformar cada mensagem em RPC.
+ADMIN_FILTER_RPC_TIMEOUT = _env_int("ADMIN_FILTER_RPC_TIMEOUT_MS", 750, 100, 3000) / 1000
 _admin_status_cache = OrderedDict()
 _admin_status_inflight = {}
 
@@ -1738,11 +1773,17 @@ async def _refresh_chat_admin_status(chat_id, user_id):
                 "ChannelParticipantAdmin", "ChannelParticipantCreator",
             }
         )
-    except (RPCError, ValueError, TypeError):
+    except UserNotParticipantError:
+        # Resposta válida: quem não participa não pode ser administrador.
         allowed = False
+    except (FloodWaitError, ChatAdminRequiredError, RPCError, ValueError, TypeError) as exc:
+        # Estado desconhecido: filtros automáticos devem aguardar a próxima
+        # tentativa, nunca interpretar uma falha transitória como não-admin.
+        logger.debug("Estado administrativo indisponível no chat %s: %s", chat_id, exc)
+        allowed = None
     except Exception as exc:
         logger.debug("Falha ao verificar cargo no chat %s: %s", chat_id, exc)
-        allowed = False
+        allowed = None
     _admin_status_cache[key] = (allowed, time.monotonic())
     _admin_status_cache.move_to_end(key)
     while len(_admin_status_cache) > ADMIN_CACHE_MAX_ENTRIES:
@@ -1798,8 +1839,33 @@ async def is_chat_admin(chat_id, user_id, use_cache=True, wait_for_rpc=True):
         return False
 
 
+async def admin_state_for_filter(chat_id, user_id):
+    """Obtém o cargo para filtros com uma espera curta e compartilhada.
+
+    O primeiro acesso agenda uma consulta única. Se ela terminar rapidamente,
+    o filtro usa o resultado real; se o Telegram estiver lento, o filtro não
+    bloqueia o dispatcher nem transforma um estado desconhecido em admin.
+    """
+    state = await is_chat_admin(chat_id, user_id, wait_for_rpc=False)
+    if state is not None:
+        return state
+    try:
+        return await asyncio.wait_for(
+            is_chat_admin(chat_id, user_id, wait_for_rpc=True),
+            timeout=ADMIN_FILTER_RPC_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.debug("Estado administrativo ainda desconhecido para %s/%s após %.0f ms", chat_id, user_id, ADMIN_FILTER_RPC_TIMEOUT * 1000)
+        return None
+    except Exception as exc:
+        logger.debug("Falha ao obter estado administrativo no filtro %s/%s: %s", chat_id, user_id, exc)
+        return None
+
+
 async def can_manage_chat(event):
-    if is_owner(event.sender_id):
+    # Eventos outgoing pertencem à sessão autenticada e não devem depender
+    # de um sender_id aquecido no cache para usar comandos administrativos.
+    if is_outgoing_event(event) or is_owner(getattr(event, "sender_id", 0)):
         return True
     return await is_chat_admin(event.chat_id, event.sender_id)
 
@@ -2946,7 +3012,7 @@ async def chat_lock_filter(event):
     # comandos de uma conta já autorizada pelo Userbot.
     if (event.raw_text or "").startswith(".") and is_authorized(user_id):
         return
-    admin_state = await is_chat_admin(event.chat_id, user_id, wait_for_rpc=False)
+    admin_state = await admin_state_for_filter(event.chat_id, user_id)
     if admin_state is not False:
         return
     try:
@@ -3084,7 +3150,7 @@ async def antilink_filter(event):
         return
     if user_id in cache.link_whitelist.get(int(event.chat_id), set()):
         return
-    admin_state = await is_chat_admin(event.chat_id, user_id, wait_for_rpc=False)
+    admin_state = await admin_state_for_filter(event.chat_id, user_id)
     if admin_state is not False:
         return
     try:
@@ -3184,7 +3250,7 @@ async def antispam_filter(event):
         return
     # Administradores não entram no antispam: o antilink também possui a
     # mesma exceção e não deve haver punição automática de moderadores.
-    admin_state = await is_chat_admin(event.chat_id, user_id, wait_for_rpc=False)
+    admin_state = await admin_state_for_filter(event.chat_id, user_id)
     if admin_state is not False:
         return
     settings = await get_settings_async(event.chat_id)
@@ -5047,11 +5113,15 @@ async def cmd_delspy(event):
     if not target_id:
         await reply_or_edit(event, "❌ Responda à mensagem do espião, ou digite o ID/Username após .delspy", delete_after=DEFAULT_DELETE_AFTER)
         return
-    if not await asyncio.to_thread(db.remove_spy, target_id):
-        await reply_or_edit(event, "❌ Não foi possível remover o registro de espião no banco de dados.", delete_after=DEFAULT_DELETE_AFTER)
+    scope_chat_id = event.chat_id if (event.is_group or event.is_channel) else None
+    removed = await asyncio.to_thread(db.remove_spy, target_id, scope_chat_id)
+    if not removed:
+        scope_label = "neste chat" if scope_chat_id is not None else "no banco de dados"
+        await reply_or_edit(event, f"❌ Nenhum registro de espião foi encontrado {scope_label}.", delete_after=DEFAULT_DELETE_AFTER)
         return
     info = await asyncio.to_thread(db.get_user_info, target_id)
-    await reply_or_edit(event, f"✅ <b>{info} (<code>{target_id}</code>) removido da lista de espiões.</b>", delete_after=DEFAULT_DELETE_AFTER)
+    scope_label = "deste chat" if scope_chat_id is not None else "dos chats registrados"
+    await reply_or_edit(event, f"✅ <b>{info} (<code>{target_id}</code>) removido da lista de espiões {scope_label}.</b>", delete_after=DEFAULT_DELETE_AFTER)
 
 @client.on(events.NewMessage(pattern=r'^\.jtpurgeall(?:\s|$)', func=is_owner_event))
 async def cmd_purgeall(event):
