@@ -339,6 +339,16 @@ CHAT_MEMBER_CACHE_TTL = 5.0
 CHAT_MEMBER_ERROR_TTL = 1.5
 CHAT_MEMBER_CACHE: dict[tuple[int, int], tuple[float, object | None]] = {}
 ALLOWED_UPDATES = ["message", "my_chat_member"]
+BLACKLIST_TELEMETRY = {
+    "matched": 0,
+    "delete_scheduled": 0,
+    "delete_success": 0,
+    "delete_failed": 0,
+    "last_update_age_ms": None,
+    "last_queue_ms": None,
+    "last_delete_rpc_ms": None,
+    "max_delete_rpc_ms": 0.0,
+}
 
 
 def _remember_user_in_memory(user) -> Target:
@@ -359,6 +369,10 @@ def _safe_html(text: str) -> str:
     return escape(str(text or ""))
 
 
+def _format_ms(value) -> str:
+    return "—" if value is None else f"{float(value):.0f} ms"
+
+
 def _track_task(coro):
     task = asyncio.create_task(coro)
     _cleanup_tasks.add(task)
@@ -366,22 +380,32 @@ def _track_task(coro):
     return task
 
 
-async def _delete_now(message):
+async def _delete_now(message, scheduled_at: float | None = None):
+    started = time.perf_counter()
+    if scheduled_at is not None:
+        BLACKLIST_TELEMETRY["last_queue_ms"] = max(0.0, (started - scheduled_at) * 1000)
     try:
         await message.delete()
     except (BadRequest, Forbidden, TelegramError):
+        BLACKLIST_TELEMETRY["delete_failed"] += 1
         return False
     except asyncio.CancelledError:
         raise
     except Exception:
+        BLACKLIST_TELEMETRY["delete_failed"] += 1
         logger.debug("Falha inesperada ao apagar mensagem imediatamente", exc_info=True)
         return False
+    rpc_ms = (time.perf_counter() - started) * 1000
+    BLACKLIST_TELEMETRY["delete_success"] += 1
+    BLACKLIST_TELEMETRY["last_delete_rpc_ms"] = rpc_ms
+    BLACKLIST_TELEMETRY["max_delete_rpc_ms"] = max(BLACKLIST_TELEMETRY["max_delete_rpc_ms"], rpc_ms)
     return True
 
 
 def _schedule_delete_now(message):
     if message is not None:
-        _track_task(_delete_now(message))
+        BLACKLIST_TELEMETRY["delete_scheduled"] += 1
+        _track_task(_delete_now(message, time.perf_counter()))
 
 
 def _schedule_delete(message, delay: int = DELETE_AFTER_SECONDS):
@@ -618,9 +642,16 @@ async def cmd_latency(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚡ <b>Diagnóstico de latência — Bot API</b>\n\n"
         f"• API Telegram: {api_status}\n"
         f"• Tempo total: <code>{total_ms:.0f} ms</code>\n"
+        f"• Blacklist: <code>{BLACKLIST_TELEMETRY['matched']}</code> mensagens detectadas\n"
+        f"• Último update: <code>{_format_ms(BLACKLIST_TELEMETRY['last_update_age_ms'])}</code>\n"
+        f"• Fila local: <code>{_format_ms(BLACKLIST_TELEMETRY['last_queue_ms'])}</code>\n"
+        f"• Último RPC de exclusão: <code>{_format_ms(BLACKLIST_TELEMETRY['last_delete_rpc_ms'])}</code>\n"
+        f"• Maior RPC de exclusão: <code>{_format_ms(BLACKLIST_TELEMETRY['max_delete_rpc_ms'])}</code>\n"
+        f"• Exclusões: <code>{BLACKLIST_TELEMETRY['delete_success']}</code> OK / <code>{BLACKLIST_TELEMETRY['delete_failed']}</code> falhas\n"
         "• Polling: ✅ processo monitorado pelo watchdog\n"
         "• Userbot: ⏸️ desligado\n"
-        "\nO valor mede uma chamada real à API no momento do diagnóstico.",
+        "\nA medição separa atraso do update, fila local e tempo do RPC de exclusão."
+
     )
 
 
@@ -915,10 +946,16 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = int(user.id)
     if user_id in ALLBAN_CACHE and not _is_owner(user_id):
         target = _remember_user_in_memory(user)
+        BLACKLIST_TELEMETRY["matched"] += 1
+        if getattr(message, "date", None) is not None:
+            BLACKLIST_TELEMETRY["last_update_age_ms"] = max(0.0, (time.time() - message.date.timestamp()) * 1000)
         _schedule_delete_now(message)
         _track_task(_ban_in_chat(context, chat.id, target))
         return
     if user_id in BANPERM_CACHE.get(chat.id, set()) or user_id in BLACKLIST_CACHE.get(chat.id, set()):
+        BLACKLIST_TELEMETRY["matched"] += 1
+        if getattr(message, "date", None) is not None:
+            BLACKLIST_TELEMETRY["last_update_age_ms"] = max(0.0, (time.time() - message.date.timestamp()) * 1000)
         _schedule_delete_now(message)
         return
 
