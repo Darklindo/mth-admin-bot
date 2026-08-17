@@ -1,18 +1,18 @@
 # Catálogo de comandos — Jtzin Bot API + Userbot V9.0
 
-A V9.0 possui duas superfícies independentes. O **Bot API** usa comandos com `/` e também reconhece aliases com `.`. O **Userbot** usa comandos com `.` e só aceita mensagens do proprietário configurado em `OWNER_ID`.
+A V9.0 possui duas superfícies independentes. O **Bot API** usa somente comandos com `.`. O **Userbot** também usa comandos com `.` e só aceita mensagens do proprietário configurado em `OWNER_ID`.
 
 ## Bot API — moderação local e global
 
 | Comando | Função | Acesso |
 |---|---|---|
-| `/blacklist` ou `.blacklist` | Registra o alvo na blacklist local do grupo atual e apaga mensagens dele enquanto o bot estiver ativo. | Administrador do grupo ou `OWNER_IDS` |
-| `/unblacklist` ou `.unblacklist` | Remove o alvo da blacklist local do grupo atual. | Administrador do grupo ou `OWNER_IDS` |
-| `/banperm` ou `.banperm` | Bane permanentemente o alvo somente no grupo atual. | Administrador do grupo ou `OWNER_IDS` |
-| `/unbanperm` ou `.unbanperm` | Retira o banimento permanente do alvo no grupo atual. | Administrador do grupo ou `OWNER_IDS` |
-| `/allban` ou `.allban` | Registra o alvo na lista global e tenta bani-lo em todos os grupos conhecidos do Bot API. | Somente um dos `OWNER_IDS` |
-| `/unallban` ou `.unallban` | Remove o alvo da lista global e tenta desbaní-lo nos grupos conhecidos. | Somente um dos `OWNER_IDS` |
-| `/latency` ou `.latency` | Mede uma chamada real à API do Telegram e informa o tempo total. | Administradores do grupo ou `OWNER_IDS` |
+| `.blacklist` | Registra o alvo na blacklist local do grupo atual e apaga mensagens dele enquanto o bot estiver ativo. | Administrador do grupo ou `OWNER_IDS` |
+| `.unblacklist` | Remove o alvo da blacklist local do grupo atual. | Administrador do grupo ou `OWNER_IDS` |
+| `.banperm` | Bane permanentemente o alvo somente no grupo atual. | Administrador do grupo ou `OWNER_IDS` |
+| `.unbanperm` | Retira o banimento permanente do alvo no grupo atual. | Administrador do grupo ou `OWNER_IDS` |
+| `.allban` | Registra o alvo na lista global e tenta bani-lo em todos os grupos conhecidos do Bot API. | Somente um dos `OWNER_IDS` |
+| `.unallban` | Remove o alvo da lista global e tenta desbaní-lo nos grupos conhecidos. | Somente um dos `OWNER_IDS` |
+| `.latency` | Mede uma chamada real à API do Telegram e informa o tempo total. | Administradores do grupo ou `OWNER_IDS` |
 
 Todos os comandos aceitam reply à mensagem do alvo ou ID/username conhecido. Os proprietários podem usar a moderação local mesmo sem serem administradores do grupo, mas o Bot API precisa estar no grupo e possuir as permissões administrativas correspondentes. A função global não consegue operar em chats que o bot não conhece, não acessa ou onde não pode restringir membros. O banco do Bot API é separado do banco do Userbot.
 

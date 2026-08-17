@@ -13,14 +13,13 @@ from html import escape
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import BotCommand, Update
+from telegram import Update
 from telegram.constants import ChatType
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     ChatMemberHandler,
-    CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -557,7 +556,7 @@ def _reason(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 def _target_error(command: str) -> str:
     return (
-        f"❌ Informe o alvo para <code>/{command}</code> ou <code>.{command}</code>: "
+        f"❌ Informe o alvo para <code>.{command}</code>: "
         f"responda à mensagem do usuário, use um ID numérico ou um @username que o bot já tenha registrado. "
         f"Um username pessoal desconhecido não pode ser convertido em ID pela Bot API."
     )
@@ -593,7 +592,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update,
         "🛡️ <b>Jtzin Administrator Bot</b>\n\n"
         "Bot API dedicado a blacklist local, banimento permanente local e allban global.\n"
-        "Use /help para consultar a forma de uso.",
+        "Use .help para consultar a forma de uso.",
     )
 
 
@@ -602,13 +601,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update,
         "🛡️ <b>Jtzin Administrator Bot</b>\n\n"
         "<b>Comandos disponíveis</b>\n"
-        "<code>/blacklist</code> ou <code>.blacklist</code> — adiciona o alvo à blacklist deste grupo.\n"
-        "<code>/unblacklist</code> ou <code>.unblacklist</code> — remove a blacklist local.\n"
-        "<code>/banperm</code> ou <code>.banperm</code> — bane permanentemente o alvo deste grupo.\n"
-        "<code>/unbanperm</code> ou <code>.unbanperm</code> — remove o banimento deste grupo.\n"
-        "<code>/allban</code> ou <code>.allban</code> — o proprietário bane o alvo nos grupos registrados.\n"
-        "<code>/unallban</code> ou <code>.unallban</code> — remove o allban global e tenta desbanir o alvo.\n"
-        "<code>/latency</code> ou <code>.latency</code> — mede uma chamada real à API do Telegram.\n\n"
+        "<code>.blacklist</code> — adiciona o alvo à blacklist deste grupo.\n"
+        "<code>.unblacklist</code> — remove a blacklist local.\n"
+        "<code>.banperm</code> — bane permanentemente o alvo deste grupo.\n"
+        "<code>.unbanperm</code> — remove o banimento deste grupo.\n"
+        "<code>.allban</code> — o proprietário bane o alvo nos grupos registrados.\n"
+        "<code>.unallban</code> — remove o allban global e tenta desbanir o alvo.\n"
+        "<code>.latency</code> — mede uma chamada real à API do Telegram.\n\n"
         "Use respondendo à mensagem do alvo, informe o ID ou use um @username já registrado pelo bot. Os proprietários configurados podem usar "
         "a moderação local mesmo sem serem administradores do grupo; o bot ainda precisa ser administrador "
         "com permissão para apagar mensagens e restringir membros. Os comandos allban são exclusivos dos proprietários.",
@@ -973,19 +972,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     global BOT_USER_ID
     BOT_USER_ID = (await app.bot.get_me()).id
-    await app.bot.set_my_commands(
-        [
-            BotCommand("start", "Iniciar o bot"),
-            BotCommand("help", "Ver instruções"),
-            BotCommand("blacklist", "Adicionar à blacklist local"),
-            BotCommand("unblacklist", "Remover a blacklist local"),
-            BotCommand("banperm", "Banir permanentemente no grupo"),
-            BotCommand("unbanperm", "Remover o banimento do grupo"),
-            BotCommand("allban", "Banir em todos os grupos — proprietário"),
-            BotCommand("unallban", "Remover o allban — proprietário"),
-            BotCommand("latency", "Medir latência da API"),
-        ]
-    )
     logger.info("Jtzin Bot API online; proprietários=%s", ",".join(str(owner_id) for owner_id in sorted(OWNER_IDS)))
 
 
@@ -1007,15 +993,6 @@ def main():
         .build()
     )
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("blacklist", cmd_blacklist))
-    app.add_handler(CommandHandler("unblacklist", cmd_unblacklist))
-    app.add_handler(CommandHandler("banperm", cmd_banperm))
-    app.add_handler(CommandHandler("unbanperm", cmd_unbanperm))
-    app.add_handler(CommandHandler("allban", cmd_allban))
-    app.add_handler(CommandHandler("unallban", cmd_unallban))
-    app.add_handler(CommandHandler("latency", cmd_latency))
     app.add_handler(MessageHandler(filters.Regex(DOT_COMMAND_RE), on_dot_command))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_message), group=1)
     app.add_error_handler(error_handler)

@@ -101,18 +101,19 @@ tmux attach -t jtzin
 
 ## 7. Comandos do Bot API
 
-O Bot API aceita comandos tradicionais com `/` e aliases equivalentes com `.`:
+O Bot API responde somente a comandos iniciados por `.`, e o menu nativo de comandos do Telegram permanece desativado:
 
 ```text
-/blacklist   ou   .blacklist
-/unblacklist ou   .unblacklist
-/banperm     ou   .banperm
-/unbanperm   ou   .unbanperm
-/allban      ou   .allban
-/unallban    ou   .unallban
+.blacklist
+.unblacklist
+.banperm
+.unbanperm
+.allban
+.unallban
+.latency
 ```
 
-Responda à mensagem do alvo ou informe um ID numérico. Usernames só podem ser resolvidos quando o bot já os conhece ou quando foram registrados anteriormente. `/blacklist` e `/banperm` exigem administração real do grupo. `/allban` e `/unallban` são exclusivos dos dois IDs configurados em `OWNER_IDS`; eles tentam operar nos chats conhecidos em que o bot tenha acesso.
+Responda à mensagem do alvo ou informe um ID numérico. Usernames só podem ser resolvidos quando o bot já os conhece ou quando foram registrados anteriormente. `.blacklist` e `.banperm` permitem o uso pelos proprietários configurados mesmo sem cargo no grupo, mas o Bot API precisa ter as permissões administrativas correspondentes. `.allban` e `.unallban` são exclusivos dos dois IDs configurados em `OWNER_IDS`; eles tentam operar nos chats conhecidos em que o bot tenha acesso.
 
 ## 8. Comandos do Userbot
 
