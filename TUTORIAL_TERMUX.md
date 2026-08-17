@@ -113,7 +113,7 @@ O Bot API responde somente a comandos iniciados por `.`, e o menu nativo de coma
 .latency
 ```
 
-Responda à mensagem do alvo ou informe um ID numérico. Usernames só podem ser resolvidos quando o bot já os conhece ou quando foram registrados anteriormente. `.blacklist` e `.banperm` permitem o uso pelos proprietários configurados mesmo sem cargo no grupo, mas o Bot API precisa ter as permissões administrativas correspondentes. `.allban` e `.unallban` são exclusivos dos dois IDs configurados em `OWNER_IDS`; eles tentam operar nos chats conhecidos em que o bot tenha acesso.
+Responda à mensagem do alvo ou informe um ID numérico. Usernames só podem ser resolvidos quando o bot já os conhece ou quando foram registrados anteriormente. **Todos os comandos do Bot API são exclusivos dos dois owners configurados em `OWNER_IDS`; administradores comuns não recebem respostas nem podem executar comandos.** O Bot API ainda precisa ter as permissões administrativas correspondentes para realizar as ações. `.allban` e `.unallban` também são exclusivos dos dois IDs e tentam operar nos chats conhecidos em que o bot tenha acesso.
 
 ## 8. Comandos do Userbot
 
@@ -144,7 +144,7 @@ tail -f ~/mth-admin/logs/bot_api.log
 tail -f ~/mth-admin/logs/userbot.log
 ```
 
-O Bot API oferece `/latency` e `.latency` para proprietários e administradores de grupo. O Userbot oferece `.status`, `.health` e `.latency` quando for reativado. Para interromper o processo atual do Bot API:
+O Bot API oferece somente `.help` e `.latency` no modo dot-only, e ambos são exclusivos dos proprietários configurados. O Userbot oferece `.status`, `.health` e `.latency` quando for reativado. Para interromper o processo atual do Bot API:
 
 ```bash
 tmux kill-session -t jtzin

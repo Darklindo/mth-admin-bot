@@ -567,9 +567,7 @@ async def _require_group_admin(update: Update, context: ContextTypes.DEFAULT_TYP
     await _remember_message_context(update)
     if update.effective_user and _is_owner(update.effective_user.id):
         return True
-    if await _is_chat_admin(update, context):
-        return True
-    await _reply_and_cleanup(update, "⛔ Apenas administradores do grupo ou os proprietários configurados podem usar este comando.")
+    await _reply_and_cleanup(update, "⛔ Somente os proprietários configurados podem usar os comandos deste bot.")
     return False
 
 
@@ -691,9 +689,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>.allban</code> — o proprietário bane o alvo nos grupos registrados.\n"
         "<code>.unallban</code> — remove o allban global e tenta desbanir o alvo.\n"
         "<code>.latency</code> — mede uma chamada real à API do Telegram.\n\n"
-        "Use respondendo à mensagem do alvo, informe o ID ou use um @username já registrado pelo bot. Os proprietários configurados podem usar "
-        "a moderação local mesmo sem serem administradores do grupo; o bot ainda precisa ser administrador "
-        "com permissão para apagar mensagens e restringir membros. Os comandos allban são exclusivos dos proprietários.",
+        "Somente os dois proprietários configurados podem usar e receber respostas deste bot. "
+        "A moderação local ainda exige que o bot seja administrador com permissão para apagar mensagens "
+        "e restringir membros.",
     )
 
 
@@ -701,9 +699,7 @@ async def _require_operator(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user = update.effective_user
     if user and _is_owner(user.id):
         return True
-    if _is_group(update) and await _is_chat_admin(update, context):
-        return True
-    await _reply_and_cleanup(update, "⛔ Este diagnóstico está disponível aos administradores do grupo e aos proprietários configurados.")
+    await _reply_and_cleanup(update, "⛔ Somente os proprietários configurados podem usar os comandos deste bot.")
     return False
 
 
@@ -756,8 +752,9 @@ async def cmd_unblacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_and_cleanup(update, f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) removido da blacklist local.")
 
 
-DOT_COMMAND_RE = re.compile(r"^\.(unblacklist|unbanperm|unallban|blacklist|banperm|allban|latency)(?:\s+.*)?$", re.IGNORECASE)
+DOT_COMMAND_RE = re.compile(r"^\.(help|unblacklist|unbanperm|unallban|blacklist|banperm|allban|latency)(?:\s+.*)?$", re.IGNORECASE)
 DOT_COMMANDS = {
+    "help": "cmd_help",
     "blacklist": "cmd_blacklist",
     "unblacklist": "cmd_unblacklist",
     "banperm": "cmd_banperm",
@@ -773,6 +770,9 @@ async def on_dot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (message.text or "").strip() if message else ""
     match = DOT_COMMAND_RE.fullmatch(text)
     if not match:
+        return
+    if not message.from_user or not _is_owner(message.from_user.id):
+        # Não responder, não editar e não enviar mensagem para qualquer não-owner.
         return
     parts = text.split()
     command = parts[0][1:].lower()

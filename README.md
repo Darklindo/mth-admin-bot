@@ -8,7 +8,7 @@ Projeto de administração para Telegram com dois processos independentes no Ter
 
 | Processo | Arquivo | Prefixo | Acesso | Banco |
 |---|---|---|---|---|
-| Bot comum | `bot.py` | `.` | Administradores dos grupos; `.allban` e `.unallban` exigem um dos proprietários | `data/bot_api.db` |
+| Bot comum | `bot.py` | `.` | Somente os dois `OWNER_IDS`; administradores comuns não recebem respostas | `data/bot_api.db` |
 | Userbot | `bot_v2.py` | `.` | Somente o `OWNER_ID` configurado | `data/bot.db` |
 
 O Bot API e o Userbot não compartilham sessão, token, banco nem estado de autorização. O Userbot não possui mais subproprietários ou autorização delegada; os comandos `.autorizar`, `.desautorizar` e `.listauth` não fazem parte da superfície operacional da V9.0.
@@ -19,15 +19,15 @@ O bot comum oferece moderação local e global e responde somente a comandos ini
 
 | Comando | Função | Permissão |
 |---|---|---|
-| `.blacklist` | Cadastra o alvo na blacklist local do grupo e apaga as mensagens dele enquanto o bot estiver ativo | Administrador do grupo ou `OWNER_IDS` |
-| `.unblacklist` | Remove o alvo da blacklist local do grupo | Administrador do grupo ou `OWNER_IDS` |
-| `.banperm` | Bane permanentemente o alvo no grupo atual | Administrador do grupo ou `OWNER_IDS` |
-| `.unbanperm` | Retira o banimento permanente do alvo no grupo atual | Administrador do grupo ou `OWNER_IDS` |
+| `.blacklist` | Cadastra o alvo na blacklist local do grupo e apaga as mensagens dele enquanto o bot estiver ativo | Somente `OWNER_IDS` |
+| `.unblacklist` | Remove o alvo da blacklist local do grupo | Somente `OWNER_IDS` |
+| `.banperm` | Bane permanentemente o alvo no grupo atual | Somente `OWNER_IDS` |
+| `.unbanperm` | Retira o banimento permanente do alvo no grupo atual | Somente `OWNER_IDS` |
 | `.allban` | Registra o alvo na blacklist global e tenta bani-lo em todos os grupos conhecidos | Somente um dos `OWNER_IDS` |
 | `.unallban` | Remove o alvo da lista global e tenta desbaní-lo nos grupos conhecidos | Somente um dos `OWNER_IDS` |
-| `.latency` | Mede uma chamada real à API do Telegram | Administradores do grupo ou `OWNER_IDS` |
+| `.latency` | Mede uma chamada real à API do Telegram | Somente `OWNER_IDS` |
 
-O banco mantém a lista por chat e o Bot API possui cache próprio. Os proprietários configurados podem executar a moderação local mesmo sem serem administradores do grupo, mas o bot precisa estar presente e ter permissões administrativas para apagar mensagens ou restringir usuários; os comandos globais só podem alcançar grupos nos quais ele esteja presente e autorizado.
+O banco mantém a lista por chat e o Bot API possui cache próprio. **Somente os dois owners configurados em `OWNER_IDS` recebem respostas e executam comandos; administradores comuns não têm acesso ao dispatcher.** O bot precisa estar presente e ter permissões administrativas para apagar mensagens ou restringir usuários; os comandos globais só podem alcançar grupos nos quais ele esteja presente e autorizado.
 
 As respostas e os comandos são removidos automaticamente após alguns segundos. O bot é deliberadamente independente: não contém o restante dos recursos do Userbot, não aceita autorização de terceiros e não possui subproprietários.
 
