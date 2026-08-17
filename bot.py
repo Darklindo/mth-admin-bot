@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -15,7 +16,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatType
-from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -88,6 +89,10 @@ DELETE_BATCH_WINDOW_SECONDS = 0.008
 DELETE_BATCH_MAX_MESSAGES = 100
 API_CONNECTION_POOL_SIZE = 32
 GET_UPDATES_READ_TIMEOUT_SECONDS = 35.0
+POLLING_BOOTSTRAP_RETRIES = -1
+POLLING_TIMEOUT_SECONDS = 35
+DB_RETRY_ATTEMPTS = 3
+DB_RETRY_BACKOFF_SECONDS = 0.05
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -384,11 +389,35 @@ def _format_ms(value) -> str:
     return "—" if value is None else f"{float(value):.0f} ms"
 
 
+def _retry_delay(exc: RetryAfter, maximum: float = 60.0) -> float:
+    try:
+        delay = float(exc.retry_after)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(delay):
+        return 1.0
+    return min(max(delay, 0.0), maximum)
+
+
 def _track_task(coro):
     task = asyncio.create_task(coro)
     _cleanup_tasks.add(task)
     task.add_done_callback(_cleanup_tasks.discard)
     return task
+
+
+async def _db_call(method, *args, **kwargs):
+    """Executa SQLite fora do event loop e repete somente locks transitórios."""
+    for attempt in range(DB_RETRY_ATTEMPTS):
+        try:
+            return await asyncio.to_thread(method, *args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" not in message and "busy" not in message:
+                raise
+            if attempt + 1 >= DB_RETRY_ATTEMPTS:
+                raise
+            await asyncio.sleep(DB_RETRY_BACKOFF_SECONDS * (attempt + 1))
 
 
 async def _delete_one(bot, chat_id: int, message_id: int, scheduled_at: float | None = None):
@@ -400,7 +429,7 @@ async def _delete_one(bot, chat_id: int, message_id: int, scheduled_at: float | 
     except RetryAfter as exc:
         # Respeita o flood control do Telegram e faz uma única repetição segura.
         try:
-            await asyncio.sleep(min(max(float(exc.retry_after), 0.0), 60.0))
+            await asyncio.sleep(_retry_delay(exc))
             await bot.delete_message(chat_id=chat_id, message_id=message_id)
         except (BadRequest, Forbidden, RetryAfter, TelegramError):
             BLACKLIST_TELEMETRY["delete_failed"] += 1
@@ -440,7 +469,7 @@ async def _delete_batch_worker(bot, chat_id: int):
                 batch_ok = bool(await delete_messages(chat_id=chat_id, message_ids=message_ids))
             except RetryAfter as exc:
                 try:
-                    await asyncio.sleep(min(max(float(exc.retry_after), 0.0), 60.0))
+                    await asyncio.sleep(_retry_delay(exc))
                     batch_ok = bool(await delete_messages(chat_id=chat_id, message_ids=message_ids))
                 except (BadRequest, Forbidden, RetryAfter, TelegramError):
                     pass
@@ -517,6 +546,11 @@ async def _reply_and_cleanup(update: Update, text: str, *, parse_mode: str | Non
         response = await message.reply_text(text, **kwargs)
     except TelegramError:
         return None
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("Falha inesperada ao enviar resposta do comando", exc_info=True)
+        return None
     _schedule_delete(message)
     _schedule_delete(response)
     return response
@@ -560,11 +594,10 @@ async def _is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return bool(member and member.status in {"administrator", "creator"})
 
 
-async def _require_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def _require_owner_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not _is_group(update):
         await _reply_and_cleanup(update, "❌ Este comando só pode ser usado em grupos ou supergrupos.")
         return False
-    await _remember_message_context(update)
     if update.effective_user and _is_owner(update.effective_user.id):
         return True
     await _reply_and_cleanup(update, "⛔ Somente os proprietários configurados podem usar os comandos deste bot.")
@@ -602,7 +635,7 @@ async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         previous = KNOWN_USERS.get(int(reply.from_user.id))
         target = _remember_user_in_memory(reply.from_user)
         if previous != (target.username, target.full_name):
-            await asyncio.to_thread(db.remember_user, target.user_id, target.username, target.full_name)
+            await _db_call(db.remember_user, target.user_id, target.username, target.full_name)
         return target
 
     args = list(context.args or [])
@@ -619,7 +652,7 @@ async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if uid is not None:
             username, full_name = KNOWN_USERS[uid]
             return Target(uid, username, full_name)
-        row = await asyncio.to_thread(db.resolve_username, raw[1:])
+        row = await _db_call(db.resolve_username, raw[1:])
         if row:
             keys = row.keys()
             return Target(
@@ -651,13 +684,13 @@ async def _remember_message_context(update: Update):
     if chat.id not in _chat_registration_seen:
         _chat_registration_seen.add(chat.id)
         KNOWN_CHAT_IDS.add(chat.id)
-        await asyncio.to_thread(db.register_chat, chat.id, chat.title or "", chat.type)
+        await _db_call(db.register_chat, chat.id, chat.title or "", chat.type)
     if not user.is_bot:
         user_id = int(user.id)
         previous = KNOWN_USERS.get(user_id)
         target = _remember_user_in_memory(user)
         if previous != (target.username, target.full_name):
-            await asyncio.to_thread(db.remember_user, target.user_id, target.username, target.full_name)
+            await _db_call(db.remember_user, target.user_id, target.username, target.full_name)
 
 
 async def _safe_delete(message) -> bool:
@@ -736,7 +769,7 @@ async def cmd_latency(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_unblacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _require_group_admin(update, context):
+    if not await _require_owner_access(update, context):
         return
     target = await _resolve_target(update, context)
     if target is None:
@@ -744,7 +777,7 @@ async def cmd_unblacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     was_cached = target.user_id in BLACKLIST_CACHE.get(chat_id, set())
-    removed = await asyncio.to_thread(db.remove_blacklist, target.user_id, chat_id)
+    removed = await _db_call(db.remove_blacklist, target.user_id, chat_id)
     BLACKLIST_CACHE.get(chat_id, set()).discard(target.user_id)
     if not removed and not was_cached:
         await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> não estava na blacklist deste grupo.")
@@ -784,12 +817,20 @@ async def on_dot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.args = parts[1:]
     try:
         await handler(update, context)
+    except asyncio.CancelledError:
+        raise
+    except TelegramError as exc:
+        logger.warning("Falha do Telegram ao executar .%s: %s", command, exc)
+        await _reply_and_cleanup(update, "❌ O Telegram recusou esta operação ou a conexão falhou. Tente novamente.")
+    except Exception:
+        logger.exception("Falha inesperada ao executar .%s", command)
+        await _reply_and_cleanup(update, "❌ Ocorreu um erro interno ao executar este comando.")
     finally:
         context.args = original_args
 
 
 async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _require_group_admin(update, context):
+    if not await _require_owner_access(update, context):
         return
     target = await _resolve_target(update, context)
     if target is None:
@@ -806,7 +847,7 @@ async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> já está na blacklist deste grupo.")
         return
     reason = _reason(context)
-    if not await asyncio.to_thread(db.add_blacklist, target, chat_id, update.effective_user.id, reason):
+    if not await _db_call(db.add_blacklist, target, chat_id, update.effective_user.id, reason):
         await _reply_and_cleanup(update, "❌ Não foi possível persistir a blacklist.")
         return
     BLACKLIST_CACHE[chat_id].add(target.user_id)
@@ -818,7 +859,7 @@ async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_banperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _require_group_admin(update, context):
+    if not await _require_owner_access(update, context):
         return
     target = await _resolve_target(update, context)
     if target is None:
@@ -834,14 +875,19 @@ async def cmd_banperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _bot_can_restrict(chat_id, context):
         await _reply_and_cleanup(update, "❌ Conceda ao bot a permissão de restringir/banir membros.")
         return
-    try:
-        await context.bot.ban_chat_member(chat_id, target.user_id)
-    except (Forbidden, BadRequest, RetryAfter, TelegramError):
-        logger.exception("Falha ao aplicar banperm em %s/%s", chat_id, target.user_id)
-        await _reply_and_cleanup(update, "❌ Não foi possível aplicar o banimento permanente neste grupo.")
+    ban_result = await _ban_in_chat(context, chat_id, target)
+    if ban_result != "ok":
+        logger.warning("Falha ao aplicar banperm em %s/%s: %s", chat_id, target.user_id, ban_result)
+        if ban_result == "forbidden":
+            text = "❌ O bot não tem permissão para banir membros neste grupo."
+        elif ban_result == "skipped":
+            text = "❌ O Telegram não permitiu banir este alvo, possivelmente por ele ser administrador."
+        else:
+            text = "❌ Não foi possível aplicar o banimento permanente neste grupo."
+        await _reply_and_cleanup(update, text)
         return
     reason = _reason(context)
-    if not await asyncio.to_thread(db.add_banperm, target, chat_id, update.effective_user.id, reason):
+    if not await _db_call(db.add_banperm, target, chat_id, update.effective_user.id, reason):
         logger.error("Banimento aplicado, mas não persistido em %s/%s", chat_id, target.user_id)
         BANPERM_CACHE[chat_id].add(target.user_id)
         await _reply_and_cleanup(update, "⚠️ Banimento aplicado, mas o registro local não pôde ser persistido.")
@@ -851,7 +897,7 @@ async def cmd_banperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_unbanperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _require_group_admin(update, context):
+    if not await _require_owner_access(update, context):
         return
     target = await _resolve_target(update, context)
     if target is None:
@@ -862,19 +908,16 @@ async def cmd_unbanperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not was_cached:
         await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> não estava banido permanentemente neste grupo.")
         return
-    try:
-        await context.bot.unban_chat_member(chat_id, target.user_id, only_if_banned=True)
-    except BadRequest as exc:
-        text = str(exc).lower()
-        if "not banned" not in text and "user is not banned" not in text:
-            logger.warning("Falha ao retirar banperm em %s/%s: %s", chat_id, target.user_id, exc)
-            await _reply_and_cleanup(update, "❌ Não foi possível retirar o banimento neste grupo.")
-            return
-    except TelegramError:
-        logger.exception("Falha ao retirar banperm em %s/%s", chat_id, target.user_id)
-        await _reply_and_cleanup(update, "❌ Não foi possível retirar o banimento neste grupo.")
+    unban_result = await _unban_in_chat(context, chat_id, target)
+    if unban_result not in {"ok", "skipped"}:
+        logger.warning("Falha ao retirar banperm em %s/%s: %s", chat_id, target.user_id, unban_result)
+        if unban_result == "forbidden":
+            text = "❌ O bot não tem permissão para retirar banimentos neste grupo."
+        else:
+            text = "❌ Não foi possível retirar o banimento neste grupo."
+        await _reply_and_cleanup(update, text)
         return
-    await asyncio.to_thread(db.remove_banperm, target.user_id, chat_id)
+    await _db_call(db.remove_banperm, target.user_id, chat_id)
     BANPERM_CACHE.get(chat_id, set()).discard(target.user_id)
     await _reply_and_cleanup(update, f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) desbanido neste grupo.")
 
@@ -885,10 +928,15 @@ async def _ban_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, target:
         return "ok"
     except RetryAfter as exc:
         try:
-            await asyncio.sleep(float(exc.retry_after))
+            await asyncio.sleep(_retry_delay(exc))
             await context.bot.ban_chat_member(chat_id, target.user_id)
             return "ok"
+        except asyncio.CancelledError:
+            raise
         except TelegramError:
+            return "failed"
+        except Exception:
+            logger.exception("Falha inesperada ao banir em %s/%s", chat_id, target.user_id)
             return "failed"
     except Forbidden:
         return "forbidden"
@@ -899,12 +947,29 @@ async def _ban_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, target:
         return "failed"
     except TelegramError:
         return "failed"
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Falha inesperada ao banir em %s/%s", chat_id, target.user_id)
+        return "failed"
 
 
 async def _unban_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, target: Target):
     try:
         await context.bot.unban_chat_member(chat_id, target.user_id, only_if_banned=True)
         return "ok"
+    except RetryAfter as exc:
+        try:
+            await asyncio.sleep(_retry_delay(exc))
+            await context.bot.unban_chat_member(chat_id, target.user_id, only_if_banned=True)
+            return "ok"
+        except asyncio.CancelledError:
+            raise
+        except TelegramError:
+            return "failed"
+        except Exception:
+            logger.exception("Falha inesperada ao repetir unban em %s/%s", chat_id, target.user_id)
+            return "failed"
     except BadRequest as exc:
         text = str(exc).lower()
         if "not banned" in text or "user is not banned" in text:
@@ -914,14 +979,17 @@ async def _unban_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, targe
         return "forbidden"
     except TelegramError:
         return "failed"
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Falha inesperada ao desbanir em %s/%s", chat_id, target.user_id)
+        return "failed"
 
 
 async def cmd_unallban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not _is_owner(update.effective_user.id):
         await _reply_and_cleanup(update, "⛔ Este comando é exclusivo dos proprietários configurados.")
         return
-    if _is_group(update):
-        await _remember_message_context(update)
     target = await _resolve_target(update, context)
     if target is None:
         await _reply_and_cleanup(update, _target_error("unallban"))
@@ -929,11 +997,11 @@ async def cmd_unallban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target.user_id not in ALLBAN_CACHE:
         await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> não estava no allban global.")
         return
-    if not await asyncio.to_thread(db.remove_allban, target.user_id):
+    if not await _db_call(db.remove_allban, target.user_id):
         await _reply_and_cleanup(update, "❌ Não foi possível remover o allban global do banco.")
         return
     ALLBAN_CACHE.discard(target.user_id)
-    rows = await asyncio.to_thread(db.active_chats)
+    rows = await _db_call(db.active_chats)
     if not rows:
         await _reply_and_cleanup(update, f"✅ Allban removido para <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>).")
         return
@@ -958,10 +1026,8 @@ async def cmd_unallban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_allban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not _is_owner(update.effective_user.id):
-        await _reply_and_cleanup(update, "⛔ Este comando é exclusivo do proprietário configurado.")
+        await _reply_and_cleanup(update, "⛔ Este comando é exclusivo dos proprietários configurados.")
         return
-    if _is_group(update):
-        await _remember_message_context(update)
     target = await _resolve_target(update, context)
     if target is None:
         await _reply_and_cleanup(update, _target_error("allban"))
@@ -969,13 +1035,16 @@ async def cmd_allban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _is_owner(target.user_id):
         await _reply_and_cleanup(update, "❌ O proprietário não pode ser banido.")
         return
+    if target.user_id in ALLBAN_CACHE:
+        await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> já está no allban global.")
+        return
     reason = _reason(context)
-    if not await asyncio.to_thread(db.add_allban, target, update.effective_user.id, reason):
+    if not await _db_call(db.add_allban, target, update.effective_user.id, reason):
         await _reply_and_cleanup(update, "❌ Não foi possível registrar o allban global.")
         return
     ALLBAN_CACHE.add(target.user_id)
 
-    rows = await asyncio.to_thread(db.active_chats)
+    rows = await _db_call(db.active_chats)
     if not rows:
         await _reply_and_cleanup(update, "✅ Allban registrado. Nenhum grupo ativo está registrado para receber a ação agora.")
         return
@@ -1016,7 +1085,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         KNOWN_CHAT_IDS.discard(chat.id)
         _chat_registration_seen.discard(chat.id)
-    await asyncio.to_thread(db.register_chat, chat.id, chat.title or "", chat.type, active)
+    await _db_call(db.register_chat, chat.id, chat.title or "", chat.type, active)
 
 
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1043,15 +1112,25 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _schedule_delete_now(context.bot, message)
         return
 
+    # Não desperdiçar SQLite com comandos pontuados já tratados pelo dispatcher.
+    # A verificação ocorre depois do fast path para nunca deixar de apagar uma
+    # mensagem de usuário que esteja em allban, banperm ou blacklist.
+    if (getattr(message, "text", "") or "").lstrip().startswith("."):
+        return
     # Mensagens normais podem atualizar contexto e persistência sem atrasar a exclusão do fast path.
     await _remember_message_context(update)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    if isinstance(context.error, RetryAfter):
-        logger.warning("Telegram solicitou RetryAfter: %s", context.error)
+    error = context.error
+    if error is None:
+        return
+    if isinstance(error, RetryAfter):
+        logger.warning("Telegram solicitou RetryAfter: %s", error)
+    elif isinstance(error, NetworkError):
+        logger.warning("Falha transitória de rede no Bot API; o polling continuará tentando: %s", error)
     else:
-        logger.exception("Erro não tratado no Bot API", exc_info=context.error)
+        logger.exception("Erro não tratado no Bot API", exc_info=error)
 
 
 async def post_init(app: Application):
@@ -1099,8 +1178,17 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(DOT_COMMAND_RE), on_dot_command))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_message), group=1)
     app.add_error_handler(error_handler)
-    logger.info("Iniciando polling do Jtzin Bot API")
-    app.run_polling(allowed_updates=ALLOWED_UPDATES, drop_pending_updates=True)
+    logger.info(
+        "Iniciando polling do Jtzin Bot API (bootstrap_retries=%s, timeout=%ss)",
+        POLLING_BOOTSTRAP_RETRIES,
+        POLLING_TIMEOUT_SECONDS,
+    )
+    app.run_polling(
+        timeout=POLLING_TIMEOUT_SECONDS,
+        bootstrap_retries=POLLING_BOOTSTRAP_RETRIES,
+        allowed_updates=ALLOWED_UPDATES,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":

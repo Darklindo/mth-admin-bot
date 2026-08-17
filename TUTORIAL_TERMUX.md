@@ -25,7 +25,7 @@ Use o Termux atualizado em um dispositivo Android com conexão estável. O pacot
 
 Para o Userbot, acesse [my.telegram.org](https://my.telegram.org), entre com a conta que será autenticada e obtenha `API_ID` e `API_HASH`. O `OWNER_ID` deve ser o ID numérico da conta **JT Cacique** que utilizará a sessão do Userbot.
 
-Para o Bot API, abra o `@BotFather`, crie um bot e copie o token diretamente para o arquivo privado `.env.bot`. Se o token já tiver sido compartilhado, revogue-o antes.
+Para o Bot API, abra o `@BotFather`, crie um bot e copie o token diretamente para o arquivo privado `.env.bot`. Se o token já tiver sido compartilhado, revogue-o antes. Como os comandos do Bot API usam `.`, abra também `/setprivacy` no `@BotFather`, selecione `@Mhzinbot_bot` e escolha `Disable`; sem isso, mensagens pontuadas em grupos não chegam ao bot.
 
 ## 4. Instalação limpa
 
@@ -91,7 +91,7 @@ tmux kill-session -t jtzin 2>/dev/null || true
 tmux new-session -d -s jtzin './watchdog_bot_only.sh'
 ```
 
-O `watchdog_bot_only.sh` inicia `bot.py`, reinicia o Bot API com backoff e grava `logs/bot_api.log`. O `watchdog_all.sh` só deve ser usado quando o Userbot for reativado deliberadamente.
+O `watchdog_bot_only.sh` inicia `bot.py`, reinicia o Bot API com backoff progressivo e grava `logs/bot_api.log`. O próprio polling tenta recuperar falhas transitórias de rede durante o bootstrap; se o processo cair, o watchdog reinicia apenas o Bot API. O `watchdog_all.sh` só deve ser usado quando o Userbot for reativado deliberadamente.
 
 Para sair da visualização sem encerrar os serviços, pressione `Ctrl+B` e depois `D`. Para retornar:
 
@@ -174,4 +174,4 @@ tmux kill-session -t jtzin
 
 Nunca publique tokens, `API_HASH`, sessões, bancos, backups ou logs com dados privados. O Bot API e o Userbot não devem compartilhar tokens ou arquivos de sessão. Se uma credencial for exposta, revogue-a ou substitua-a antes de continuar.
 
-O Telegram pode recusar banimentos, exclusões e edições quando faltarem permissões, houver FloodWait, limitações da conta ou restrições específicas do chat. O `/allban` não consegue operar em chats que o Bot API não acessa.
+O Telegram pode recusar banimentos, exclusões e edições quando faltarem permissões, houver FloodWait, limitações da conta ou restrições específicas do chat. O `.allban` não consegue operar em chats que o Bot API não acessa.

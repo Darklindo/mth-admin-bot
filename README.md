@@ -13,6 +13,8 @@ Projeto de administração para Telegram com dois processos independentes no Ter
 
 O Bot API e o Userbot não compartilham sessão, token, banco nem estado de autorização. O Userbot não possui mais subproprietários ou autorização delegada; os comandos `.autorizar`, `.desautorizar` e `.listauth` não fazem parte da superfície operacional da V9.0.
 
+Para que comandos com ponto enviados em grupos sejam recebidos pelo Bot API, desative o Privacy Mode no `@BotFather` com `/setprivacy`, selecione o bot e escolha `Disable`. A confirmação pode ser verificada pelo campo `can_read_all_group_messages=true` no método `getMe`. Isso não habilita comandos slash nem o menu nativo.
+
 ## Funções do Bot API
 
 O bot comum oferece moderação local e global e responde somente a comandos iniciados por `.`, além de reply à mensagem do alvo ou ID/username previamente conhecido pelo bot. O menu nativo de comandos do Telegram permanece desativado para evitar respostas a comandos slash enviados por membros.
@@ -85,7 +87,7 @@ tmux kill-session -t jtzin 2>/dev/null || true
 tmux new-session -d -s jtzin './watchdog_bot_only.sh'
 ```
 
-O `watchdog_bot_only.sh` inicia apenas `bot.py`, grava o log em `logs/bot_api.log` e reinicia o Bot API com backoff. O `watchdog_all.sh` só deve ser usado quando o Userbot for reativado deliberadamente.
+O `watchdog_bot_only.sh` inicia apenas `bot.py`, grava o log em `logs/bot_api.log` e reinicia o Bot API com backoff progressivo. O `bot.py` também mantém tentativas de bootstrap do polling para recuperar falhas transitórias de DNS ou rede; após uma queda do processo, o watchdog reinicia automaticamente. O `watchdog_all.sh` só deve ser usado quando o Userbot for reativado deliberadamente.
 
 Para sair da sessão sem encerrar os processos, use `Ctrl+B` e depois `D`. Para retornar:
 
