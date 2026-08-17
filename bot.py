@@ -24,6 +24,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -81,6 +82,12 @@ DB_PATH = DATA_DIR / "bot_api.db"
 DELETE_AFTER_SECONDS = 5
 ALLBAN_CONCURRENCY = 4
 MAX_TARGET_ID_LENGTH = 20
+# O lote aguarda apenas alguns milissegundos para capturar uma rajada sem atrasar
+# uma mensagem isolada. O Telegram aceita de 1 a 100 IDs no deleteMessages.
+DELETE_BATCH_WINDOW_SECONDS = 0.008
+DELETE_BATCH_MAX_MESSAGES = 100
+API_CONNECTION_POOL_SIZE = 32
+GET_UPDATES_READ_TIMEOUT_SECONDS = 35.0
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -328,6 +335,8 @@ except sqlite3.Error:
 
 BOT_USER_ID = 0
 _cleanup_tasks: set[asyncio.Task] = set()
+_delete_batch_pending: dict[int, dict[int, float]] = defaultdict(dict)
+_delete_batch_tasks: dict[int, asyncio.Task] = {}
 _chat_registration_seen = set(KNOWN_CHAT_IDS)
 KNOWN_USERNAME_IDS = {
     username.lower(): int(user_id)
@@ -347,6 +356,9 @@ BLACKLIST_TELEMETRY = {
     "last_queue_ms": None,
     "last_delete_rpc_ms": None,
     "max_delete_rpc_ms": 0.0,
+    "batch_success": 0,
+    "batch_messages": 0,
+    "batch_fallbacks": 0,
 }
 
 
@@ -379,12 +391,20 @@ def _track_task(coro):
     return task
 
 
-async def _delete_now(message, scheduled_at: float | None = None):
+async def _delete_one(bot, chat_id: int, message_id: int, scheduled_at: float | None = None):
     started = time.perf_counter()
     if scheduled_at is not None:
         BLACKLIST_TELEMETRY["last_queue_ms"] = max(0.0, (started - scheduled_at) * 1000)
     try:
-        await message.delete()
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except RetryAfter as exc:
+        # Respeita o flood control do Telegram e faz uma única repetição segura.
+        try:
+            await asyncio.sleep(min(max(float(exc.retry_after), 0.0), 60.0))
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except (BadRequest, Forbidden, RetryAfter, TelegramError):
+            BLACKLIST_TELEMETRY["delete_failed"] += 1
+            return False
     except (BadRequest, Forbidden, TelegramError):
         BLACKLIST_TELEMETRY["delete_failed"] += 1
         return False
@@ -401,10 +421,73 @@ async def _delete_now(message, scheduled_at: float | None = None):
     return True
 
 
-def _schedule_delete_now(message):
-    if message is not None:
-        BLACKLIST_TELEMETRY["delete_scheduled"] += 1
-        _track_task(_delete_now(message, time.perf_counter()))
+async def _delete_batch_worker(bot, chat_id: int):
+    await asyncio.sleep(DELETE_BATCH_WINDOW_SECONDS)
+    try:
+        pending = _delete_batch_pending.get(chat_id)
+        if not pending:
+            return
+        items = list(pending.items())[:DELETE_BATCH_MAX_MESSAGES]
+        for message_id, _scheduled_at in items:
+            pending.pop(message_id, None)
+        message_ids = [message_id for message_id, _scheduled_at in items]
+        oldest_scheduled_at = min(scheduled_at for _message_id, scheduled_at in items)
+        started = time.perf_counter()
+        delete_messages = getattr(bot, "delete_messages", None)
+        batch_ok = False
+        if callable(delete_messages):
+            try:
+                batch_ok = bool(await delete_messages(chat_id=chat_id, message_ids=message_ids))
+            except RetryAfter as exc:
+                try:
+                    await asyncio.sleep(min(max(float(exc.retry_after), 0.0), 60.0))
+                    batch_ok = bool(await delete_messages(chat_id=chat_id, message_ids=message_ids))
+                except (BadRequest, Forbidden, RetryAfter, TelegramError):
+                    pass
+            except (BadRequest, Forbidden, TelegramError):
+                pass
+            except Exception:
+                logger.debug("Falha inesperada no deleteMessages", exc_info=True)
+        if batch_ok:
+            rpc_ms = (time.perf_counter() - started) * 1000
+            BLACKLIST_TELEMETRY["last_queue_ms"] = max(0.0, (started - oldest_scheduled_at) * 1000)
+            BLACKLIST_TELEMETRY["last_delete_rpc_ms"] = rpc_ms
+            BLACKLIST_TELEMETRY["max_delete_rpc_ms"] = max(BLACKLIST_TELEMETRY["max_delete_rpc_ms"], rpc_ms)
+            BLACKLIST_TELEMETRY["delete_success"] += len(message_ids)
+            BLACKLIST_TELEMETRY["batch_success"] += 1
+            BLACKLIST_TELEMETRY["batch_messages"] += len(message_ids)
+        else:
+            BLACKLIST_TELEMETRY["batch_fallbacks"] += 1
+            await asyncio.gather(
+                *(_delete_one(bot, chat_id, message_id, scheduled_at) for message_id, scheduled_at in items),
+                return_exceptions=False,
+            )
+    except asyncio.CancelledError:
+        raise
+    finally:
+        current = asyncio.current_task()
+        if _delete_batch_tasks.get(chat_id) is current:
+            _delete_batch_tasks.pop(chat_id, None)
+        pending = _delete_batch_pending.get(chat_id)
+        if pending:
+            if current is None or not current.cancelling():
+                _delete_batch_tasks[chat_id] = _track_task(_delete_batch_worker(bot, chat_id))
+        else:
+            _delete_batch_pending.pop(chat_id, None)
+
+
+def _schedule_delete_now(bot, message):
+    if message is None:
+        return
+    chat_id = getattr(message, "chat_id", None)
+    message_id = getattr(message, "message_id", None)
+    if chat_id is None or message_id is None:
+        return
+    BLACKLIST_TELEMETRY["delete_scheduled"] += 1
+    pending = _delete_batch_pending[int(chat_id)]
+    pending[int(message_id)] = time.perf_counter()
+    if int(chat_id) not in _delete_batch_tasks:
+        _delete_batch_tasks[int(chat_id)] = _track_task(_delete_batch_worker(bot, int(chat_id)))
 
 
 def _schedule_delete(message, delay: int = DELETE_AFTER_SECONDS):
@@ -647,6 +730,8 @@ async def cmd_latency(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Último RPC de exclusão: <code>{_format_ms(BLACKLIST_TELEMETRY['last_delete_rpc_ms'])}</code>\n"
         f"• Maior RPC de exclusão: <code>{_format_ms(BLACKLIST_TELEMETRY['max_delete_rpc_ms'])}</code>\n"
         f"• Exclusões: <code>{BLACKLIST_TELEMETRY['delete_success']}</code> OK / <code>{BLACKLIST_TELEMETRY['delete_failed']}</code> falhas\n"
+        f"• Lotes nativos: <code>{BLACKLIST_TELEMETRY['batch_success']}</code> / <code>{BLACKLIST_TELEMETRY['batch_messages']}</code> mensagens\n"
+        f"• Fallbacks individuais: <code>{BLACKLIST_TELEMETRY['batch_fallbacks']}</code>\n"
         "• Polling: ✅ processo monitorado pelo watchdog\n"
         "• Userbot: ⏸️ desligado\n"
         "\nA medição separa atraso do update, fila local e tempo do RPC de exclusão."
@@ -948,14 +1033,14 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         BLACKLIST_TELEMETRY["matched"] += 1
         if getattr(message, "date", None) is not None:
             BLACKLIST_TELEMETRY["last_update_age_ms"] = max(0.0, (time.time() - message.date.timestamp()) * 1000)
-        _schedule_delete_now(message)
+        _schedule_delete_now(context.bot, message)
         _track_task(_ban_in_chat(context, chat.id, target))
         return
     if user_id in BANPERM_CACHE.get(chat.id, set()) or user_id in BLACKLIST_CACHE.get(chat.id, set()):
         BLACKLIST_TELEMETRY["matched"] += 1
         if getattr(message, "date", None) is not None:
             BLACKLIST_TELEMETRY["last_update_age_ms"] = max(0.0, (time.time() - message.date.timestamp()) * 1000)
-        _schedule_delete_now(message)
+        _schedule_delete_now(context.bot, message)
         return
 
     # Mensagens normais podem atualizar contexto e persistência sem atrasar a exclusão do fast path.
@@ -984,9 +1069,27 @@ async def post_shutdown(app: Application):
 
 
 def main():
+    # O polling usa uma conexão exclusiva; as ações de moderação mantêm um pool
+    # separado para que uma longa espera de getUpdates nunca ocupe a conexão de delete.
+    api_request = HTTPXRequest(
+        connection_pool_size=API_CONNECTION_POOL_SIZE,
+        connect_timeout=3.0,
+        read_timeout=10.0,
+        write_timeout=10.0,
+        pool_timeout=1.0,
+    )
+    polling_request = HTTPXRequest(
+        connection_pool_size=1,
+        connect_timeout=3.0,
+        read_timeout=GET_UPDATES_READ_TIMEOUT_SECONDS,
+        write_timeout=10.0,
+        pool_timeout=2.0,
+    )
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
+        .request(api_request)
+        .get_updates_request(polling_request)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .concurrent_updates(8)
