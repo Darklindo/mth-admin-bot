@@ -101,6 +101,7 @@ DIVULGAR_MAX_INTERVAL_SECONDS = 30 * 24 * 60 * 60
 DIVULGAR_MAX_TEXT_LENGTH = 4096
 DIVULGAR_MAX_CAPTION_LENGTH = 1024
 DIVULGAR_ALLOWED_MEDIA = {"photo", "video"}
+DIVULGAR_MAX_SCHEDULES_PER_CHAT = 32
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -181,7 +182,8 @@ class Database:
                     created_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS divulgacoes (
-                    chat_id INTEGER PRIMARY KEY,
+                    schedule_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
                     interval_seconds INTEGER NOT NULL,
                     content_type TEXT NOT NULL CHECK(content_type IN ('text','photo','video')),
                     text TEXT NOT NULL DEFAULT '',
@@ -192,6 +194,7 @@ class Database:
                     updated_at INTEGER NOT NULL,
                     next_run_at REAL NOT NULL DEFAULT 0
                 );
+                CREATE INDEX IF NOT EXISTS idx_divulgacoes_chat ON divulgacoes(chat_id);
                 CREATE INDEX IF NOT EXISTS idx_divulgacoes_updated ON divulgacoes(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_chats_active ON chats(active);
                 CREATE INDEX IF NOT EXISTS idx_users_username_nocase ON users(username COLLATE NOCASE);
@@ -200,7 +203,50 @@ class Database:
                 """
             )
             columns = {row[1] for row in self.conn.execute("PRAGMA table_info(divulgacoes)").fetchall()}
-            if "next_run_at" not in columns:
+            if "schedule_id" not in columns:
+                # Migração V2: a versão antiga usava chat_id como chave única.
+                # O registro antigo é preservado como o primeiro agendamento do grupo.
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    self.conn.execute("DROP INDEX IF EXISTS idx_divulgacoes_chat")
+                    self.conn.execute("DROP INDEX IF EXISTS idx_divulgacoes_updated")
+                    self.conn.execute("ALTER TABLE divulgacoes RENAME TO divulgacoes_legacy_v1")
+                    self.conn.execute(
+                        """
+                        CREATE TABLE divulgacoes (
+                            schedule_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            chat_id INTEGER NOT NULL,
+                            interval_seconds INTEGER NOT NULL,
+                            content_type TEXT NOT NULL CHECK(content_type IN ('text','photo','video')),
+                            text TEXT NOT NULL DEFAULT '',
+                            file_id TEXT NOT NULL DEFAULT '',
+                            source_message_id INTEGER NOT NULL,
+                            owner_id INTEGER NOT NULL,
+                            created_at INTEGER NOT NULL,
+                            updated_at INTEGER NOT NULL,
+                            next_run_at REAL NOT NULL DEFAULT 0
+                        )
+                        """
+                    )
+                    self.conn.execute(
+                        """
+                        INSERT INTO divulgacoes(
+                            chat_id,interval_seconds,content_type,text,file_id,source_message_id,
+                            owner_id,created_at,updated_at,next_run_at
+                        )
+                        SELECT chat_id,interval_seconds,content_type,text,file_id,source_message_id,
+                               owner_id,created_at,updated_at,next_run_at
+                        FROM divulgacoes_legacy_v1
+                        """
+                    )
+                    self.conn.execute("DROP TABLE divulgacoes_legacy_v1")
+                    self.conn.execute("CREATE INDEX idx_divulgacoes_chat ON divulgacoes(chat_id)")
+                    self.conn.execute("CREATE INDEX idx_divulgacoes_updated ON divulgacoes(updated_at)")
+                    self.conn.commit()
+                except Exception:
+                    self.conn.rollback()
+                    raise
+            elif "next_run_at" not in columns:
                 self.conn.execute("ALTER TABLE divulgacoes ADD COLUMN next_run_at REAL NOT NULL DEFAULT 0")
             self.conn.commit()
 
@@ -350,42 +396,50 @@ class Database:
             "SELECT chat_id,title,chat_type FROM chats WHERE active=1 AND chat_type IN ('group','supergroup') ORDER BY chat_id"
         ).fetchall()
 
-    def save_divulgacao(self, chat_id: int, interval_seconds: int, content_type: str, text: str, file_id: str, source_message_id: int, owner_id: int, next_run_at: float | None = None):
+    def save_divulgacao(self, chat_id: int, interval_seconds: int, content_type: str, text: str, file_id: str, source_message_id: int, owner_id: int, next_run_at: float | None = None) -> int:
         now = int(time.time())
         next_run_at = float(next_run_at if next_run_at is not None else time.time() + interval_seconds)
-        self._execute(
+        cursor = self._execute(
             """
-            INSERT INTO divulgacoes(chat_id,interval_seconds,content_type,text,file_id,source_message_id,owner_id,created_at,updated_at,next_run_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(chat_id) DO UPDATE SET
-                interval_seconds=excluded.interval_seconds,
-                content_type=excluded.content_type,
-                text=excluded.text,
-                file_id=excluded.file_id,
-                source_message_id=excluded.source_message_id,
-                owner_id=excluded.owner_id,
-                updated_at=excluded.updated_at,
-                next_run_at=excluded.next_run_at
+            INSERT INTO divulgacoes(
+                chat_id,interval_seconds,content_type,text,file_id,source_message_id,
+                owner_id,created_at,updated_at,next_run_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
             """,
             (int(chat_id), int(interval_seconds), content_type, text or "", file_id or "", int(source_message_id), int(owner_id), now, now, next_run_at),
             commit=True,
         )
+        return int(cursor.lastrowid)
 
     def get_divulgacoes(self):
         return self._execute(
-            "SELECT chat_id,interval_seconds,content_type,text,file_id,source_message_id,owner_id,next_run_at FROM divulgacoes"
+            "SELECT schedule_id,chat_id,interval_seconds,content_type,text,file_id,source_message_id,owner_id,next_run_at FROM divulgacoes ORDER BY chat_id,schedule_id"
         ).fetchall()
 
-    def update_divulgacao_next_run(self, chat_id: int, next_run_at: float):
+    def get_divulgacoes_for_chat(self, chat_id: int):
+        return self._execute(
+            "SELECT schedule_id,chat_id,interval_seconds,content_type,text,file_id,source_message_id,owner_id,next_run_at FROM divulgacoes WHERE chat_id=? ORDER BY schedule_id",
+            (int(chat_id),),
+        ).fetchall()
+
+    def update_divulgacao_next_run(self, schedule_id: int, next_run_at: float):
         self._execute(
-            "UPDATE divulgacoes SET next_run_at=?, updated_at=? WHERE chat_id=?",
-            (float(next_run_at), int(time.time()), int(chat_id)),
+            "UPDATE divulgacoes SET next_run_at=?, updated_at=? WHERE schedule_id=?",
+            (float(next_run_at), int(time.time()), int(schedule_id)),
             commit=True,
         )
 
-    def remove_divulgacao(self, chat_id: int) -> bool:
-        cursor = self._execute("DELETE FROM divulgacoes WHERE chat_id=?", (int(chat_id),), commit=True)
+    def remove_divulgacao(self, schedule_id: int) -> bool:
+        cursor = self._execute("DELETE FROM divulgacoes WHERE schedule_id=?", (int(schedule_id),), commit=True)
         return cursor.rowcount > 0
+
+    def remove_all_divulgacoes_for_chat(self, chat_id: int) -> int:
+        cursor = self._execute("DELETE FROM divulgacoes WHERE chat_id=?", (int(chat_id),), commit=True)
+        return int(cursor.rowcount)
+
+    # Alias de compatibilidade para scripts locais que usavam o nome anterior.
+    def remove_divulgacoes_for_chat(self, chat_id: int) -> int:
+        return self.remove_all_divulgacoes_for_chat(chat_id)
 
     def close(self):
         with self._lock:
@@ -719,91 +773,123 @@ def _extract_divulgacao(source_message):
     return None, "❌ O tipo respondido não é suportado. Use texto, foto ou vídeo."
 
 
-async def _cancel_divulgar_task(chat_id: int):
-    task = DIVULGAR_TASKS.pop(int(chat_id), None)
+async def _cancel_divulgar_task(schedule_id: int):
+    schedule_id = int(schedule_id)
+    task = DIVULGAR_TASKS.pop(schedule_id, None)
     if task is None or task is asyncio.current_task():
         return
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 
 
-async def _notify_divulgar_failure(bot, chat_id: int, detail: str):
+async def _cancel_all_divulgar_tasks_for_chat(chat_id: int):
+    chat_id = int(chat_id)
+    schedule_ids = [
+        schedule_id
+        for schedule_id, config in DIVULGAR_CONFIGS.items()
+        if int(config.get("chat_id", 0)) == chat_id
+    ]
+    for schedule_id in schedule_ids:
+        await _cancel_divulgar_task(schedule_id)
+
+
+def _divulgar_list_text(rows) -> str:
+    lines = []
+    for row in rows:
+        content_type = {"text": "texto", "photo": "foto", "video": "vídeo"}.get(row["content_type"], row["content_type"])
+        next_run_at = float(row["next_run_at"] or 0)
+        next_text = _format_divulgar_datetime(next_run_at) if next_run_at else "indisponível"
+        lines.append(
+            f"• ID <code>{int(row['schedule_id'])}</code> — {content_type}, "
+            f"a cada <code>{_format_divulgar_interval(int(row['interval_seconds']))}</code>; "
+            f"próximo: <b>{next_text}</b>"
+        )
+    return "\n".join(lines)
+
+
+async def _notify_divulgar_failure(bot, schedule_id: int, detail: str):
+    schedule_id = int(schedule_id)
     now = time.monotonic()
-    last = DIVULGAR_LAST_FAILURE_NOTIFY.get(int(chat_id), 0.0)
+    last = DIVULGAR_LAST_FAILURE_NOTIFY.get(schedule_id, 0.0)
     if now - last < DIVULGAR_FAILURE_NOTIFY_COOLDOWN_SECONDS:
         return
-    DIVULGAR_LAST_FAILURE_NOTIFY[int(chat_id)] = now
-    config = DIVULGAR_CONFIGS.get(int(chat_id), {})
+    DIVULGAR_LAST_FAILURE_NOTIFY[schedule_id] = now
+    config = DIVULGAR_CONFIGS.get(schedule_id, {})
+    chat_id = int(config.get("chat_id", 0))
     next_run_at = config.get("next_run_at")
     next_text = _format_divulgar_datetime(next_run_at) if next_run_at else "indisponível"
     await _send_divulgar_notification(
         bot,
         "⚠️ <b>Falha na divulgação</b>\n\n"
-        f"Grupo: <code>{int(chat_id)}</code>\n"
+        f"Agendamento: <code>{schedule_id}</code>\n"
+        f"Grupo: <code>{chat_id}</code>\n"
         f"Motivo: {_safe_html(detail)}\n"
         f"Próxima tentativa: <b>{next_text}</b>\n"
         "O agendamento continua ativo e tentará novamente no próximo ciclo.",
     )
 
 
-async def _divulgar_worker(bot, chat_id: int, config: dict):
+async def _divulgar_worker(bot, schedule_id: int, config: dict):
+    schedule_id = int(schedule_id)
+    chat_id = int(config["chat_id"])
     try:
         next_run_at = float(config.get("next_run_at") or (time.time() + config["interval_seconds"]))
         if next_run_at <= time.time():
             next_run_at = time.time() + config["interval_seconds"]
             config["next_run_at"] = next_run_at
-            await _db_call(db.update_divulgacao_next_run, chat_id, next_run_at)
+            await _db_call(db.update_divulgacao_next_run, schedule_id, next_run_at)
         while True:
-            if DIVULGAR_CONFIGS.get(int(chat_id)) is not config:
+            if DIVULGAR_CONFIGS.get(schedule_id) is not config:
                 return
             await asyncio.sleep(max(0.0, next_run_at - time.time()))
-            if DIVULGAR_CONFIGS.get(int(chat_id)) is not config:
+            if DIVULGAR_CONFIGS.get(schedule_id) is not config:
                 return
             sent = False
             failure_detail = None
             try:
                 if config["content_type"] == "text":
-                    await bot.send_message(chat_id=int(chat_id), text=config["text"])
+                    await bot.send_message(chat_id=chat_id, text=config["text"])
                 elif config["content_type"] == "photo":
-                    await bot.send_photo(chat_id=int(chat_id), photo=config["file_id"], caption=config["text"] or None)
+                    await bot.send_photo(chat_id=chat_id, photo=config["file_id"], caption=config["text"] or None)
                 else:
-                    await bot.send_video(chat_id=int(chat_id), video=config["file_id"], caption=config["text"] or None)
+                    await bot.send_video(chat_id=chat_id, video=config["file_id"], caption=config["text"] or None)
                 sent = True
-                DIVULGAR_LAST_FAILURE_NOTIFY.pop(int(chat_id), None)
-                logger.info("Divulgação enviada em chat_id=%s", chat_id)
+                DIVULGAR_LAST_FAILURE_NOTIFY.pop(schedule_id, None)
+                logger.info("Divulgação enviada em chat_id=%s schedule_id=%s", chat_id, schedule_id)
             except RetryAfter as exc:
                 delay = _retry_delay(exc, maximum=300.0)
-                logger.warning("Divulgação em chat_id=%s limitada; aguardando %.1fs", chat_id, delay)
+                logger.warning("Divulgação limitada em chat_id=%s schedule_id=%s; aguardando %.1fs", chat_id, schedule_id, delay)
                 await asyncio.sleep(delay)
                 failure_detail = f"limite temporário do Telegram ({delay:.0f}s)"
             except Forbidden:
-                logger.warning("Sem permissão para divulgar em chat_id=%s", chat_id, exc_info=True)
+                logger.warning("Sem permissão para divulgar em chat_id=%s schedule_id=%s", chat_id, schedule_id, exc_info=True)
                 failure_detail = "o bot não pode enviar mensagens neste grupo"
             except BadRequest as exc:
-                logger.warning("Requisição inválida ao divulgar em chat_id=%s: %s", chat_id, exc)
+                logger.warning("Requisição inválida ao divulgar em chat_id=%s schedule_id=%s: %s", chat_id, schedule_id, exc)
                 failure_detail = "a API recusou o conteúdo ou a operação"
             except TelegramError as exc:
-                logger.warning("Falha Telegram ao divulgar em chat_id=%s: %s", chat_id, exc)
+                logger.warning("Falha Telegram ao divulgar em chat_id=%s schedule_id=%s: %s", chat_id, schedule_id, exc)
                 failure_detail = type(exc).__name__
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("Falha inesperada ao divulgar em chat_id=%s", chat_id)
+                logger.exception("Falha inesperada ao divulgar em chat_id=%s schedule_id=%s", chat_id, schedule_id)
                 failure_detail = "erro interno inesperado"
             finally:
                 next_run_at = time.time() + config["interval_seconds"]
                 config["next_run_at"] = next_run_at
                 try:
-                    await _db_call(db.update_divulgacao_next_run, chat_id, next_run_at)
+                    await _db_call(db.update_divulgacao_next_run, schedule_id, next_run_at)
                 except Exception:
-                    logger.exception("Não foi possível persistir o próximo envio de chat_id=%s", chat_id)
+                    logger.exception("Não foi possível persistir o próximo envio de schedule_id=%s", schedule_id)
                 if failure_detail:
-                    await _notify_divulgar_failure(bot, chat_id, failure_detail)
+                    await _notify_divulgar_failure(bot, schedule_id, failure_detail)
                 if sent:
                     await _send_divulgar_notification(
                         bot,
                         "✅ <b>Divulgação enviada</b>\n\n"
-                        f"Grupo: <code>{int(chat_id)}</code>\n"
+                        f"Agendamento: <code>{schedule_id}</code>\n"
+                        f"Grupo: <code>{chat_id}</code>\n"
                         f"Horário: <b>{_format_divulgar_datetime(time.time())}</b>\n"
                         f"Próximo envio: <b>{_format_divulgar_datetime(next_run_at)}</b>\n"
                         f"Intervalo: <code>{_format_divulgar_interval(config['interval_seconds'])}</code>",
@@ -812,19 +898,20 @@ async def _divulgar_worker(bot, chat_id: int, config: dict):
         raise
     finally:
         current = asyncio.current_task()
-        if DIVULGAR_TASKS.get(int(chat_id)) is current:
-            DIVULGAR_TASKS.pop(int(chat_id), None)
+        if DIVULGAR_TASKS.get(schedule_id) is current:
+            DIVULGAR_TASKS.pop(schedule_id, None)
 
 
-async def _ensure_divulgar_task(bot, chat_id: int):
-    chat_id = int(chat_id)
-    config = DIVULGAR_CONFIGS.get(chat_id)
+async def _ensure_divulgar_task(bot, schedule_id: int, config: dict | None = None):
+    schedule_id = int(schedule_id)
+    config = config or DIVULGAR_CONFIGS.get(schedule_id)
     if not config:
         return
-    task = DIVULGAR_TASKS.get(chat_id)
+    task = DIVULGAR_TASKS.get(schedule_id)
     if task and not task.done():
         return
-    DIVULGAR_TASKS[chat_id] = _track_task(_divulgar_worker(bot, chat_id, config))
+    DIVULGAR_CONFIGS[schedule_id] = config
+    DIVULGAR_TASKS[schedule_id] = _track_task(_divulgar_worker(bot, schedule_id, config))
 
 
 def _is_group(update: Update) -> bool:
@@ -980,30 +1067,111 @@ async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat = update.effective_chat
     message = update.effective_message
+    chat_id = int(chat.id)
     args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
-    if len(args) == 1 and args[0].lower() == "off":
-        await _cancel_divulgar_task(chat.id)
-        DIVULGAR_CONFIGS.pop(int(chat.id), None)
-        DIVULGAR_LAST_FAILURE_NOTIFY.pop(int(chat.id), None)
-        removed = await _db_call(db.remove_divulgacao, chat.id)
+    command = args[0].lower() if args else ""
+
+    if command == "list" and len(args) == 1:
+        rows = await _db_call(db.get_divulgacoes_for_chat, chat_id)
+        if not rows:
+            await _reply_and_cleanup(update, "ℹ️ Não há divulgações ativas neste grupo.")
+            return
+        await _reply_and_cleanup(
+            update,
+            "📋 <b>Divulgações ativas neste grupo</b>\n\n"
+            f"{_divulgar_list_text(rows)}\n\n"
+            "Para cancelar uma específica, use <code>.divulgar off ID</code>.",
+        )
+        return
+
+    if command == "off":
+        rows = await _db_call(db.get_divulgacoes_for_chat, chat_id)
+        if not rows:
+            await _reply_and_cleanup(update, "ℹ️ Não havia divulgação ativa neste grupo.")
+            return
+        if len(args) == 1:
+            if len(rows) > 1:
+                await _reply_and_cleanup(
+                    update,
+                    "⚠️ Há várias divulgações ativas. Nenhuma foi cancelada.\n\n"
+                    f"{_divulgar_list_text(rows)}\n\n"
+                    "Use <code>.divulgar off ID</code> para cancelar uma ou "
+                    "<code>.divulgar off all</code> para cancelar todas.",
+                )
+                return
+            target_row = rows[0]
+        elif len(args) == 2 and args[1].lower() == "all":
+            for row in rows:
+                schedule_id = int(row["schedule_id"])
+                await _cancel_divulgar_task(schedule_id)
+                DIVULGAR_CONFIGS.pop(schedule_id, None)
+                DIVULGAR_LAST_FAILURE_NOTIFY.pop(schedule_id, None)
+            removed = await _db_call(db.remove_all_divulgacoes_for_chat, chat_id)
+            await _reply_and_cleanup(update, f"✅ {removed} divulgação(ões) desligada(s) neste grupo.")
+            await _send_divulgar_notification(
+                context.bot,
+                "⏹️ <b>Todas as divulgações foram desligadas</b>\n\n"
+                f"Grupo: <code>{chat_id}</code>\n"
+                f"Quantidade: <b>{removed}</b>\n"
+                f"Horário: <b>{_format_divulgar_datetime(time.time())}</b>",
+            )
+            return
+        elif len(args) == 2:
+            try:
+                requested_id = int(args[1])
+            except (TypeError, ValueError):
+                requested_id = 0
+            target_row = next((row for row in rows if int(row["schedule_id"]) == requested_id), None)
+            if target_row is None:
+                await _reply_and_cleanup(update, "❌ ID de agendamento inválido para este grupo. Use <code>.divulgar list</code> para consultar os IDs ativos.")
+                return
+        else:
+            target_row = None
+
+        if target_row is None:
+            await _reply_and_cleanup(
+                update,
+                "ℹ️ Uso: <code>.divulgar off</code> quando há apenas uma agenda, "
+                "<code>.divulgar off ID</code> para uma específica ou "
+                "<code>.divulgar off all</code> para todas.",
+            )
+            return
+        schedule_id = int(target_row["schedule_id"])
+        await _cancel_divulgar_task(schedule_id)
+        DIVULGAR_CONFIGS.pop(schedule_id, None)
+        DIVULGAR_LAST_FAILURE_NOTIFY.pop(schedule_id, None)
+        removed = await _db_call(db.remove_divulgacao, schedule_id)
         if removed:
-            await _reply_and_cleanup(update, "✅ Divulgação desligada neste grupo.")
+            await _reply_and_cleanup(update, f"✅ Divulgação <code>{schedule_id}</code> desligada neste grupo.")
             await _send_divulgar_notification(
                 context.bot,
                 "⏹️ <b>Divulgação desligada</b>\n\n"
-                f"Grupo: <code>{int(chat.id)}</code>\n"
-                f"Horário: <b>{_format_divulgar_datetime(time.time())}</b>\n"
-                "Nenhum novo envio será realizado neste grupo.",
+                f"Agendamento: <code>{schedule_id}</code>\n"
+                f"Grupo: <code>{chat_id}</code>\n"
+                f"Horário: <b>{_format_divulgar_datetime(time.time())}</b>",
             )
         else:
-            await _reply_and_cleanup(update, "ℹ️ Não havia divulgação ativa neste grupo.")
+            await _reply_and_cleanup(update, "ℹ️ Esse agendamento já não está ativo.")
         return
+
     if len(args) != 2 or args[1].lower() != "on":
         await _reply_and_cleanup(
             update,
-            "ℹ️ Uso: responda a uma mensagem com <code>.divulgar 30m on</code> para ligar.\n"
-            "Para desligar: <code>.divulgar off</code>.\n"
-            "Intervalo permitido: de 30s a 30d.",
+            "ℹ️ Uso: responda a uma mensagem com <code>.divulgar 30m on</code> para criar uma nova agenda.\n"
+            "<code>.divulgar list</code> — lista as agendas ativas.\n"
+            "<code>.divulgar off ID</code> — desliga uma agenda específica.\n"
+            "<code>.divulgar off all</code> — desliga todas.\n"
+            "Intervalo permitido: de 30s a 30d; máximo de "
+            f"{DIVULGAR_MAX_SCHEDULES_PER_CHAT} agendas por grupo.",
+        )
+        return
+
+    active_rows = await _db_call(db.get_divulgacoes_for_chat, chat_id)
+    if len(active_rows) >= DIVULGAR_MAX_SCHEDULES_PER_CHAT:
+        await _reply_and_cleanup(
+            update,
+            f"❌ Este grupo já atingiu o limite de {DIVULGAR_MAX_SCHEDULES_PER_CHAT} divulgações simultâneas. "
+            "Desligue uma agenda com <code>.divulgar off ID</code> antes de criar outra.",
         )
         return
     interval_seconds = _parse_divulgar_interval(args[0])
@@ -1015,9 +1183,9 @@ async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_and_cleanup(update, error)
         return
     next_run_at = time.time() + interval_seconds
-    await _db_call(
+    schedule_id = await _db_call(
         db.save_divulgacao,
-        chat.id,
+        chat_id,
         interval_seconds,
         source["content_type"],
         source["text"],
@@ -1026,9 +1194,9 @@ async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update.effective_user.id,
         next_run_at,
     )
-    await _cancel_divulgar_task(chat.id)
-    DIVULGAR_LAST_FAILURE_NOTIFY.pop(int(chat.id), None)
     config = {
+        "schedule_id": int(schedule_id),
+        "chat_id": chat_id,
         "interval_seconds": interval_seconds,
         "content_type": source["content_type"],
         "text": source["text"],
@@ -1037,21 +1205,25 @@ async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "owner_id": int(update.effective_user.id),
         "next_run_at": next_run_at,
     }
-    DIVULGAR_CONFIGS[int(chat.id)] = config
-    await _ensure_divulgar_task(context.bot, chat.id)
+    DIVULGAR_CONFIGS[int(schedule_id)] = config
+    DIVULGAR_LAST_FAILURE_NOTIFY.pop(int(schedule_id), None)
+    await _ensure_divulgar_task(context.bot, schedule_id, config)
     await _reply_and_cleanup(
         update,
-        f"✅ Divulgação ativada neste grupo a cada <b>{_format_divulgar_interval(interval_seconds)}</b>.\n"
+        f"✅ Divulgação <code>{schedule_id}</code> ativada neste grupo a cada "
+        f"<b>{_format_divulgar_interval(interval_seconds)}</b>.\n"
         f"A primeira publicação ocorrerá em <b>{_format_divulgar_datetime(next_run_at)}</b>.\n"
-        "Use <code>.divulgar off</code> para desligar.",
+        "Use <code>.divulgar list</code> para consultar as agendas.",
     )
     await _send_divulgar_notification(
         context.bot,
         "✅ <b>Divulgação ativada</b>\n\n"
-        f"Grupo: <code>{int(chat.id)}</code>\n"
+        f"Agendamento: <code>{schedule_id}</code>\n"
+        f"Grupo: <code>{chat_id}</code>\n"
         f"Conteúdo: <b>{_safe_html(source['content_type'])}</b>\n"
         f"Intervalo: <code>{_format_divulgar_interval(interval_seconds)}</code>\n"
         f"Primeiro envio: <b>{_format_divulgar_datetime(next_run_at)}</b>\n"
+        f"Agendas ativas neste grupo: <b>{len(active_rows) + 1}</b>\n"
         "Após cada envio, você receberá o horário da publicação e o próximo agendamento.",
     )
 
@@ -1077,8 +1249,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>.allban</code> — o proprietário bane o alvo nos grupos registrados.\n"
         "<code>.unallban</code> — remove o allban global e tenta desbanir o alvo.\n"
         "<code>.latency</code> — mede uma chamada real à API do Telegram.\n"
-        "<code>.divulgar 30m on</code> — programa texto, foto ou vídeo respondido neste grupo.\n"
-        "<code>.divulgar off</code> — desliga a divulgação deste grupo.\n\n"
+        "<code>.divulgar 30m on</code> — cria uma nova agenda para texto, foto ou vídeo respondido.\n"
+        "<code>.divulgar list</code> — lista as agendas ativas com seus IDs.\n"
+        "<code>.divulgar off ID</code> — desliga uma agenda específica; <code>off all</code> desliga todas.\n\n"
         "Somente os dois proprietários configurados podem usar e receber respostas deste bot. "
         "A moderação local ainda exige que o bot seja administrador com permissão para apagar mensagens "
         "e restringir membros.",
@@ -1443,9 +1616,16 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         KNOWN_CHAT_IDS.discard(chat.id)
         _chat_registration_seen.discard(chat.id)
-        await _cancel_divulgar_task(chat.id)
-        DIVULGAR_CONFIGS.pop(int(chat.id), None)
-        await _db_call(db.remove_divulgacao, chat.id)
+        await _cancel_all_divulgar_tasks_for_chat(chat.id)
+        schedule_ids = [
+            schedule_id
+            for schedule_id, config in list(DIVULGAR_CONFIGS.items())
+            if int(config.get("chat_id", 0)) == int(chat.id)
+        ]
+        for schedule_id in schedule_ids:
+            DIVULGAR_CONFIGS.pop(schedule_id, None)
+            DIVULGAR_LAST_FAILURE_NOTIFY.pop(schedule_id, None)
+        await _db_call(db.remove_all_divulgacoes_for_chat, chat.id)
     await _db_call(db.register_chat, chat.id, chat.title or "", chat.type, active)
 
 
@@ -1499,23 +1679,27 @@ async def post_init(app: Application):
     BOT_USER_ID = (await app.bot.get_me()).id
     rows = await _db_call(db.get_divulgacoes)
     for row in rows:
+        schedule_id = int(row["schedule_id"])
         chat_id = int(row["chat_id"])
         config = {
+            "schedule_id": schedule_id,
+            "chat_id": chat_id,
             "interval_seconds": int(row["interval_seconds"]),
             "content_type": row["content_type"],
             "text": row["text"] or "",
             "file_id": row["file_id"] or "",
             "source_message_id": int(row["source_message_id"]),
             "owner_id": int(row["owner_id"]),
+            "next_run_at": float(row["next_run_at"] or 0),
         }
         if config["content_type"] not in {"text", "photo", "video"}:
-            logger.warning("Divulgação inválida ignorada no chat_id=%s", chat_id)
+            logger.warning("Divulgação inválida ignorada no chat_id=%s schedule_id=%s", chat_id, schedule_id)
             continue
         if not DIVULGAR_MIN_INTERVAL_SECONDS <= config["interval_seconds"] <= DIVULGAR_MAX_INTERVAL_SECONDS:
-            logger.warning("Intervalo de divulgação inválido ignorado no chat_id=%s", chat_id)
+            logger.warning("Intervalo de divulgação inválido ignorado no chat_id=%s schedule_id=%s", chat_id, schedule_id)
             continue
-        DIVULGAR_CONFIGS[chat_id] = config
-        await _ensure_divulgar_task(app.bot, chat_id)
+        DIVULGAR_CONFIGS[schedule_id] = config
+        await _ensure_divulgar_task(app.bot, schedule_id, config)
     logger.info(
         "Jtzin Bot API online; proprietários=%s; divulgações restauradas=%s",
         ",".join(str(owner_id) for owner_id in sorted(OWNER_IDS)),

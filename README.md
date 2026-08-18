@@ -28,12 +28,14 @@ O bot comum oferece moderação local e global e responde somente a comandos ini
 | `.allban` | Registra o alvo na blacklist global e tenta bani-lo em todos os grupos conhecidos | Somente um dos `OWNER_IDS` |
 | `.unallban` | Remove o alvo da lista global e tenta desbaní-lo nos grupos conhecidos | Somente um dos `OWNER_IDS` |
 | `.latency` | Mede uma chamada real à API do Telegram | Somente `OWNER_IDS` |
-| `.divulgar 30m on` | Programa a republicação de texto, foto ou vídeo respondido no grupo atual | Somente `OWNER_IDS` |
-| `.divulgar off` | Desliga a divulgação programada no grupo atual | Somente `OWNER_IDS` |
+| `.divulgar 30m on` | Cria uma nova republicação de texto, foto ou vídeo respondido no grupo atual | Somente `OWNER_IDS` |
+| `.divulgar list` | Lista as agendas ativas e seus IDs | Somente `OWNER_IDS` |
+| `.divulgar off ID` | Desliga uma agenda específica pelo ID | Somente `OWNER_IDS` |
+| `.divulgar off all` | Desliga todas as agendas do grupo | Somente `OWNER_IDS` |
 
 O banco mantém a lista por chat e o Bot API possui cache próprio. **Somente os dois owners configurados em `OWNER_IDS` recebem respostas e executam comandos; administradores comuns não têm acesso ao dispatcher.** O bot precisa estar presente e ter permissões administrativas para apagar mensagens ou restringir usuários; os comandos globais só podem alcançar grupos nos quais ele esteja presente e autorizado.
 
-O comando `.divulgar 30m on` deve ser enviado em resposta a uma mensagem de texto, foto ou vídeo. O bot republica o texto ou a mídia com sua legenda a cada intervalo configurado, entre 30 segundos e 30 dias. Há uma divulgação por grupo; ativar novamente substitui a anterior. Use `.divulgar off` para desligar. O agendamento é salvo no banco e restaurado após reinícios, desde que o bot continue no grupo e possa enviar mensagens e mídias. O owner `6822870889` (`@OnlyExaltarei`) recebe no privado a confirmação da ativação, o primeiro horário, cada confirmação de envio com o próximo horário, o desligamento e alertas de falha com limitação para evitar spam de notificações.
+O comando `.divulgar 30m on` deve ser enviado em resposta a uma mensagem de texto, foto ou vídeo. Cada ativação cria uma nova agenda independente, identificada por `schedule_id`, permitindo várias divulgações no mesmo grupo — por exemplo, uma a cada 20 minutos e outra a cada 30 minutos. O bot republica o texto ou a mídia com sua legenda a cada intervalo entre 30 segundos e 30 dias, com limite de 32 agendas por grupo. Use `.divulgar list` para consultar os IDs, `.divulgar off ID` para cancelar uma específica e `.divulgar off all` para cancelar todas. Se houver apenas uma agenda, `.divulgar off` também a desliga; com várias, o comando mostra a lista e evita cancelamento acidental. Os agendamentos são salvos no banco e restaurados após reinícios, desde que o bot continue no grupo e possa enviar mensagens e mídias. O owner `6822870889` (`@OnlyExaltarei`) recebe no privado a confirmação da ativação, o primeiro horário, cada confirmação de envio com o próximo horário, o desligamento e alertas de falha com limitação para evitar spam de notificações.
 
 As respostas e os comandos são removidos automaticamente após alguns segundos. O bot é deliberadamente independente: não contém o restante dos recursos do Userbot, não aceita autorização de terceiros e não possui subproprietários.
 

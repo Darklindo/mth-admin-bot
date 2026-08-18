@@ -13,14 +13,16 @@ A V9.0 possui duas superfícies independentes. O **Bot API** usa somente comando
 | `.allban` | Registra o alvo na lista global e tenta bani-lo em todos os grupos conhecidos do Bot API. | Somente um dos `OWNER_IDS` |
 | `.unallban` | Remove o alvo da lista global e tenta desbaní-lo nos grupos conhecidos. | Somente um dos `OWNER_IDS` |
 | `.latency` | Mede uma chamada real à API do Telegram e informa o tempo total. | Somente `OWNER_IDS` |
-| `.divulgar 30m on` | Programa a republicação periódica de uma mensagem de texto, foto ou vídeo respondido no grupo atual. Aceita intervalos de `30s` a `30d`. | Somente `OWNER_IDS` |
-| `.divulgar off` | Desliga a divulgação programada no grupo atual. | Somente `OWNER_IDS` |
+| `.divulgar 30m on` | Cria uma nova republicação periódica de uma mensagem de texto, foto ou vídeo respondido no grupo atual. Aceita intervalos de `30s` a `30d`. | Somente `OWNER_IDS` |
+| `.divulgar list` | Lista as divulgações ativas do grupo e seus `schedule_id`. | Somente `OWNER_IDS` |
+| `.divulgar off ID` | Desliga somente a divulgação identificada pelo `schedule_id`. | Somente `OWNER_IDS` |
+| `.divulgar off all` | Desliga todas as divulgações do grupo; sem `ID`, `.divulgar off` só desliga diretamente quando há uma única agenda. | Somente `OWNER_IDS` |
 
 Todos os comandos aceitam reply à mensagem do alvo ou ID/username conhecido, mas **somente os dois owners configurados em `OWNER_IDS` recebem respostas e executam comandos**. Administradores comuns não têm acesso ao dispatcher do bot. O Bot API ainda precisa estar no grupo e possuir as permissões administrativas correspondentes para realizar as ações. A função global não consegue operar em chats que o bot não conhece, não acessa ou onde não pode restringir membros. O banco do Bot API é separado do banco do Userbot.
 
 ### Divulgação periódica
 
-Para ativar, responda à mensagem que será divulgada — texto, foto ou vídeo — usando `.divulgar 30m on`. O texto de uma mensagem de texto é republicado como texto; a legenda de uma foto ou vídeo é preservada como legenda. O intervalo permitido vai de 30 segundos a 30 dias. Existe uma configuração por grupo; ativar novamente substitui a divulgação anterior. Use `.divulgar off` para desligar. A configuração fica salva no banco do Bot API e é restaurada após reinícios, desde que o bot continue no grupo e tenha permissão para enviar mensagens e mídias. O owner `6822870889` recebe uma notificação privada na ativação, no desligamento, após cada envio, com o horário realizado e o próximo horário, e também recebe alertas de falhas com limitação de repetição.
+Para ativar, responda à mensagem que será divulgada — texto, foto ou vídeo — usando `.divulgar 30m on`. Cada ativação cria uma nova agenda independente; portanto, o mesmo grupo pode ter, por exemplo, uma publicação a cada 20 minutos e outra a cada 30 minutos. O texto de uma mensagem de texto é republicado como texto; a legenda de uma foto ou vídeo é preservada como legenda. O intervalo permitido vai de 30 segundos a 30 dias, com limite de 32 agendas por grupo. Use `.divulgar list` para consultar os IDs, `.divulgar off ID` para cancelar apenas uma agenda e `.divulgar off all` para cancelar todas. O comando `.divulgar off` sem ID desliga diretamente quando existe apenas uma agenda e, quando há várias, mostra a lista sem cancelar nada. Os agendamentos ficam salvos no banco do Bot API, são restaurados após reinícios e recebem notificações privadas para `6822870889` (`@OnlyExaltarei`) na ativação, em cada envio, no desligamento e em falhas com limitação de repetição.
 
 ## Userbot — prefixos
 

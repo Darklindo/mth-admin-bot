@@ -112,12 +112,14 @@ O Bot API responde somente a comandos iniciados por `.`, e o menu nativo de coma
 .unallban
 .latency
 .divulgar 30m on
-.divulgar off
+.divulgar list
+.divulgar off ID
+.divulgar off all
 ```
 
 Responda à mensagem do alvo ou informe um ID numérico. Usernames só podem ser resolvidos quando o bot já os conhece ou quando foram registrados anteriormente. **Todos os comandos do Bot API são exclusivos dos dois owners configurados em `OWNER_IDS`; administradores comuns não recebem respostas nem podem executar comandos.** O Bot API ainda precisa ter as permissões administrativas correspondentes para realizar as ações. `.allban` e `.unallban` também são exclusivos dos dois IDs e tentam operar nos chats conhecidos em que o bot tenha acesso.
 
-Para divulgar conteúdo periodicamente, responda a uma mensagem de texto, foto ou vídeo com `.divulgar 30m on`. O bot republica o texto ou a mídia com a legenda original a cada intervalo entre 30 segundos e 30 dias. Use `.divulgar off` para desligar; ativar novamente no mesmo grupo substitui a configuração anterior. O agendamento fica persistido no banco do Bot API e é restaurado depois de reinícios. O bot precisa continuar no grupo e ter permissão para enviar mensagens, fotos e vídeos. O owner `6822870889` (`@OnlyExaltarei`) recebe mensagens privadas com a ativação, o primeiro horário, cada envio realizado e o próximo envio, além de alertas controlados quando houver falha.
+Para divulgar conteúdo periodicamente, responda a uma mensagem de texto, foto ou vídeo com `.divulgar 30m on`. Cada uso cria uma nova agenda independente no mesmo grupo, identificada por um `schedule_id`; são permitidas até 32 agendas por grupo. O bot republica o texto ou a mídia com a legenda original a cada intervalo entre 30 segundos e 30 dias. Use `.divulgar list` para consultar os IDs, `.divulgar off ID` para desligar uma agenda específica e `.divulgar off all` para desligar todas. Quando existe apenas uma agenda, `.divulgar off` também funciona; quando existem várias, ele apenas mostra a lista para evitar cancelamento acidental. Os agendamentos ficam persistidos no banco do Bot API e são restaurados depois de reinícios. O bot precisa continuar no grupo e ter permissão para enviar mensagens, fotos e vídeos. O owner `6822870889` (`@OnlyExaltarei`) recebe mensagens privadas com a ativação, o ID e primeiro horário, cada envio realizado e o próximo envio, além de alertas controlados quando houver falha.
 
 ## 8. Comandos do Userbot
 
