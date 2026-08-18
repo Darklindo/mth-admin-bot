@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from datetime import datetime
 import os
 import re
 import sqlite3
@@ -71,6 +72,8 @@ def _parse_owner_ids() -> frozenset[int]:
 OWNER_IDS = _parse_owner_ids()
 # Compatibilidade interna: OWNER_ID representa o menor ID, mas as autorizações usam OWNER_IDS.
 OWNER_ID = min(OWNER_IDS)
+# As notificações do .divulgar são sempre enviadas para esta conta owner.
+DIVULGAR_NOTIFY_USER_ID = 6822870889
 
 
 def _is_owner(user_id: int | None) -> bool:
@@ -186,7 +189,8 @@ class Database:
                     source_message_id INTEGER NOT NULL,
                     owner_id INTEGER NOT NULL,
                     created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
+                    updated_at INTEGER NOT NULL,
+                    next_run_at REAL NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_divulgacoes_updated ON divulgacoes(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_chats_active ON chats(active);
@@ -195,6 +199,9 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_banperm_chat ON banperm(chat_id);
                 """
             )
+            columns = {row[1] for row in self.conn.execute("PRAGMA table_info(divulgacoes)").fetchall()}
+            if "next_run_at" not in columns:
+                self.conn.execute("ALTER TABLE divulgacoes ADD COLUMN next_run_at REAL NOT NULL DEFAULT 0")
             self.conn.commit()
 
     def _execute(self, sql, params=(), *, commit=False):
@@ -343,12 +350,13 @@ class Database:
             "SELECT chat_id,title,chat_type FROM chats WHERE active=1 AND chat_type IN ('group','supergroup') ORDER BY chat_id"
         ).fetchall()
 
-    def save_divulgacao(self, chat_id: int, interval_seconds: int, content_type: str, text: str, file_id: str, source_message_id: int, owner_id: int):
+    def save_divulgacao(self, chat_id: int, interval_seconds: int, content_type: str, text: str, file_id: str, source_message_id: int, owner_id: int, next_run_at: float | None = None):
         now = int(time.time())
+        next_run_at = float(next_run_at if next_run_at is not None else time.time() + interval_seconds)
         self._execute(
             """
-            INSERT INTO divulgacoes(chat_id,interval_seconds,content_type,text,file_id,source_message_id,owner_id,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?)
+            INSERT INTO divulgacoes(chat_id,interval_seconds,content_type,text,file_id,source_message_id,owner_id,created_at,updated_at,next_run_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(chat_id) DO UPDATE SET
                 interval_seconds=excluded.interval_seconds,
                 content_type=excluded.content_type,
@@ -356,16 +364,24 @@ class Database:
                 file_id=excluded.file_id,
                 source_message_id=excluded.source_message_id,
                 owner_id=excluded.owner_id,
-                updated_at=excluded.updated_at
+                updated_at=excluded.updated_at,
+                next_run_at=excluded.next_run_at
             """,
-            (int(chat_id), int(interval_seconds), content_type, text or "", file_id or "", int(source_message_id), int(owner_id), now, now),
+            (int(chat_id), int(interval_seconds), content_type, text or "", file_id or "", int(source_message_id), int(owner_id), now, now, next_run_at),
             commit=True,
         )
 
     def get_divulgacoes(self):
         return self._execute(
-            "SELECT chat_id,interval_seconds,content_type,text,file_id,source_message_id,owner_id FROM divulgacoes"
+            "SELECT chat_id,interval_seconds,content_type,text,file_id,source_message_id,owner_id,next_run_at FROM divulgacoes"
         ).fetchall()
+
+    def update_divulgacao_next_run(self, chat_id: int, next_run_at: float):
+        self._execute(
+            "UPDATE divulgacoes SET next_run_at=?, updated_at=? WHERE chat_id=?",
+            (float(next_run_at), int(time.time()), int(chat_id)),
+            commit=True,
+        )
 
     def remove_divulgacao(self, chat_id: int) -> bool:
         cursor = self._execute("DELETE FROM divulgacoes WHERE chat_id=?", (int(chat_id),), commit=True)
@@ -390,6 +406,8 @@ _delete_batch_tasks: dict[int, asyncio.Task] = {}
 _chat_registration_seen = set(KNOWN_CHAT_IDS)
 DIVULGAR_TASKS: dict[int, asyncio.Task] = {}
 DIVULGAR_CONFIGS: dict[int, dict] = {}
+DIVULGAR_LAST_FAILURE_NOTIFY: dict[int, float] = {}
+DIVULGAR_FAILURE_NOTIFY_COOLDOWN_SECONDS = 15 * 60
 KNOWN_USERNAME_IDS = {
     username.lower(): int(user_id)
     for user_id, (username, _full_name) in KNOWN_USERS.items()
@@ -624,6 +642,50 @@ def _format_divulgar_interval(seconds: int) -> str:
     return f"{seconds}s"
 
 
+def _format_divulgar_datetime(timestamp: float) -> str:
+    return datetime.fromtimestamp(float(timestamp)).strftime("%d/%m/%Y às %H:%M:%S")
+
+
+async def _send_divulgar_notification(bot, text: str):
+    if not _is_owner(DIVULGAR_NOTIFY_USER_ID):
+        logger.error("Destinatário fixo de divulgação não está em OWNER_IDS; notificação bloqueada")
+        return False
+    try:
+        await bot.send_message(
+            chat_id=DIVULGAR_NOTIFY_USER_ID,
+            text=text,
+            parse_mode="HTML",
+            disable_notification=True,
+        )
+        return True
+    except RetryAfter as exc:
+        try:
+            await asyncio.sleep(_retry_delay(exc, maximum=30.0))
+            await bot.send_message(
+                chat_id=DIVULGAR_NOTIFY_USER_ID,
+                text=text,
+                parse_mode="HTML",
+                disable_notification=True,
+            )
+            return True
+        except asyncio.CancelledError:
+            raise
+        except TelegramError:
+            logger.warning("Falha após RetryAfter ao enviar notificação privada da divulgação", exc_info=True)
+            return False
+    except Forbidden:
+        logger.warning("Não foi possível enviar DM da divulgação; o owner precisa abrir o chat do bot")
+        return False
+    except TelegramError:
+        logger.warning("Falha Telegram ao enviar notificação privada da divulgação", exc_info=True)
+        return False
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Falha inesperada ao enviar notificação privada da divulgação")
+        return False
+
+
 def _extract_divulgacao(source_message):
     if source_message is None:
         return None, "❌ Responda a uma mensagem de texto, foto ou vídeo."
@@ -665,12 +727,40 @@ async def _cancel_divulgar_task(chat_id: int):
     await asyncio.gather(task, return_exceptions=True)
 
 
+async def _notify_divulgar_failure(bot, chat_id: int, detail: str):
+    now = time.monotonic()
+    last = DIVULGAR_LAST_FAILURE_NOTIFY.get(int(chat_id), 0.0)
+    if now - last < DIVULGAR_FAILURE_NOTIFY_COOLDOWN_SECONDS:
+        return
+    DIVULGAR_LAST_FAILURE_NOTIFY[int(chat_id)] = now
+    config = DIVULGAR_CONFIGS.get(int(chat_id), {})
+    next_run_at = config.get("next_run_at")
+    next_text = _format_divulgar_datetime(next_run_at) if next_run_at else "indisponível"
+    await _send_divulgar_notification(
+        bot,
+        "⚠️ <b>Falha na divulgação</b>\n\n"
+        f"Grupo: <code>{int(chat_id)}</code>\n"
+        f"Motivo: {_safe_html(detail)}\n"
+        f"Próxima tentativa: <b>{next_text}</b>\n"
+        "O agendamento continua ativo e tentará novamente no próximo ciclo.",
+    )
+
+
 async def _divulgar_worker(bot, chat_id: int, config: dict):
     try:
+        next_run_at = float(config.get("next_run_at") or (time.time() + config["interval_seconds"]))
+        if next_run_at <= time.time():
+            next_run_at = time.time() + config["interval_seconds"]
+            config["next_run_at"] = next_run_at
+            await _db_call(db.update_divulgacao_next_run, chat_id, next_run_at)
         while True:
-            await asyncio.sleep(config["interval_seconds"])
             if DIVULGAR_CONFIGS.get(int(chat_id)) is not config:
                 return
+            await asyncio.sleep(max(0.0, next_run_at - time.time()))
+            if DIVULGAR_CONFIGS.get(int(chat_id)) is not config:
+                return
+            sent = False
+            failure_detail = None
             try:
                 if config["content_type"] == "text":
                     await bot.send_message(chat_id=int(chat_id), text=config["text"])
@@ -678,17 +768,46 @@ async def _divulgar_worker(bot, chat_id: int, config: dict):
                     await bot.send_photo(chat_id=int(chat_id), photo=config["file_id"], caption=config["text"] or None)
                 else:
                     await bot.send_video(chat_id=int(chat_id), video=config["file_id"], caption=config["text"] or None)
+                sent = True
+                DIVULGAR_LAST_FAILURE_NOTIFY.pop(int(chat_id), None)
                 logger.info("Divulgação enviada em chat_id=%s", chat_id)
             except RetryAfter as exc:
                 delay = _retry_delay(exc, maximum=300.0)
                 logger.warning("Divulgação em chat_id=%s limitada; aguardando %.1fs", chat_id, delay)
                 await asyncio.sleep(delay)
-            except (BadRequest, Forbidden, TelegramError):
-                logger.warning("Falha Telegram ao divulgar em chat_id=%s", chat_id, exc_info=True)
+                failure_detail = f"limite temporário do Telegram ({delay:.0f}s)"
+            except Forbidden:
+                logger.warning("Sem permissão para divulgar em chat_id=%s", chat_id, exc_info=True)
+                failure_detail = "o bot não pode enviar mensagens neste grupo"
+            except BadRequest as exc:
+                logger.warning("Requisição inválida ao divulgar em chat_id=%s: %s", chat_id, exc)
+                failure_detail = "a API recusou o conteúdo ou a operação"
+            except TelegramError as exc:
+                logger.warning("Falha Telegram ao divulgar em chat_id=%s: %s", chat_id, exc)
+                failure_detail = type(exc).__name__
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Falha inesperada ao divulgar em chat_id=%s", chat_id)
+                failure_detail = "erro interno inesperado"
+            finally:
+                next_run_at = time.time() + config["interval_seconds"]
+                config["next_run_at"] = next_run_at
+                try:
+                    await _db_call(db.update_divulgacao_next_run, chat_id, next_run_at)
+                except Exception:
+                    logger.exception("Não foi possível persistir o próximo envio de chat_id=%s", chat_id)
+                if failure_detail:
+                    await _notify_divulgar_failure(bot, chat_id, failure_detail)
+                if sent:
+                    await _send_divulgar_notification(
+                        bot,
+                        "✅ <b>Divulgação enviada</b>\n\n"
+                        f"Grupo: <code>{int(chat_id)}</code>\n"
+                        f"Horário: <b>{_format_divulgar_datetime(time.time())}</b>\n"
+                        f"Próximo envio: <b>{_format_divulgar_datetime(next_run_at)}</b>\n"
+                        f"Intervalo: <code>{_format_divulgar_interval(config['interval_seconds'])}</code>",
+                    )
     except asyncio.CancelledError:
         raise
     finally:
@@ -865,9 +984,17 @@ async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(args) == 1 and args[0].lower() == "off":
         await _cancel_divulgar_task(chat.id)
         DIVULGAR_CONFIGS.pop(int(chat.id), None)
+        DIVULGAR_LAST_FAILURE_NOTIFY.pop(int(chat.id), None)
         removed = await _db_call(db.remove_divulgacao, chat.id)
         if removed:
             await _reply_and_cleanup(update, "✅ Divulgação desligada neste grupo.")
+            await _send_divulgar_notification(
+                context.bot,
+                "⏹️ <b>Divulgação desligada</b>\n\n"
+                f"Grupo: <code>{int(chat.id)}</code>\n"
+                f"Horário: <b>{_format_divulgar_datetime(time.time())}</b>\n"
+                "Nenhum novo envio será realizado neste grupo.",
+            )
         else:
             await _reply_and_cleanup(update, "ℹ️ Não havia divulgação ativa neste grupo.")
         return
@@ -887,6 +1014,7 @@ async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if error:
         await _reply_and_cleanup(update, error)
         return
+    next_run_at = time.time() + interval_seconds
     await _db_call(
         db.save_divulgacao,
         chat.id,
@@ -896,8 +1024,10 @@ async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         source["file_id"],
         source["source_message_id"],
         update.effective_user.id,
+        next_run_at,
     )
     await _cancel_divulgar_task(chat.id)
+    DIVULGAR_LAST_FAILURE_NOTIFY.pop(int(chat.id), None)
     config = {
         "interval_seconds": interval_seconds,
         "content_type": source["content_type"],
@@ -905,14 +1035,24 @@ async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "file_id": source["file_id"],
         "source_message_id": source["source_message_id"],
         "owner_id": int(update.effective_user.id),
+        "next_run_at": next_run_at,
     }
     DIVULGAR_CONFIGS[int(chat.id)] = config
     await _ensure_divulgar_task(context.bot, chat.id)
     await _reply_and_cleanup(
         update,
         f"✅ Divulgação ativada neste grupo a cada <b>{_format_divulgar_interval(interval_seconds)}</b>.\n"
-        "A primeira publicação ocorrerá após o primeiro intervalo.\n"
+        f"A primeira publicação ocorrerá em <b>{_format_divulgar_datetime(next_run_at)}</b>.\n"
         "Use <code>.divulgar off</code> para desligar.",
+    )
+    await _send_divulgar_notification(
+        context.bot,
+        "✅ <b>Divulgação ativada</b>\n\n"
+        f"Grupo: <code>{int(chat.id)}</code>\n"
+        f"Conteúdo: <b>{_safe_html(source['content_type'])}</b>\n"
+        f"Intervalo: <code>{_format_divulgar_interval(interval_seconds)}</code>\n"
+        f"Primeiro envio: <b>{_format_divulgar_datetime(next_run_at)}</b>\n"
+        "Após cada envio, você receberá o horário da publicação e o próximo agendamento.",
     )
 
 

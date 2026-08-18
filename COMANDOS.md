@@ -20,7 +20,7 @@ Todos os comandos aceitam reply à mensagem do alvo ou ID/username conhecido, ma
 
 ### Divulgação periódica
 
-Para ativar, responda à mensagem que será divulgada — texto, foto ou vídeo — usando `.divulgar 30m on`. O texto de uma mensagem de texto é republicado como texto; a legenda de uma foto ou vídeo é preservada como legenda. O intervalo permitido vai de 30 segundos a 30 dias. Existe uma configuração por grupo; ativar novamente substitui a divulgação anterior. Use `.divulgar off` para desligar. A configuração fica salva no banco do Bot API e é restaurada após reinícios, desde que o bot continue no grupo e tenha permissão para enviar mensagens e mídias.
+Para ativar, responda à mensagem que será divulgada — texto, foto ou vídeo — usando `.divulgar 30m on`. O texto de uma mensagem de texto é republicado como texto; a legenda de uma foto ou vídeo é preservada como legenda. O intervalo permitido vai de 30 segundos a 30 dias. Existe uma configuração por grupo; ativar novamente substitui a divulgação anterior. Use `.divulgar off` para desligar. A configuração fica salva no banco do Bot API e é restaurada após reinícios, desde que o bot continue no grupo e tenha permissão para enviar mensagens e mídias. O owner `6822870889` recebe uma notificação privada na ativação, no desligamento, após cada envio, com o horário realizado e o próximo horário, e também recebe alertas de falhas com limitação de repetição.
 
 ## Userbot — prefixos
 
