@@ -93,6 +93,11 @@ POLLING_BOOTSTRAP_RETRIES = -1
 POLLING_TIMEOUT_SECONDS = 35
 DB_RETRY_ATTEMPTS = 3
 DB_RETRY_BACKOFF_SECONDS = 0.05
+DIVULGAR_MIN_INTERVAL_SECONDS = 30
+DIVULGAR_MAX_INTERVAL_SECONDS = 30 * 24 * 60 * 60
+DIVULGAR_MAX_TEXT_LENGTH = 4096
+DIVULGAR_MAX_CAPTION_LENGTH = 1024
+DIVULGAR_ALLOWED_MEDIA = {"photo", "video"}
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -172,6 +177,18 @@ class Database:
                     added_by INTEGER NOT NULL,
                     created_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS divulgacoes (
+                    chat_id INTEGER PRIMARY KEY,
+                    interval_seconds INTEGER NOT NULL,
+                    content_type TEXT NOT NULL CHECK(content_type IN ('text','photo','video')),
+                    text TEXT NOT NULL DEFAULT '',
+                    file_id TEXT NOT NULL DEFAULT '',
+                    source_message_id INTEGER NOT NULL,
+                    owner_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_divulgacoes_updated ON divulgacoes(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_chats_active ON chats(active);
                 CREATE INDEX IF NOT EXISTS idx_users_username_nocase ON users(username COLLATE NOCASE);
                 CREATE INDEX IF NOT EXISTS idx_blacklist_chat ON blacklist(chat_id);
@@ -326,6 +343,34 @@ class Database:
             "SELECT chat_id,title,chat_type FROM chats WHERE active=1 AND chat_type IN ('group','supergroup') ORDER BY chat_id"
         ).fetchall()
 
+    def save_divulgacao(self, chat_id: int, interval_seconds: int, content_type: str, text: str, file_id: str, source_message_id: int, owner_id: int):
+        now = int(time.time())
+        self._execute(
+            """
+            INSERT INTO divulgacoes(chat_id,interval_seconds,content_type,text,file_id,source_message_id,owner_id,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                interval_seconds=excluded.interval_seconds,
+                content_type=excluded.content_type,
+                text=excluded.text,
+                file_id=excluded.file_id,
+                source_message_id=excluded.source_message_id,
+                owner_id=excluded.owner_id,
+                updated_at=excluded.updated_at
+            """,
+            (int(chat_id), int(interval_seconds), content_type, text or "", file_id or "", int(source_message_id), int(owner_id), now, now),
+            commit=True,
+        )
+
+    def get_divulgacoes(self):
+        return self._execute(
+            "SELECT chat_id,interval_seconds,content_type,text,file_id,source_message_id,owner_id FROM divulgacoes"
+        ).fetchall()
+
+    def remove_divulgacao(self, chat_id: int) -> bool:
+        cursor = self._execute("DELETE FROM divulgacoes WHERE chat_id=?", (int(chat_id),), commit=True)
+        return cursor.rowcount > 0
+
     def close(self):
         with self._lock:
             self.conn.close()
@@ -343,6 +388,8 @@ _cleanup_tasks: set[asyncio.Task] = set()
 _delete_batch_pending: dict[int, dict[int, float]] = defaultdict(dict)
 _delete_batch_tasks: dict[int, asyncio.Task] = {}
 _chat_registration_seen = set(KNOWN_CHAT_IDS)
+DIVULGAR_TASKS: dict[int, asyncio.Task] = {}
+DIVULGAR_CONFIGS: dict[int, dict] = {}
 KNOWN_USERNAME_IDS = {
     username.lower(): int(user_id)
     for user_id, (username, _full_name) in KNOWN_USERS.items()
@@ -556,6 +603,111 @@ async def _reply_and_cleanup(update: Update, text: str, *, parse_mode: str | Non
     return response
 
 
+def _parse_divulgar_interval(raw: str) -> int | None:
+    match = re.fullmatch(r"(\d+)([smhd])", (raw or "").strip().lower())
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2)
+    multiplier = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    seconds = amount * multiplier
+    if not DIVULGAR_MIN_INTERVAL_SECONDS <= seconds <= DIVULGAR_MAX_INTERVAL_SECONDS:
+        return None
+    return seconds
+
+
+def _format_divulgar_interval(seconds: int) -> str:
+    seconds = int(seconds)
+    for unit, multiplier in (("d", 86400), ("h", 3600), ("m", 60), ("s", 1)):
+        if seconds % multiplier == 0:
+            return f"{seconds // multiplier}{unit}"
+    return f"{seconds}s"
+
+
+def _extract_divulgacao(source_message):
+    if source_message is None:
+        return None, "❌ Responda a uma mensagem de texto, foto ou vídeo."
+    if source_message.text and not source_message.photo and not source_message.video:
+        text = source_message.text.strip()
+        if not text:
+            return None, "❌ A mensagem respondida não possui texto."
+        if len(text) > DIVULGAR_MAX_TEXT_LENGTH:
+            return None, f"❌ O texto excede o limite de {DIVULGAR_MAX_TEXT_LENGTH} caracteres."
+        return {"content_type": "text", "text": text, "file_id": "", "source_message_id": int(source_message.message_id)}, None
+    if source_message.photo:
+        caption = (source_message.caption or "").strip()
+        if len(caption) > DIVULGAR_MAX_CAPTION_LENGTH:
+            return None, f"❌ A legenda excede o limite de {DIVULGAR_MAX_CAPTION_LENGTH} caracteres."
+        return {
+            "content_type": "photo",
+            "text": caption,
+            "file_id": source_message.photo[-1].file_id,
+            "source_message_id": int(source_message.message_id),
+        }, None
+    if source_message.video:
+        caption = (source_message.caption or "").strip()
+        if len(caption) > DIVULGAR_MAX_CAPTION_LENGTH:
+            return None, f"❌ A legenda excede o limite de {DIVULGAR_MAX_CAPTION_LENGTH} caracteres."
+        return {
+            "content_type": "video",
+            "text": caption,
+            "file_id": source_message.video.file_id,
+            "source_message_id": int(source_message.message_id),
+        }, None
+    return None, "❌ O tipo respondido não é suportado. Use texto, foto ou vídeo."
+
+
+async def _cancel_divulgar_task(chat_id: int):
+    task = DIVULGAR_TASKS.pop(int(chat_id), None)
+    if task is None or task is asyncio.current_task():
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def _divulgar_worker(bot, chat_id: int, config: dict):
+    try:
+        while True:
+            await asyncio.sleep(config["interval_seconds"])
+            if DIVULGAR_CONFIGS.get(int(chat_id)) is not config:
+                return
+            try:
+                if config["content_type"] == "text":
+                    await bot.send_message(chat_id=int(chat_id), text=config["text"])
+                elif config["content_type"] == "photo":
+                    await bot.send_photo(chat_id=int(chat_id), photo=config["file_id"], caption=config["text"] or None)
+                else:
+                    await bot.send_video(chat_id=int(chat_id), video=config["file_id"], caption=config["text"] or None)
+                logger.info("Divulgação enviada em chat_id=%s", chat_id)
+            except RetryAfter as exc:
+                delay = _retry_delay(exc, maximum=300.0)
+                logger.warning("Divulgação em chat_id=%s limitada; aguardando %.1fs", chat_id, delay)
+                await asyncio.sleep(delay)
+            except (BadRequest, Forbidden, TelegramError):
+                logger.warning("Falha Telegram ao divulgar em chat_id=%s", chat_id, exc_info=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Falha inesperada ao divulgar em chat_id=%s", chat_id)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        current = asyncio.current_task()
+        if DIVULGAR_TASKS.get(int(chat_id)) is current:
+            DIVULGAR_TASKS.pop(int(chat_id), None)
+
+
+async def _ensure_divulgar_task(bot, chat_id: int):
+    chat_id = int(chat_id)
+    config = DIVULGAR_CONFIGS.get(chat_id)
+    if not config:
+        return
+    task = DIVULGAR_TASKS.get(chat_id)
+    if task and not task.done():
+        return
+    DIVULGAR_TASKS[chat_id] = _track_task(_divulgar_worker(bot, chat_id, config))
+
+
 def _is_group(update: Update) -> bool:
     chat = update.effective_chat
     return bool(chat and chat.type in {ChatType.GROUP, ChatType.SUPERGROUP})
@@ -701,6 +853,69 @@ async def _safe_delete(message) -> bool:
         return False
 
 
+async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_owner_access(update, context):
+        return
+    if not _is_group(update):
+        await _reply_and_cleanup(update, "❌ O `.divulgar` só pode ser usado em grupos ou supergrupos.")
+        return
+    chat = update.effective_chat
+    message = update.effective_message
+    args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
+    if len(args) == 1 and args[0].lower() == "off":
+        await _cancel_divulgar_task(chat.id)
+        DIVULGAR_CONFIGS.pop(int(chat.id), None)
+        removed = await _db_call(db.remove_divulgacao, chat.id)
+        if removed:
+            await _reply_and_cleanup(update, "✅ Divulgação desligada neste grupo.")
+        else:
+            await _reply_and_cleanup(update, "ℹ️ Não havia divulgação ativa neste grupo.")
+        return
+    if len(args) != 2 or args[1].lower() != "on":
+        await _reply_and_cleanup(
+            update,
+            "ℹ️ Uso: responda a uma mensagem com <code>.divulgar 30m on</code> para ligar.\n"
+            "Para desligar: <code>.divulgar off</code>.\n"
+            "Intervalo permitido: de 30s a 30d.",
+        )
+        return
+    interval_seconds = _parse_divulgar_interval(args[0])
+    if interval_seconds is None:
+        await _reply_and_cleanup(update, "❌ Intervalo inválido. Use, por exemplo, <code>30s</code>, <code>30m</code>, <code>2h</code> ou <code>1d</code>; o mínimo é 30s.")
+        return
+    source, error = _extract_divulgacao(message.reply_to_message if message else None)
+    if error:
+        await _reply_and_cleanup(update, error)
+        return
+    await _db_call(
+        db.save_divulgacao,
+        chat.id,
+        interval_seconds,
+        source["content_type"],
+        source["text"],
+        source["file_id"],
+        source["source_message_id"],
+        update.effective_user.id,
+    )
+    await _cancel_divulgar_task(chat.id)
+    config = {
+        "interval_seconds": interval_seconds,
+        "content_type": source["content_type"],
+        "text": source["text"],
+        "file_id": source["file_id"],
+        "source_message_id": source["source_message_id"],
+        "owner_id": int(update.effective_user.id),
+    }
+    DIVULGAR_CONFIGS[int(chat.id)] = config
+    await _ensure_divulgar_task(context.bot, chat.id)
+    await _reply_and_cleanup(
+        update,
+        f"✅ Divulgação ativada neste grupo a cada <b>{_format_divulgar_interval(interval_seconds)}</b>.\n"
+        "A primeira publicação ocorrerá após o primeiro intervalo.\n"
+        "Use <code>.divulgar off</code> para desligar.",
+    )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_and_cleanup(
         update,
@@ -721,7 +936,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>.unbanperm</code> — remove o banimento deste grupo.\n"
         "<code>.allban</code> — o proprietário bane o alvo nos grupos registrados.\n"
         "<code>.unallban</code> — remove o allban global e tenta desbanir o alvo.\n"
-        "<code>.latency</code> — mede uma chamada real à API do Telegram.\n\n"
+        "<code>.latency</code> — mede uma chamada real à API do Telegram.\n"
+        "<code>.divulgar 30m on</code> — programa texto, foto ou vídeo respondido neste grupo.\n"
+        "<code>.divulgar off</code> — desliga a divulgação deste grupo.\n\n"
         "Somente os dois proprietários configurados podem usar e receber respostas deste bot. "
         "A moderação local ainda exige que o bot seja administrador com permissão para apagar mensagens "
         "e restringir membros.",
@@ -785,7 +1002,7 @@ async def cmd_unblacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_and_cleanup(update, f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) removido da blacklist local.")
 
 
-DOT_COMMAND_RE = re.compile(r"^\.(help|unblacklist|unbanperm|unallban|blacklist|banperm|allban|latency)(?:\s+.*)?$", re.IGNORECASE)
+DOT_COMMAND_RE = re.compile(r"^\.(help|unblacklist|unbanperm|unallban|blacklist|banperm|allban|latency|divulgar)(?:\s+.*)?$", re.IGNORECASE)
 DOT_COMMANDS = {
     "help": "cmd_help",
     "blacklist": "cmd_blacklist",
@@ -795,6 +1012,7 @@ DOT_COMMANDS = {
     "allban": "cmd_allban",
     "unallban": "cmd_unallban",
     "latency": "cmd_latency",
+    "divulgar": "cmd_divulgar",
 }
 
 
@@ -1085,6 +1303,9 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         KNOWN_CHAT_IDS.discard(chat.id)
         _chat_registration_seen.discard(chat.id)
+        await _cancel_divulgar_task(chat.id)
+        DIVULGAR_CONFIGS.pop(int(chat.id), None)
+        await _db_call(db.remove_divulgacao, chat.id)
     await _db_call(db.register_chat, chat.id, chat.title or "", chat.type, active)
 
 
@@ -1136,14 +1357,41 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     global BOT_USER_ID
     BOT_USER_ID = (await app.bot.get_me()).id
-    logger.info("Jtzin Bot API online; proprietários=%s", ",".join(str(owner_id) for owner_id in sorted(OWNER_IDS)))
+    rows = await _db_call(db.get_divulgacoes)
+    for row in rows:
+        chat_id = int(row["chat_id"])
+        config = {
+            "interval_seconds": int(row["interval_seconds"]),
+            "content_type": row["content_type"],
+            "text": row["text"] or "",
+            "file_id": row["file_id"] or "",
+            "source_message_id": int(row["source_message_id"]),
+            "owner_id": int(row["owner_id"]),
+        }
+        if config["content_type"] not in {"text", "photo", "video"}:
+            logger.warning("Divulgação inválida ignorada no chat_id=%s", chat_id)
+            continue
+        if not DIVULGAR_MIN_INTERVAL_SECONDS <= config["interval_seconds"] <= DIVULGAR_MAX_INTERVAL_SECONDS:
+            logger.warning("Intervalo de divulgação inválido ignorado no chat_id=%s", chat_id)
+            continue
+        DIVULGAR_CONFIGS[chat_id] = config
+        await _ensure_divulgar_task(app.bot, chat_id)
+    logger.info(
+        "Jtzin Bot API online; proprietários=%s; divulgações restauradas=%s",
+        ",".join(str(owner_id) for owner_id in sorted(OWNER_IDS)),
+        len(DIVULGAR_CONFIGS),
+    )
 
 
 async def post_shutdown(app: Application):
+    for task in set(DIVULGAR_TASKS.values()):
+        task.cancel()
     for task in list(_cleanup_tasks):
         task.cancel()
     if _cleanup_tasks:
         await asyncio.gather(*_cleanup_tasks, return_exceptions=True)
+    DIVULGAR_TASKS.clear()
+    DIVULGAR_CONFIGS.clear()
     await asyncio.to_thread(db.close)
 
 

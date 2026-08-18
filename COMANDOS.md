@@ -13,8 +13,14 @@ A V9.0 possui duas superfícies independentes. O **Bot API** usa somente comando
 | `.allban` | Registra o alvo na lista global e tenta bani-lo em todos os grupos conhecidos do Bot API. | Somente um dos `OWNER_IDS` |
 | `.unallban` | Remove o alvo da lista global e tenta desbaní-lo nos grupos conhecidos. | Somente um dos `OWNER_IDS` |
 | `.latency` | Mede uma chamada real à API do Telegram e informa o tempo total. | Somente `OWNER_IDS` |
+| `.divulgar 30m on` | Programa a republicação periódica de uma mensagem de texto, foto ou vídeo respondido no grupo atual. Aceita intervalos de `30s` a `30d`. | Somente `OWNER_IDS` |
+| `.divulgar off` | Desliga a divulgação programada no grupo atual. | Somente `OWNER_IDS` |
 
 Todos os comandos aceitam reply à mensagem do alvo ou ID/username conhecido, mas **somente os dois owners configurados em `OWNER_IDS` recebem respostas e executam comandos**. Administradores comuns não têm acesso ao dispatcher do bot. O Bot API ainda precisa estar no grupo e possuir as permissões administrativas correspondentes para realizar as ações. A função global não consegue operar em chats que o bot não conhece, não acessa ou onde não pode restringir membros. O banco do Bot API é separado do banco do Userbot.
+
+### Divulgação periódica
+
+Para ativar, responda à mensagem que será divulgada — texto, foto ou vídeo — usando `.divulgar 30m on`. O texto de uma mensagem de texto é republicado como texto; a legenda de uma foto ou vídeo é preservada como legenda. O intervalo permitido vai de 30 segundos a 30 dias. Existe uma configuração por grupo; ativar novamente substitui a divulgação anterior. Use `.divulgar off` para desligar. A configuração fica salva no banco do Bot API e é restaurada após reinícios, desde que o bot continue no grupo e tenha permissão para enviar mensagens e mídias.
 
 ## Userbot — prefixos
 

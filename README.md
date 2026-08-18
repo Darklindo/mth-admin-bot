@@ -28,8 +28,12 @@ O bot comum oferece moderação local e global e responde somente a comandos ini
 | `.allban` | Registra o alvo na blacklist global e tenta bani-lo em todos os grupos conhecidos | Somente um dos `OWNER_IDS` |
 | `.unallban` | Remove o alvo da lista global e tenta desbaní-lo nos grupos conhecidos | Somente um dos `OWNER_IDS` |
 | `.latency` | Mede uma chamada real à API do Telegram | Somente `OWNER_IDS` |
+| `.divulgar 30m on` | Programa a republicação de texto, foto ou vídeo respondido no grupo atual | Somente `OWNER_IDS` |
+| `.divulgar off` | Desliga a divulgação programada no grupo atual | Somente `OWNER_IDS` |
 
 O banco mantém a lista por chat e o Bot API possui cache próprio. **Somente os dois owners configurados em `OWNER_IDS` recebem respostas e executam comandos; administradores comuns não têm acesso ao dispatcher.** O bot precisa estar presente e ter permissões administrativas para apagar mensagens ou restringir usuários; os comandos globais só podem alcançar grupos nos quais ele esteja presente e autorizado.
+
+O comando `.divulgar 30m on` deve ser enviado em resposta a uma mensagem de texto, foto ou vídeo. O bot republica o texto ou a mídia com sua legenda a cada intervalo configurado, entre 30 segundos e 30 dias. Há uma divulgação por grupo; ativar novamente substitui a anterior. Use `.divulgar off` para desligar. O agendamento é salvo no banco e restaurado após reinícios, desde que o bot continue no grupo e possa enviar mensagens e mídias.
 
 As respostas e os comandos são removidos automaticamente após alguns segundos. O bot é deliberadamente independente: não contém o restante dos recursos do Userbot, não aceita autorização de terceiros e não possui subproprietários.
 

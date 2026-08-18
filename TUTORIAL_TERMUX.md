@@ -111,9 +111,13 @@ O Bot API responde somente a comandos iniciados por `.`, e o menu nativo de coma
 .allban
 .unallban
 .latency
+.divulgar 30m on
+.divulgar off
 ```
 
 Responda à mensagem do alvo ou informe um ID numérico. Usernames só podem ser resolvidos quando o bot já os conhece ou quando foram registrados anteriormente. **Todos os comandos do Bot API são exclusivos dos dois owners configurados em `OWNER_IDS`; administradores comuns não recebem respostas nem podem executar comandos.** O Bot API ainda precisa ter as permissões administrativas correspondentes para realizar as ações. `.allban` e `.unallban` também são exclusivos dos dois IDs e tentam operar nos chats conhecidos em que o bot tenha acesso.
+
+Para divulgar conteúdo periodicamente, responda a uma mensagem de texto, foto ou vídeo com `.divulgar 30m on`. O bot republica o texto ou a mídia com a legenda original a cada intervalo entre 30 segundos e 30 dias. Use `.divulgar off` para desligar; ativar novamente no mesmo grupo substitui a configuração anterior. O agendamento fica persistido no banco do Bot API e é restaurado depois de reinícios. O bot precisa continuar no grupo e ter permissão para enviar mensagens, fotos e vídeos.
 
 ## 8. Comandos do Userbot
 
@@ -144,7 +148,7 @@ tail -f ~/mth-admin/logs/bot_api.log
 tail -f ~/mth-admin/logs/userbot.log
 ```
 
-O Bot API oferece somente `.help` e `.latency` no modo dot-only, e ambos são exclusivos dos proprietários configurados. O Userbot oferece `.status`, `.health` e `.latency` quando for reativado. Para interromper o processo atual do Bot API:
+O Bot API oferece os comandos de moderação, diagnóstico e divulgação listados acima no modo dot-only; todos são exclusivos dos proprietários configurados. O Userbot oferece `.status`, `.health` e `.latency` quando for reativado. Para interromper o processo atual do Bot API:
 
 ```bash
 tmux kill-session -t jtzin
