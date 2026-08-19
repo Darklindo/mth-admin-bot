@@ -93,7 +93,7 @@ tmux kill-session -t jtzin 2>/dev/null || true
 tmux new-session -d -s jtzin './watchdog_bot_only.sh'
 ```
 
-O `watchdog_bot_only.sh` inicia apenas `bot.py`, grava o log em `logs/bot_api.log` e reinicia o Bot API com backoff progressivo. O `bot.py` também mantém tentativas de bootstrap do polling para recuperar falhas transitórias de DNS ou rede; após uma queda do processo, o watchdog reinicia automaticamente. O `watchdog_all.sh` só deve ser usado quando o Userbot for reativado deliberadamente.
+O `watchdog_bot_only.sh` inicia apenas `bot.py`, grava o log em `logs/bot_api.log` e reinicia o Bot API com backoff progressivo. O `bot.py` mantém tentativas de bootstrap do polling para recuperar falhas transitórias de DNS ou rede, usa pools HTTP separados para polling e ações, aplica retries limitados com backoff às operações da Bot API e atualiza `data/bot_api.heartbeat` a cada 15 segundos. Se o processo cair ou o event loop ficar sem atualizar o heartbeat por 180 segundos, o watchdog reinicia automaticamente somente o Bot API. O `watchdog_all.sh` só deve ser usado quando o Userbot for reativado deliberadamente.
 
 Para sair da sessão sem encerrar os processos, use `Ctrl+B` e depois `D`. Para retornar:
 
@@ -128,7 +128,7 @@ Para interromper os processos:
 tmux kill-session -t jtzin
 ```
 
-O Bot API não deve receber o token pela linha de comando, e o Userbot não deve compartilhar seu arquivo `.session`. Se qualquer token, `API_HASH`, sessão ou banco for exposto, revogue ou substitua a credencial imediatamente.
+O comando `.latency` mostra a chamada real à API, idade do último update, fila local, tempo de exclusão, duração dos comandos, RetryAfter, falhas de rede e erros de polling. Isso ajuda a distinguir atraso da API do Telegram de travamento local do Termux. O Bot API não deve receber o token pela linha de comando, e o Userbot não deve compartilhar seu arquivo `.session`. Se qualquer token, `API_HASH`, sessão ou banco for exposto, revogue ou substitua a credencial imediatamente.
 
 ## Documentação adicional
 

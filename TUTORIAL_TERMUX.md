@@ -91,7 +91,7 @@ tmux kill-session -t jtzin 2>/dev/null || true
 tmux new-session -d -s jtzin './watchdog_bot_only.sh'
 ```
 
-O `watchdog_bot_only.sh` inicia `bot.py`, reinicia o Bot API com backoff progressivo e grava `logs/bot_api.log`. O próprio polling tenta recuperar falhas transitórias de rede durante o bootstrap; se o processo cair, o watchdog reinicia apenas o Bot API. O `watchdog_all.sh` só deve ser usado quando o Userbot for reativado deliberadamente.
+O `watchdog_bot_only.sh` inicia `bot.py`, reinicia o Bot API com backoff progressivo e grava `logs/bot_api.log`. O polling tenta recuperar falhas transitórias de rede durante o bootstrap, enquanto as ações usam retries limitados com backoff e pools HTTP separados do polling. O `bot.py` atualiza `data/bot_api.heartbeat` a cada 15 segundos; se o event loop parar de atualizar esse arquivo por 180 segundos, o watchdog considera o processo travado e reinicia somente o Bot API. O `watchdog_all.sh` só deve ser usado quando o Userbot for reativado deliberadamente.
 
 Para sair da visualização sem encerrar os serviços, pressione `Ctrl+B` e depois `D`. Para retornar:
 
@@ -150,7 +150,7 @@ tail -f ~/mth-admin/logs/bot_api.log
 tail -f ~/mth-admin/logs/userbot.log
 ```
 
-O Bot API oferece os comandos de moderação, diagnóstico e divulgação listados acima no modo dot-only; todos são exclusivos dos proprietários configurados. O Userbot oferece `.status`, `.health` e `.latency` quando for reativado. Para interromper o processo atual do Bot API:
+O Bot API oferece os comandos de moderação, diagnóstico e divulgação listados acima no modo dot-only; todos são exclusivos dos proprietários configurados. O `.latency` exibe a chamada real à API, idade do update, fila local, tempos de exclusão, duração dos comandos, retries de flood/rede, falhas recuperadas do polling e o último erro observado. Use essa separação para diferenciar latência do Telegram de atraso local do Termux. O Userbot oferece `.status`, `.health` e `.latency` quando for reativado. Para interromper o processo atual do Bot API:
 
 ```bash
 tmux kill-session -t jtzin

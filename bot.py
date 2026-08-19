@@ -17,7 +17,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatType
-from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -83,6 +83,7 @@ def _is_owner(user_id: int | None) -> bool:
         return False
 
 DB_PATH = DATA_DIR / "bot_api.db"
+HEARTBEAT_PATH = DATA_DIR / "bot_api.heartbeat"
 DELETE_AFTER_SECONDS = 5
 ALLBAN_CONCURRENCY = 4
 MAX_TARGET_ID_LENGTH = 20
@@ -96,6 +97,12 @@ POLLING_BOOTSTRAP_RETRIES = -1
 POLLING_TIMEOUT_SECONDS = 35
 DB_RETRY_ATTEMPTS = 3
 DB_RETRY_BACKOFF_SECONDS = 0.05
+API_RETRY_ATTEMPTS = 3
+API_RETRY_BASE_SECONDS = 0.25
+API_RETRY_MAX_SECONDS = 4.0
+HEARTBEAT_INTERVAL_SECONDS = 15.0
+HEARTBEAT_STALE_AFTER_SECONDS = 180.0
+COMMAND_ARGUMENT_MAX_CHARS = 1024
 DIVULGAR_MIN_INTERVAL_SECONDS = 30
 DIVULGAR_MAX_INTERVAL_SECONDS = 30 * 24 * 60 * 60
 DIVULGAR_MAX_TEXT_LENGTH = 4096
@@ -462,6 +469,7 @@ DIVULGAR_TASKS: dict[int, asyncio.Task] = {}
 DIVULGAR_CONFIGS: dict[int, dict] = {}
 DIVULGAR_LAST_FAILURE_NOTIFY: dict[int, float] = {}
 DIVULGAR_FAILURE_NOTIFY_COOLDOWN_SECONDS = 15 * 60
+HEARTBEAT_TASK: asyncio.Task | None = None
 KNOWN_USERNAME_IDS = {
     username.lower(): int(user_id)
     for user_id, (username, _full_name) in KNOWN_USERS.items()
@@ -470,6 +478,7 @@ KNOWN_USERNAME_IDS = {
 CHAT_MEMBER_CACHE_TTL = 5.0
 CHAT_MEMBER_ERROR_TTL = 1.5
 CHAT_MEMBER_CACHE: dict[tuple[int, int], tuple[float, object | None]] = {}
+CHAT_MEMBER_INFLIGHT: dict[tuple[int, int], asyncio.Task] = {}
 ALLOWED_UPDATES = ["message", "my_chat_member"]
 BLACKLIST_TELEMETRY = {
     "matched": 0,
@@ -483,6 +492,16 @@ BLACKLIST_TELEMETRY = {
     "batch_success": 0,
     "batch_messages": 0,
     "batch_fallbacks": 0,
+    "network_errors": 0,
+    "retry_after_events": 0,
+    "command_started": 0,
+    "command_completed": 0,
+    "command_failed": 0,
+    "last_command_ms": None,
+    "max_command_ms": 0.0,
+    "last_error": "",
+    "polling_errors": 0,
+    "last_polling_error": "",
 }
 
 
@@ -525,6 +544,52 @@ def _track_task(coro):
     return task
 
 
+def _is_transient_api_error(exc: BaseException) -> bool:
+    return isinstance(exc, (RetryAfter, TimedOut, NetworkError))
+
+
+def _retry_backoff(attempt: int) -> float:
+    # Backoff exponencial pequeno: recupera falhas transitórias sem travar comandos.
+    return min(API_RETRY_MAX_SECONDS, API_RETRY_BASE_SECONDS * (2 ** max(0, int(attempt))))
+
+
+async def _api_call(operation, *args, operation_name: str = "operação", retry_after_maximum: float = API_RETRY_MAX_SECONDS, **kwargs):
+    """Executa uma chamada da Bot API com retry seguro e limitado."""
+    for attempt in range(API_RETRY_ATTEMPTS):
+        try:
+            return await operation(*args, **kwargs)
+        except RetryAfter as exc:
+            BLACKLIST_TELEMETRY["retry_after_events"] += 1
+            delay = _retry_delay(exc, maximum=retry_after_maximum)
+            if attempt + 1 >= API_RETRY_ATTEMPTS:
+                raise
+            await asyncio.sleep(delay)
+        except (TimedOut, NetworkError):
+            BLACKLIST_TELEMETRY["network_errors"] += 1
+            if attempt + 1 >= API_RETRY_ATTEMPTS:
+                raise
+            await asyncio.sleep(_retry_backoff(attempt))
+        except asyncio.CancelledError:
+            raise
+    raise RuntimeError(f"Falha sem resultado em {operation_name}")
+
+
+def _write_heartbeat():
+    now = time.time()
+    temporary_path = HEARTBEAT_PATH.with_suffix(".tmp")
+    try:
+        temporary_path.write_text(f"{os.getpid()}\n{now:.6f}\n", encoding="utf-8")
+        temporary_path.replace(HEARTBEAT_PATH)
+    except OSError:
+        logger.debug("Não foi possível atualizar o heartbeat do Bot API", exc_info=True)
+
+
+async def _heartbeat_worker():
+    while True:
+        _write_heartbeat()
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
+
 async def _db_call(method, *args, **kwargs):
     """Executa SQLite fora do event loop e repete somente locks transitórios."""
     for attempt in range(DB_RETRY_ATTEMPTS):
@@ -544,15 +609,13 @@ async def _delete_one(bot, chat_id: int, message_id: int, scheduled_at: float | 
     if scheduled_at is not None:
         BLACKLIST_TELEMETRY["last_queue_ms"] = max(0.0, (started - scheduled_at) * 1000)
     try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except RetryAfter as exc:
-        # Respeita o flood control do Telegram e faz uma única repetição segura.
-        try:
-            await asyncio.sleep(_retry_delay(exc))
-            await bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except (BadRequest, Forbidden, RetryAfter, TelegramError):
-            BLACKLIST_TELEMETRY["delete_failed"] += 1
-            return False
+        await _api_call(
+            bot.delete_message,
+            chat_id=chat_id,
+            message_id=message_id,
+            operation_name="exclusão de mensagem",
+            retry_after_maximum=60.0,
+        )
     except (BadRequest, Forbidden, TelegramError):
         BLACKLIST_TELEMETRY["delete_failed"] += 1
         return False
@@ -585,15 +648,19 @@ async def _delete_batch_worker(bot, chat_id: int):
         batch_ok = False
         if callable(delete_messages):
             try:
-                batch_ok = bool(await delete_messages(chat_id=chat_id, message_ids=message_ids))
-            except RetryAfter as exc:
-                try:
-                    await asyncio.sleep(_retry_delay(exc))
-                    batch_ok = bool(await delete_messages(chat_id=chat_id, message_ids=message_ids))
-                except (BadRequest, Forbidden, RetryAfter, TelegramError):
-                    pass
+                batch_ok = bool(
+                    await _api_call(
+                        delete_messages,
+                        chat_id=chat_id,
+                        message_ids=message_ids,
+                        operation_name="exclusão em lote",
+                        retry_after_maximum=60.0,
+                    )
+                )
             except (BadRequest, Forbidden, TelegramError):
                 pass
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.debug("Falha inesperada no deleteMessages", exc_info=True)
         if batch_ok:
@@ -645,7 +712,11 @@ def _schedule_delete(message, delay: int = DELETE_AFTER_SECONDS):
     async def worker():
         try:
             await asyncio.sleep(delay)
-            await message.delete()
+            await _api_call(
+                message.delete,
+                operation_name="limpeza de resposta",
+                retry_after_maximum=60.0,
+            )
         except (BadRequest, Forbidden, TelegramError):
             return
         except asyncio.CancelledError:
@@ -662,12 +733,19 @@ async def _reply_and_cleanup(update: Update, text: str, *, parse_mode: str | Non
         return None
     kwargs = {"parse_mode": parse_mode} if parse_mode else {}
     try:
-        response = await message.reply_text(text, **kwargs)
-    except TelegramError:
+        response = await _api_call(
+            message.reply_text,
+            text,
+            operation_name="resposta de comando",
+            **kwargs,
+        )
+    except TelegramError as exc:
+        BLACKLIST_TELEMETRY["last_error"] = type(exc).__name__
         return None
     except asyncio.CancelledError:
         raise
     except Exception:
+        BLACKLIST_TELEMETRY["last_error"] = "resposta_de_comando"
         logger.debug("Falha inesperada ao enviar resposta do comando", exc_info=True)
         return None
     _schedule_delete(message)
@@ -705,28 +783,16 @@ async def _send_divulgar_notification(bot, text: str):
         logger.error("Destinatário fixo de divulgação não está em OWNER_IDS; notificação bloqueada")
         return False
     try:
-        await bot.send_message(
+        await _api_call(
+            bot.send_message,
             chat_id=DIVULGAR_NOTIFY_USER_ID,
             text=text,
             parse_mode="HTML",
             disable_notification=True,
+            operation_name="notificação privada da divulgação",
+            retry_after_maximum=30.0,
         )
         return True
-    except RetryAfter as exc:
-        try:
-            await asyncio.sleep(_retry_delay(exc, maximum=30.0))
-            await bot.send_message(
-                chat_id=DIVULGAR_NOTIFY_USER_ID,
-                text=text,
-                parse_mode="HTML",
-                disable_notification=True,
-            )
-            return True
-        except asyncio.CancelledError:
-            raise
-        except TelegramError:
-            logger.warning("Falha após RetryAfter ao enviar notificação privada da divulgação", exc_info=True)
-            return False
     except Forbidden:
         logger.warning("Não foi possível enviar DM da divulgação; o owner precisa abrir o chat do bot")
         return False
@@ -848,18 +914,17 @@ async def _divulgar_worker(bot, schedule_id: int, config: dict):
             failure_detail = None
             try:
                 if config["content_type"] == "text":
-                    await bot.send_message(chat_id=chat_id, text=config["text"])
+                    await _api_call(bot.send_message,chat_id=chat_id, text=config["text"])
                 elif config["content_type"] == "photo":
-                    await bot.send_photo(chat_id=chat_id, photo=config["file_id"], caption=config["text"] or None)
+                    await _api_call(bot.send_photo,chat_id=chat_id, photo=config["file_id"], caption=config["text"] or None)
                 else:
-                    await bot.send_video(chat_id=chat_id, video=config["file_id"], caption=config["text"] or None)
+                    await _api_call(bot.send_video,chat_id=chat_id, video=config["file_id"], caption=config["text"] or None)
                 sent = True
                 DIVULGAR_LAST_FAILURE_NOTIFY.pop(schedule_id, None)
                 logger.info("Divulgação enviada em chat_id=%s schedule_id=%s", chat_id, schedule_id)
             except RetryAfter as exc:
                 delay = _retry_delay(exc, maximum=300.0)
-                logger.warning("Divulgação limitada em chat_id=%s schedule_id=%s; aguardando %.1fs", chat_id, schedule_id, delay)
-                await asyncio.sleep(delay)
+                logger.warning("Divulgação limitada em chat_id=%s schedule_id=%s após retries; próxima tentativa em %.1fs", chat_id, schedule_id, delay)
                 failure_detail = f"limite temporário do Telegram ({delay:.0f}s)"
             except Forbidden:
                 logger.warning("Sem permissão para divulgar em chat_id=%s schedule_id=%s", chat_id, schedule_id, exc_info=True)
@@ -925,17 +990,48 @@ async def _get_chat_member_cached(chat_id: int, user_id: int, context: ContextTy
     cached = CHAT_MEMBER_CACHE.get(key)
     if cached and cached[0] > now:
         return cached[1]
+
+    async def load_member():
+        try:
+            member = await _api_call(
+                context.bot.get_chat_member,
+                int(chat_id),
+                int(user_id),
+                operation_name="consulta de membro",
+                retry_after_maximum=30.0,
+            )
+        except TelegramError:
+            CHAT_MEMBER_CACHE[key] = (time.monotonic() + CHAT_MEMBER_ERROR_TTL, None)
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            CHAT_MEMBER_CACHE[key] = (time.monotonic() + CHAT_MEMBER_ERROR_TTL, None)
+            logger.debug("Falha inesperada ao consultar membro", exc_info=True)
+            return None
+        CHAT_MEMBER_CACHE[key] = (time.monotonic() + CHAT_MEMBER_CACHE_TTL, member)
+        if len(CHAT_MEMBER_CACHE) > 4096:
+            expired = [cache_key for cache_key, (expires, _member) in CHAT_MEMBER_CACHE.items() if expires <= time.monotonic()]
+            for cache_key in expired[:1024]:
+                CHAT_MEMBER_CACHE.pop(cache_key, None)
+        return member
+
+    task = CHAT_MEMBER_INFLIGHT.get(key)
+    if task is None or task.done():
+        task = asyncio.create_task(load_member())
+        CHAT_MEMBER_INFLIGHT[key] = task
+
+        def clear_inflight(done_task, cache_key=key):
+            if CHAT_MEMBER_INFLIGHT.get(cache_key) is done_task:
+                CHAT_MEMBER_INFLIGHT.pop(cache_key, None)
+
+        task.add_done_callback(clear_inflight)
     try:
-        member = await context.bot.get_chat_member(chat_id, user_id)
-    except TelegramError:
-        CHAT_MEMBER_CACHE[key] = (now + CHAT_MEMBER_ERROR_TTL, None)
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
         return None
-    CHAT_MEMBER_CACHE[key] = (now + CHAT_MEMBER_CACHE_TTL, member)
-    if len(CHAT_MEMBER_CACHE) > 4096:
-        expired = [cache_key for cache_key, (expires, _member) in CHAT_MEMBER_CACHE.items() if expires <= now]
-        for cache_key in expired[:1024]:
-            CHAT_MEMBER_CACHE.pop(cache_key, None)
-    return member
 
 
 def _invalidate_chat_member_cache(chat_id: int):
@@ -966,7 +1062,7 @@ async def _bot_can_restrict(chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
     global BOT_USER_ID
     if not BOT_USER_ID:
         try:
-            BOT_USER_ID = (await context.bot.get_me()).id
+            BOT_USER_ID = (await _api_call(context.bot.get_me, operation_name="identificação do bot")).id
         except TelegramError:
             return False
     member = await _get_chat_member_cached(chat_id, BOT_USER_ID, context)
@@ -977,7 +1073,7 @@ async def _bot_can_delete(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> b
     global BOT_USER_ID
     if not BOT_USER_ID:
         try:
-            BOT_USER_ID = (await context.bot.get_me()).id
+            BOT_USER_ID = (await _api_call(context.bot.get_me, operation_name="identificação do bot")).id
         except TelegramError:
             return False
     member = await _get_chat_member_cached(chat_id, BOT_USER_ID, context)
@@ -1271,7 +1367,7 @@ async def cmd_latency(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     started = time.perf_counter()
     try:
-        await context.bot.get_me()
+        await _api_call(context.bot.get_me, operation_name="diagnóstico de latência")
         api_ms = (time.perf_counter() - started) * 1000
         api_status = f"✅ disponível ({api_ms:.0f} ms)"
     except TelegramError as exc:
@@ -1291,7 +1387,12 @@ async def cmd_latency(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Exclusões: <code>{BLACKLIST_TELEMETRY['delete_success']}</code> OK / <code>{BLACKLIST_TELEMETRY['delete_failed']}</code> falhas\n"
         f"• Lotes nativos: <code>{BLACKLIST_TELEMETRY['batch_success']}</code> / <code>{BLACKLIST_TELEMETRY['batch_messages']}</code> mensagens\n"
         f"• Fallbacks individuais: <code>{BLACKLIST_TELEMETRY['batch_fallbacks']}</code>\n"
-        "• Polling: ✅ processo monitorado pelo watchdog\n"
+        f"• Comandos: <code>{BLACKLIST_TELEMETRY['command_completed']}</code> concluídos / <code>{BLACKLIST_TELEMETRY['command_failed']}</code> falhas\n"
+        f"• Duração do comando: <code>{_format_ms(BLACKLIST_TELEMETRY['last_command_ms'])}</code> último / <code>{_format_ms(BLACKLIST_TELEMETRY['max_command_ms'])}</code> máximo\n"
+        f"• Retries: <code>{BLACKLIST_TELEMETRY['retry_after_events']}</code> flood / <code>{BLACKLIST_TELEMETRY['network_errors']}</code> rede\n"
+        f"• Polling: <code>{BLACKLIST_TELEMETRY['polling_errors']}</code> falhas recuperadas; última <code>{_safe_html(BLACKLIST_TELEMETRY['last_polling_error'] or 'nenhuma')}</code>\n"
+        f"• Último erro: <code>{_safe_html(BLACKLIST_TELEMETRY['last_error'] or 'nenhum')}</code>\n"
+        "• Polling: ✅ processo monitorado pelo watchdog + heartbeat\n"
         "• Userbot: ⏸️ desligado\n"
         "\nA medição separa atraso do update, fila local e tempo do RPC de exclusão."
 
@@ -1338,6 +1439,9 @@ async def on_dot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message.from_user or not _is_owner(message.from_user.id):
         # Não responder, não editar e não enviar mensagem para qualquer não-owner.
         return
+    if len(text) > COMMAND_ARGUMENT_MAX_CHARS:
+        await _reply_and_cleanup(update, f"❌ O comando excede o limite de {COMMAND_ARGUMENT_MAX_CHARS} caracteres.")
+        return
     parts = text.split()
     command = parts[0][1:].lower()
     handler_name = DOT_COMMANDS.get(command)
@@ -1346,17 +1450,27 @@ async def on_dot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     original_args = getattr(context, "args", None)
     context.args = parts[1:]
+    command_started = time.perf_counter()
+    BLACKLIST_TELEMETRY["command_started"] += 1
     try:
         await handler(update, context)
+        BLACKLIST_TELEMETRY["command_completed"] += 1
     except asyncio.CancelledError:
         raise
     except TelegramError as exc:
+        BLACKLIST_TELEMETRY["command_failed"] += 1
+        BLACKLIST_TELEMETRY["last_error"] = type(exc).__name__
         logger.warning("Falha do Telegram ao executar .%s: %s", command, exc)
         await _reply_and_cleanup(update, "❌ O Telegram recusou esta operação ou a conexão falhou. Tente novamente.")
     except Exception:
+        BLACKLIST_TELEMETRY["command_failed"] += 1
+        BLACKLIST_TELEMETRY["last_error"] = "command_internal_error"
         logger.exception("Falha inesperada ao executar .%s", command)
         await _reply_and_cleanup(update, "❌ Ocorreu um erro interno ao executar este comando.")
     finally:
+        elapsed_ms = (time.perf_counter() - command_started) * 1000
+        BLACKLIST_TELEMETRY["last_command_ms"] = elapsed_ms
+        BLACKLIST_TELEMETRY["max_command_ms"] = max(BLACKLIST_TELEMETRY["max_command_ms"], elapsed_ms)
         context.args = original_args
 
 
@@ -1455,20 +1569,14 @@ async def cmd_unbanperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _ban_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, target: Target):
     try:
-        await context.bot.ban_chat_member(chat_id, target.user_id)
+        await _api_call(
+            context.bot.ban_chat_member,
+            chat_id,
+            target.user_id,
+            operation_name="banimento",
+            retry_after_maximum=60.0,
+        )
         return "ok"
-    except RetryAfter as exc:
-        try:
-            await asyncio.sleep(_retry_delay(exc))
-            await context.bot.ban_chat_member(chat_id, target.user_id)
-            return "ok"
-        except asyncio.CancelledError:
-            raise
-        except TelegramError:
-            return "failed"
-        except Exception:
-            logger.exception("Falha inesperada ao banir em %s/%s", chat_id, target.user_id)
-            return "failed"
     except Forbidden:
         return "forbidden"
     except BadRequest as exc:
@@ -1487,20 +1595,15 @@ async def _ban_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, target:
 
 async def _unban_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, target: Target):
     try:
-        await context.bot.unban_chat_member(chat_id, target.user_id, only_if_banned=True)
+        await _api_call(
+            context.bot.unban_chat_member,
+            chat_id,
+            target.user_id,
+            only_if_banned=True,
+            operation_name="desbanimento",
+            retry_after_maximum=60.0,
+        )
         return "ok"
-    except RetryAfter as exc:
-        try:
-            await asyncio.sleep(_retry_delay(exc))
-            await context.bot.unban_chat_member(chat_id, target.user_id, only_if_banned=True)
-            return "ok"
-        except asyncio.CancelledError:
-            raise
-        except TelegramError:
-            return "failed"
-        except Exception:
-            logger.exception("Falha inesperada ao repetir unban em %s/%s", chat_id, target.user_id)
-            return "failed"
     except BadRequest as exc:
         text = str(exc).lower()
         if "not banned" in text or "user is not banned" in text:
@@ -1667,16 +1770,23 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     if error is None:
         return
     if isinstance(error, RetryAfter):
+        BLACKLIST_TELEMETRY["polling_errors"] += 1
+        BLACKLIST_TELEMETRY["last_polling_error"] = "RetryAfter"
         logger.warning("Telegram solicitou RetryAfter: %s", error)
-    elif isinstance(error, NetworkError):
+    elif isinstance(error, (NetworkError, TimedOut)):
+        BLACKLIST_TELEMETRY["polling_errors"] += 1
+        BLACKLIST_TELEMETRY["last_polling_error"] = type(error).__name__
         logger.warning("Falha transitória de rede no Bot API; o polling continuará tentando: %s", error)
     else:
+        BLACKLIST_TELEMETRY["last_polling_error"] = type(error).__name__
         logger.exception("Erro não tratado no Bot API", exc_info=error)
 
 
 async def post_init(app: Application):
-    global BOT_USER_ID
-    BOT_USER_ID = (await app.bot.get_me()).id
+    global BOT_USER_ID, HEARTBEAT_TASK
+    _write_heartbeat()
+    HEARTBEAT_TASK = _track_task(_heartbeat_worker())
+    BOT_USER_ID = (await _api_call(app.bot.get_me, operation_name="identificação do bot")).id
     rows = await _db_call(db.get_divulgacoes)
     for row in rows:
         schedule_id = int(row["schedule_id"])
@@ -1708,6 +1818,7 @@ async def post_init(app: Application):
 
 
 async def post_shutdown(app: Application):
+    global HEARTBEAT_TASK
     for task in set(DIVULGAR_TASKS.values()):
         task.cancel()
     for task in list(_cleanup_tasks):
@@ -1716,6 +1827,14 @@ async def post_shutdown(app: Application):
         await asyncio.gather(*_cleanup_tasks, return_exceptions=True)
     DIVULGAR_TASKS.clear()
     DIVULGAR_CONFIGS.clear()
+    if HEARTBEAT_TASK is not None:
+        HEARTBEAT_TASK.cancel()
+        await asyncio.gather(HEARTBEAT_TASK, return_exceptions=True)
+        HEARTBEAT_TASK = None
+    try:
+        HEARTBEAT_PATH.unlink(missing_ok=True)
+    except OSError:
+        logger.debug("Não foi possível remover o heartbeat do Bot API", exc_info=True)
     await asyncio.to_thread(db.close)
 
 

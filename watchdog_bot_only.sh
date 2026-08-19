@@ -23,6 +23,8 @@ botapi_pid=""
 delay=5
 max_delay=60
 stable_after=30
+heartbeat_file="${SCRIPT_DIR}/data/bot_api.heartbeat"
+heartbeat_stale_after=180
 botapi_started_at=0
 
 log() {
@@ -45,6 +47,15 @@ stop_bot() {
         done
         kill -KILL "$pid" 2>/dev/null || true
     fi
+}
+
+heartbeat_is_healthy() {
+    [[ -f "$heartbeat_file" ]] || return 1
+    local modified now age
+    modified="$(stat -c '%Y' "$heartbeat_file" 2>/dev/null || printf '0')"
+    now="$(date +%s)"
+    age=$((now - modified))
+    (( age >= 0 && age <= heartbeat_stale_after ))
 }
 
 shutdown() {
@@ -104,6 +115,18 @@ while [[ "$stop_requested" -eq 0 ]]; do
             (( delay > max_delay )) && delay=$max_delay
         fi
         log "Bot API encerrou com código ${code} após ${uptime}s; reinício em ${delay}s."
+        sleep "$delay"
+        continue
+    fi
+
+    now=$(date +%s)
+    uptime=$((now - botapi_started_at))
+    if (( uptime >= heartbeat_stale_after )) && ! heartbeat_is_healthy; then
+        log "Heartbeat do Bot API está ausente ou obsoleto há mais de ${heartbeat_stale_after}s; reinício preventivo."
+        stop_bot "$botapi_pid"
+        wait "$botapi_pid" 2>/dev/null || true
+        botapi_pid=""
+        delay=5
         sleep "$delay"
         continue
     fi

@@ -12,13 +12,15 @@ A V9.0 possui duas superfícies independentes. O **Bot API** usa somente comando
 | `.unbanperm` | Retira o banimento permanente do alvo no grupo atual. | Somente `OWNER_IDS` |
 | `.allban` | Registra o alvo na lista global e tenta bani-lo em todos os grupos conhecidos do Bot API. | Somente um dos `OWNER_IDS` |
 | `.unallban` | Remove o alvo da lista global e tenta desbaní-lo nos grupos conhecidos. | Somente um dos `OWNER_IDS` |
-| `.latency` | Mede uma chamada real à API do Telegram e informa o tempo total. | Somente `OWNER_IDS` |
+| `.latency` | Mede uma chamada real à API e informa idade do update, fila local, exclusões, duração dos comandos, retries, falhas de polling e último erro observado. | Somente `OWNER_IDS` |
 | `.divulgar 30m on` | Cria uma nova republicação periódica de uma mensagem de texto, foto ou vídeo respondido no grupo atual. Aceita intervalos de `30s` a `30d`. | Somente `OWNER_IDS` |
 | `.divulgar list` | Lista as divulgações ativas do grupo e seus `schedule_id`. | Somente `OWNER_IDS` |
 | `.divulgar off ID` | Desliga somente a divulgação identificada pelo `schedule_id`. | Somente `OWNER_IDS` |
 | `.divulgar off all` | Desliga todas as divulgações do grupo; sem `ID`, `.divulgar off` só desliga diretamente quando há uma única agenda. | Somente `OWNER_IDS` |
 
 Todos os comandos aceitam reply à mensagem do alvo ou ID/username conhecido, mas **somente os dois owners configurados em `OWNER_IDS` recebem respostas e executam comandos**. Administradores comuns não têm acesso ao dispatcher do bot. O Bot API ainda precisa estar no grupo e possuir as permissões administrativas correspondentes para realizar as ações. A função global não consegue operar em chats que o bot não conhece, não acessa ou onde não pode restringir membros. O banco do Bot API é separado do banco do Userbot.
+
+As ações da Bot API usam retries limitados com backoff para falhas transitórias e `RetryAfter`, sem transformar erros permanentes de permissão ou conteúdo em loops infinitos. O polling possui conexão própria, e o watchdog monitora o processo e o arquivo `data/bot_api.heartbeat`; se o event loop travar e o heartbeat ficar obsoleto, somente o Bot API é reiniciado. O Userbot permanece desligado.
 
 ### Divulgação periódica
 
