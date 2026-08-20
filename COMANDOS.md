@@ -14,6 +14,8 @@ A V9.0 possui duas superfícies independentes. O **Bot API** usa somente comando
 | `.jtbn` | Registra o alvo na lista global JTBN e tenta bani-lo em todos os grupos conhecidos do Bot API. | Somente um dos `OWNER_IDS` |
 | `.jtbn list [página]` | Lista os usuários registrados no JTBN global em páginas limitadas. | Somente um dos `OWNER_IDS` |
 | `.unjtbn` | Remove o alvo da lista global JTBN e tenta desbaní-lo nos grupos conhecidos. | Somente um dos `OWNER_IDS` |
+| `.lock` | Fecha o envio de mensagens para membros comuns; administradores e o dono do grupo continuam podendo enviar, e o Bot API permanece operacional. | Somente `OWNER_IDS` |
+| `.unlock` | Abre o grupo e restaura as permissões anteriores salvas pelo Bot API. | Somente `OWNER_IDS` |
 | `.latency` | Mede uma chamada real à API e informa idade do update, fila local, exclusões, duração dos comandos, retries, falhas de polling e último erro observado. | Somente `OWNER_IDS` |
 | `.divulgar 30m on` | Cria uma nova republicação periódica de uma mensagem de texto, foto ou vídeo respondido no grupo atual. Aceita intervalos de `30s` a `30d`. | Somente `OWNER_IDS` |
 | `.divulgar list` | Lista as divulgações ativas do grupo e seus `schedule_id`. | Somente `OWNER_IDS` |
@@ -23,6 +25,10 @@ A V9.0 possui duas superfícies independentes. O **Bot API** usa somente comando
 Todos os comandos aceitam reply à mensagem do alvo ou ID/username conhecido, mas **somente os dois owners configurados em `OWNER_IDS` recebem respostas e executam comandos**. Administradores comuns não têm acesso ao dispatcher do bot. O Bot API ainda precisa estar no grupo e possuir as permissões administrativas correspondentes para realizar as ações. A função JTBN não consegue operar em chats que o bot não conhece, não acessa ou onde não pode restringir membros. O banco do Bot API é separado do banco do Userbot.
 
 As ações da Bot API usam retries limitados com backoff para falhas transitórias e `RetryAfter`, sem transformar erros permanentes de permissão ou conteúdo em loops infinitos. O polling possui conexão própria, e o watchdog monitora o processo e o arquivo `data/bot_api.heartbeat`; se o event loop travar e o heartbeat ficar obsoleto, somente o Bot API é reiniciado. O Userbot permanece desligado.
+
+### Lock e unlock do grupo
+
+Use `.lock` em um grupo para desativar o envio de mensagens por membros comuns. Administradores e o dono do grupo continuam podendo falar, e o Bot API — que deve ser administrador — continua podendo enviar divulgações e executar ações. O comando salva as permissões padrão atuais no banco antes de bloquear, evitando substituir configurações personalizadas. Use `.unlock` para restaurar exatamente esse snapshot. Os comandos são idempotentes: repetir `.lock` ou `.unlock` não altera o grupo novamente. Se o bot não tiver permissão para restringir membros, a operação é recusada sem gravar um lock incompleto.
 
 ### Divulgação periódica
 

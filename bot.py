@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 from datetime import datetime
@@ -15,7 +16,7 @@ from html import escape
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import ChatPermissions, Update
 from telegram.constants import ChatType
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
@@ -190,6 +191,13 @@ class Database:
                     reason TEXT NOT NULL DEFAULT '',
                     added_by INTEGER NOT NULL,
                     created_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS chat_locks (
+                    chat_id INTEGER PRIMARY KEY,
+                    permissions_json TEXT NOT NULL,
+                    locked_by INTEGER NOT NULL,
+                    locked_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS divulgacoes (
                     schedule_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -445,6 +453,38 @@ class Database:
         )
         return cursor.rowcount > 0
 
+    def save_chat_lock(self, chat_id: int, permissions_json: str, locked_by: int) -> bool:
+        now = int(time.time())
+        cursor = self._execute(
+            """
+            INSERT INTO chat_locks(chat_id,permissions_json,locked_by,locked_at,updated_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                permissions_json=excluded.permissions_json,
+                locked_by=excluded.locked_by,
+                locked_at=excluded.locked_at,
+                updated_at=excluded.updated_at
+            """,
+            (int(chat_id), str(permissions_json), int(locked_by), now, now),
+            commit=True,
+        )
+        return cursor.rowcount >= 0
+
+    def get_chat_lock(self, chat_id: int):
+        row = self._execute(
+            "SELECT chat_id,permissions_json,locked_by,locked_at,updated_at FROM chat_locks WHERE chat_id=? LIMIT 1",
+            (int(chat_id),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def remove_chat_lock(self, chat_id: int) -> bool:
+        cursor = self._execute(
+            "DELETE FROM chat_locks WHERE chat_id=?",
+            (int(chat_id),),
+            commit=True,
+        )
+        return cursor.rowcount > 0
+
     def active_chats(self):
         return self._execute(
             "SELECT chat_id,title,chat_type FROM chats WHERE active=1 AND chat_type IN ('group','supergroup') ORDER BY chat_id"
@@ -573,6 +613,37 @@ def _safe_html(text: str) -> str:
 
 def _format_ms(value) -> str:
     return "—" if value is None else f"{float(value):.0f} ms"
+
+
+_CHAT_PERMISSION_FIELDS = tuple(ChatPermissions.all_permissions().to_dict().keys())
+
+
+def _permissions_to_json(permissions: ChatPermissions) -> str:
+    payload = {
+        field: bool(value)
+        for field, value in permissions.to_dict().items()
+        if field in _CHAT_PERMISSION_FIELDS and value is not None
+    }
+    return json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def _permissions_from_json(raw: str) -> ChatPermissions | None:
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    values = {
+        field: bool(payload[field])
+        for field in _CHAT_PERMISSION_FIELDS
+        if field in payload
+    }
+    return ChatPermissions(**values) if values else None
+
+
+def _locked_permissions() -> ChatPermissions:
+    return ChatPermissions.no_permissions()
 
 
 def _format_user_list(
@@ -1461,6 +1532,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>.jtbn</code> — o proprietário bane o alvo nos grupos registrados.\n"
         "<code>.jtbn list</code> — lista os usuários no JTBN global.\n"
         "<code>.unjtbn</code> — remove o JTBN global e tenta desbanir o alvo.\n"
+        "<code>.lock</code> — fecha o grupo para membros; administradores e o dono continuam podendo falar.\n"
+        "<code>.unlock</code> — abre o grupo e restaura as permissões anteriores.\n"
         "<code>.latency</code> — mede uma chamada real à API do Telegram.\n"
         "<code>.divulgar 30m on</code> — cria uma nova agenda para texto, foto ou vídeo respondido.\n"
         "<code>.divulgar list</code> — lista as agendas ativas com seus IDs.\n"
@@ -1478,6 +1551,104 @@ async def _require_operator(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return True
     await _reply_and_cleanup(update, "⛔ Somente os proprietários configurados podem usar os comandos deste bot.")
     return False
+
+
+def _lock_permission_error(exc: BaseException) -> str:
+    text = str(exc).lower()
+    if isinstance(exc, Forbidden) or "administrator" in text or "permission" in text:
+        return "❌ O Bot API precisa ser administrador do grupo com permissão para restringir membros."
+    if "not enough rights" in text or "rights" in text:
+        return "❌ O Bot API não tem direitos suficientes para alterar as permissões deste grupo."
+    return "❌ Não foi possível alterar as permissões do grupo. Tente novamente."
+
+
+async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_owner_access(update, context):
+        return
+    chat = update.effective_chat
+    operator = update.effective_user
+    if not chat or not operator:
+        return
+    existing = await _db_call(db.get_chat_lock, chat.id)
+    if existing:
+        await _reply_and_cleanup(update, "ℹ️ O grupo já está fechado pelo Bot API.")
+        return
+    try:
+        current_chat = await _api_call(
+            context.bot.get_chat,
+            chat_id=chat.id,
+            operation_name="leitura das permissões do grupo",
+        )
+        current_permissions = getattr(current_chat, "permissions", None)
+        if not isinstance(current_permissions, ChatPermissions):
+            await _reply_and_cleanup(update, "❌ Não consegui ler as permissões atuais deste grupo.")
+            return
+        snapshot = _permissions_to_json(current_permissions)
+        saved = await _db_call(db.save_chat_lock, chat.id, snapshot, operator.id)
+        if not saved:
+            await _reply_and_cleanup(update, "❌ Não consegui salvar o estado atual do grupo; o lock não foi aplicado.")
+            return
+        try:
+            await _api_call(
+                context.bot.set_chat_permissions,
+                chat_id=chat.id,
+                permissions=_locked_permissions(),
+                use_independent_chat_permissions=True,
+                operation_name="bloqueio de mensagens do grupo",
+            )
+        except Exception:
+            await _db_call(db.remove_chat_lock, chat.id)
+            raise
+    except (BadRequest, Forbidden, TelegramError) as exc:
+        await _reply_and_cleanup(update, _lock_permission_error(exc))
+        return
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Falha inesperada ao fechar o grupo %s", chat.id)
+        await _db_call(db.remove_chat_lock, chat.id)
+        await _reply_and_cleanup(update, "❌ Ocorreu um erro interno; o lock não foi concluído.")
+        return
+    await _reply_and_cleanup(
+        update,
+        "🔒 <b>Grupo fechado.</b> Apenas administradores e o dono do grupo podem enviar mensagens; "
+        "o Bot API continua podendo publicar e executar suas tarefas administrativas.",
+    )
+
+
+async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_owner_access(update, context):
+        return
+    chat = update.effective_chat
+    if not chat:
+        return
+    saved = await _db_call(db.get_chat_lock, chat.id)
+    if not saved:
+        await _reply_and_cleanup(update, "ℹ️ O grupo já está aberto ou não há um lock do Bot API registrado.")
+        return
+    permissions = _permissions_from_json(saved.get("permissions_json", ""))
+    if permissions is None:
+        await _reply_and_cleanup(update, "❌ O snapshot de permissões está inválido; não alterei o grupo para evitar perda de configuração.")
+        return
+    try:
+        await _api_call(
+            context.bot.set_chat_permissions,
+            chat_id=chat.id,
+            permissions=permissions,
+            use_independent_chat_permissions=True,
+            operation_name="restauração das permissões do grupo",
+        )
+        await _db_call(db.remove_chat_lock, chat.id)
+    except (BadRequest, Forbidden, TelegramError) as exc:
+        await _reply_and_cleanup(update, _lock_permission_error(exc))
+        return
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Falha inesperada ao abrir o grupo %s", chat.id)
+        await _reply_and_cleanup(update, "❌ Ocorreu um erro interno; as permissões salvas continuam preservadas para uma nova tentativa.")
+        return
+    await _reply_and_cleanup(update, "🔓 <b>Grupo aberto.</b> As permissões anteriores foram restauradas.")
 
 
 async def cmd_latency(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1535,7 +1706,7 @@ async def cmd_unblacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_and_cleanup(update, f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) removido da blacklist local.")
 
 
-DOT_COMMAND_RE = re.compile(r"^\.(help|unblacklist|unbanperm|unjtbn|blacklist|banperm|jtbn|latency|divulgar)(?:\s+.*)?$", re.IGNORECASE)
+DOT_COMMAND_RE = re.compile(r"^\.(help|unblacklist|unbanperm|unjtbn|blacklist|banperm|jtbn|lock|unlock|latency|divulgar)(?:\s+.*)?$", re.IGNORECASE)
 DOT_COMMANDS = {
     "help": "cmd_help",
     "blacklist": "cmd_blacklist",
@@ -1544,6 +1715,8 @@ DOT_COMMANDS = {
     "unbanperm": "cmd_unbanperm",
     "jtbn": "cmd_jtbn",
     "unjtbn": "cmd_unjtbn",
+    "lock": "cmd_lock",
+    "unlock": "cmd_unlock",
     "latency": "cmd_latency",
     "divulgar": "cmd_divulgar",
 }

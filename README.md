@@ -29,6 +29,8 @@ O bot comum oferece moderação local e global e responde somente a comandos ini
 | `.jtbn` | Registra o alvo na lista global JTBN e tenta bani-lo em todos os grupos conhecidos | Somente um dos `OWNER_IDS` |
 | `.jtbn list [página]` | Lista os usuários registrados no JTBN global em páginas limitadas | Somente um dos `OWNER_IDS` |
 | `.unjtbn` | Remove o alvo da lista global JTBN e tenta desbaní-lo nos grupos conhecidos | Somente um dos `OWNER_IDS` |
+| `.lock` | Fecha o grupo para membros comuns; administradores e o dono do grupo continuam podendo enviar | Somente `OWNER_IDS` |
+| `.unlock` | Abre o grupo e restaura as permissões anteriores salvas pelo Bot API | Somente `OWNER_IDS` |
 | `.latency` | Mede uma chamada real à API do Telegram | Somente `OWNER_IDS` |
 | `.divulgar 30m on` | Cria uma nova republicação de texto, foto ou vídeo respondido no grupo atual | Somente `OWNER_IDS` |
 | `.divulgar list` | Lista as agendas ativas e seus IDs | Somente `OWNER_IDS` |
@@ -36,6 +38,8 @@ O bot comum oferece moderação local e global e responde somente a comandos ini
 | `.divulgar off all` | Desliga todas as agendas do grupo | Somente `OWNER_IDS` |
 
 As listas aceitam uma página opcional, por exemplo `.blacklist list 2` e `.jtbn list 2`, e consultam o SQLite com limite e deslocamento para não carregar registros desnecessários. O banco mantém a lista por chat e o Bot API possui cache próprio. A nomenclatura pública global é **JTBN**: use `.jtbn`, `.jtbn list` e `.unjtbn`; o nome antigo `.allban` não é mais registrado pelo dispatcher do Bot API. **Somente os dois owners configurados em `OWNER_IDS` recebem respostas e executam comandos; administradores comuns não têm acesso ao dispatcher.** O bot precisa estar presente e ter permissões administrativas para apagar mensagens ou restringir usuários; os comandos globais só podem alcançar grupos nos quais ele esteja presente e autorizado.
+
+O comando `.lock` salva as permissões padrão atuais do grupo no banco e bloqueia o envio para membros comuns. Administradores e o dono do grupo continuam podendo enviar mensagens, e o Bot API continua podendo publicar e administrar o grupo. `.unlock` restaura o snapshot anterior; ambos são idempotentes e não deixam um lock incompleto salvo se o Telegram recusar a alteração.
 
 O comando `.divulgar 30m on` deve ser enviado em resposta a uma mensagem de texto, foto ou vídeo. Cada ativação cria uma nova agenda independente, identificada por `schedule_id`, permitindo várias divulgações no mesmo grupo — por exemplo, uma a cada 20 minutos e outra a cada 30 minutos. O bot republica o texto ou a mídia com sua legenda a cada intervalo entre 30 segundos e 30 dias, com limite de 32 agendas por grupo. Use `.divulgar list` para consultar os IDs, `.divulgar off ID` para cancelar uma específica e `.divulgar off all` para cancelar todas. Se houver apenas uma agenda, `.divulgar off` também a desliga; com várias, o comando mostra a lista e evita cancelamento acidental. Os agendamentos são salvos no banco e restaurados após reinícios, desde que o bot continue no grupo e possa enviar mensagens e mídias. O owner `6822870889` (`@OnlyExaltarei`) recebe no privado a confirmação da ativação, o primeiro horário, cada confirmação de envio com o próximo horário, o desligamento e alertas de falha com limitação para evitar spam de notificações. As notificações são executadas fora do worker principal; se uma mensagem privada falhar, a agenda continua ativa e o próximo ciclo não é bloqueado.
 
