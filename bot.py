@@ -109,6 +109,9 @@ DIVULGAR_MAX_TEXT_LENGTH = 4096
 DIVULGAR_MAX_CAPTION_LENGTH = 1024
 DIVULGAR_ALLOWED_MEDIA = {"photo", "video"}
 DIVULGAR_MAX_SCHEDULES_PER_CHAT = 32
+LIST_MAX_VISIBLE_ENTRIES = 30
+LIST_MAX_OUTPUT_CHARS = 3600
+LIST_REASON_MAX_CHARS = 80
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -206,7 +209,9 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_chats_active ON chats(active);
                 CREATE INDEX IF NOT EXISTS idx_users_username_nocase ON users(username COLLATE NOCASE);
                 CREATE INDEX IF NOT EXISTS idx_blacklist_chat ON blacklist(chat_id);
+                CREATE INDEX IF NOT EXISTS idx_blacklist_chat_created ON blacklist(chat_id,created_at,user_id);
                 CREATE INDEX IF NOT EXISTS idx_banperm_chat ON banperm(chat_id);
+                CREATE INDEX IF NOT EXISTS idx_allban_created ON allban(created_at,user_id);
                 """
             )
             columns = {row[1] for row in self.conn.execute("PRAGMA table_info(divulgacoes)").fetchall()}
@@ -374,6 +379,17 @@ class Database:
         )
         return cursor.rowcount >= 0
 
+    def get_blacklist_for_chat(self, chat_id: int):
+        return self._execute(
+            "SELECT user_id,username,reason,added_by,created_at FROM blacklist WHERE chat_id=? ORDER BY created_at,user_id",
+            (int(chat_id),),
+        ).fetchall()
+
+    def get_allban_entries(self):
+        return self._execute(
+            "SELECT user_id,username,reason,added_by,created_at FROM allban ORDER BY created_at,user_id"
+        ).fetchall()
+
     def remove_blacklist(self, user_id: int, chat_id: int) -> bool:
         cursor = self._execute(
             "DELETE FROM blacklist WHERE chat_id=? AND user_id=?",
@@ -525,6 +541,40 @@ def _safe_html(text: str) -> str:
 
 def _format_ms(value) -> str:
     return "—" if value is None else f"{float(value):.0f} ms"
+
+
+def _format_user_list(rows, *, title: str, empty_text: str, scope_text: str = "") -> str:
+    """Renderiza listas de moderação sem exceder o limite de uma resposta do Telegram."""
+    total = len(rows)
+    if not total:
+        return empty_text
+    visible_limit = min(total, LIST_MAX_VISIBLE_ENTRIES)
+    lines = []
+    for row in rows[:visible_limit]:
+        user_id = int(row["user_id"])
+        username = (row["username"] or "").strip().lstrip("@")
+        known_username, known_full_name = KNOWN_USERS.get(user_id, ("", ""))
+        target = Target(user_id, username or known_username, known_full_name)
+        label = _safe_html(target.label)
+        reason = " ".join(str(row["reason"] or "").split())[:LIST_REASON_MAX_CHARS]
+        reason_text = f" — {_safe_html(reason)}" if reason else ""
+        lines.append(f"• <b>{label}</b> (<code>{user_id}</code>){reason_text}")
+
+    header = f"{title} — <b>{total}</b> registro(s)"
+    if scope_text:
+        header += f"\n{scope_text}"
+    output = header + "\n\n"
+    rendered = 0
+    for line in lines:
+        candidate = output + line + "\n"
+        if len(candidate) > LIST_MAX_OUTPUT_CHARS:
+            break
+        output = candidate
+        rendered += 1
+    remaining = total - rendered
+    if remaining > 0:
+        output += f"\n… e mais <b>{remaining}</b>. Refine a consulta ou use a listagem novamente."
+    return output.rstrip()
 
 
 def _retry_delay(exc: RetryAfter, maximum: float = 60.0) -> float:
@@ -778,6 +828,10 @@ def _format_divulgar_datetime(timestamp: float) -> str:
     return datetime.fromtimestamp(float(timestamp)).strftime("%d/%m/%Y às %H:%M:%S")
 
 
+def _queue_divulgar_notification(bot, text: str):
+    return _track_task(_send_divulgar_notification(bot, text))
+
+
 async def _send_divulgar_notification(bot, text: str):
     if not _is_owner(DIVULGAR_NOTIFY_USER_ID):
         logger.error("Destinatário fixo de divulgação não está em OWNER_IDS; notificação bloqueada")
@@ -948,9 +1002,9 @@ async def _divulgar_worker(bot, schedule_id: int, config: dict):
                 except Exception:
                     logger.exception("Não foi possível persistir o próximo envio de schedule_id=%s", schedule_id)
                 if failure_detail:
-                    await _notify_divulgar_failure(bot, schedule_id, failure_detail)
+                    _track_task(_notify_divulgar_failure(bot, schedule_id, failure_detail))
                 if sent:
-                    await _send_divulgar_notification(
+                    _queue_divulgar_notification(
                         bot,
                         "✅ <b>Divulgação enviada</b>\n\n"
                         f"Agendamento: <code>{schedule_id}</code>\n"
@@ -1204,7 +1258,7 @@ async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 DIVULGAR_LAST_FAILURE_NOTIFY.pop(schedule_id, None)
             removed = await _db_call(db.remove_all_divulgacoes_for_chat, chat_id)
             await _reply_and_cleanup(update, f"✅ {removed} divulgação(ões) desligada(s) neste grupo.")
-            await _send_divulgar_notification(
+            _queue_divulgar_notification(
                 context.bot,
                 "⏹️ <b>Todas as divulgações foram desligadas</b>\n\n"
                 f"Grupo: <code>{chat_id}</code>\n"
@@ -1239,7 +1293,7 @@ async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         removed = await _db_call(db.remove_divulgacao, schedule_id)
         if removed:
             await _reply_and_cleanup(update, f"✅ Divulgação <code>{schedule_id}</code> desligada neste grupo.")
-            await _send_divulgar_notification(
+            _queue_divulgar_notification(
                 context.bot,
                 "⏹️ <b>Divulgação desligada</b>\n\n"
                 f"Agendamento: <code>{schedule_id}</code>\n"
@@ -1311,7 +1365,7 @@ async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"A primeira publicação ocorrerá em <b>{_format_divulgar_datetime(next_run_at)}</b>.\n"
         "Use <code>.divulgar list</code> para consultar as agendas.",
     )
-    await _send_divulgar_notification(
+    _queue_divulgar_notification(
         context.bot,
         "✅ <b>Divulgação ativada</b>\n\n"
         f"Agendamento: <code>{schedule_id}</code>\n"
@@ -1339,15 +1393,18 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🛡️ <b>Jtzin Administrator Bot</b>\n\n"
         "<b>Comandos disponíveis</b>\n"
         "<code>.blacklist</code> — adiciona o alvo à blacklist deste grupo.\n"
+        "<code>.blacklist list</code> — lista a blacklist local deste grupo.\n"
         "<code>.unblacklist</code> — remove a blacklist local.\n"
         "<code>.banperm</code> — bane permanentemente o alvo deste grupo.\n"
         "<code>.unbanperm</code> — remove o banimento deste grupo.\n"
         "<code>.allban</code> — o proprietário bane o alvo nos grupos registrados.\n"
+        "<code>.allban list</code> — lista os usuários no allban global.\n"
         "<code>.unallban</code> — remove o allban global e tenta desbanir o alvo.\n"
         "<code>.latency</code> — mede uma chamada real à API do Telegram.\n"
         "<code>.divulgar 30m on</code> — cria uma nova agenda para texto, foto ou vídeo respondido.\n"
         "<code>.divulgar list</code> — lista as agendas ativas com seus IDs.\n"
-        "<code>.divulgar off ID</code> — desliga uma agenda específica; <code>off all</code> desliga todas.\n\n"
+        "<code>.divulgar off ID</code> — desliga uma agenda específica; <code>off all</code> desliga todas.\n"
+        "Cada envio usa retry isolado e uma falha de notificação privada não interrompe o agendamento.\n\n"
         "Somente os dois proprietários configurados podem usar e receber respostas deste bot. "
         "A moderação local ainda exige que o bot seja administrador com permissão para apagar mensagens "
         "e restringir membros.",
@@ -1477,6 +1534,21 @@ async def on_dot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _require_owner_access(update, context):
         return
+    args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
+    chat_id = int(update.effective_chat.id)
+    if len(args) == 1 and args[0].lower() == "list":
+        rows = await _db_call(db.get_blacklist_for_chat, chat_id)
+        await _reply_and_cleanup(
+            update,
+            _format_user_list(
+                rows,
+                title="📋 <b>Blacklist local</b>",
+                empty_text="ℹ️ Não há usuários na blacklist deste grupo.",
+                scope_text="As mensagens dos usuários listados são apagadas automaticamente.",
+            ),
+        )
+        return
+
     target = await _resolve_target(update, context)
     if target is None:
         await _reply_and_cleanup(update, _target_error("blacklist"))
@@ -1484,12 +1556,12 @@ async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _is_owner(target.user_id):
         await _reply_and_cleanup(update, "❌ O proprietário não pode ser colocado na blacklist.")
         return
-    chat_id = update.effective_chat.id
+    # Idempotência rápida: não faça RPC de permissões se o alvo já está registrado.
+    if target.user_id in BLACKLIST_CACHE.get(chat_id, set()):
+        await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> já está na blacklist deste grupo.")
+        return
     if not await _bot_can_delete(chat_id, context):
         await _reply_and_cleanup(update, "❌ O bot precisa ser administrador com permissão para apagar mensagens neste grupo.")
-        return
-    if target.user_id in BLACKLIST_CACHE[chat_id]:
-        await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> já está na blacklist deste grupo.")
         return
     reason = _reason(context)
     if not await _db_call(db.add_blacklist, target, chat_id, update.effective_user.id, reason):
@@ -1661,6 +1733,19 @@ async def cmd_unallban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_allban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not _is_owner(update.effective_user.id):
         await _reply_and_cleanup(update, "⛔ Este comando é exclusivo dos proprietários configurados.")
+        return
+    args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
+    if len(args) == 1 and args[0].lower() == "list":
+        rows = await _db_call(db.get_allban_entries)
+        await _reply_and_cleanup(
+            update,
+            _format_user_list(
+                rows,
+                title="🌐 <b>Allban global</b>",
+                empty_text="ℹ️ Não há usuários no allban global.",
+                scope_text="O allban é aplicado aos grupos ativos registrados pelo Bot API.",
+            ),
+        )
         return
     target = await _resolve_target(update, context)
     if target is None:

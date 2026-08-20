@@ -7,10 +7,12 @@ A V9.0 possui duas superfícies independentes. O **Bot API** usa somente comando
 | Comando | Função | Acesso |
 |---|---|---|
 | `.blacklist` | Registra o alvo na blacklist local do grupo atual e apaga mensagens dele enquanto o bot estiver ativo. | Somente `OWNER_IDS` |
+| `.blacklist list` | Lista os usuários da blacklist local do grupo atual, com ID e motivo quando houver. | Somente `OWNER_IDS` |
 | `.unblacklist` | Remove o alvo da blacklist local do grupo atual. | Somente `OWNER_IDS` |
 | `.banperm` | Bane permanentemente o alvo somente no grupo atual. | Somente `OWNER_IDS` |
 | `.unbanperm` | Retira o banimento permanente do alvo no grupo atual. | Somente `OWNER_IDS` |
 | `.allban` | Registra o alvo na lista global e tenta bani-lo em todos os grupos conhecidos do Bot API. | Somente um dos `OWNER_IDS` |
+| `.allban list` | Lista os usuários registrados no allban global, com saída limitada para permanecer legível. | Somente um dos `OWNER_IDS` |
 | `.unallban` | Remove o alvo da lista global e tenta desbaní-lo nos grupos conhecidos. | Somente um dos `OWNER_IDS` |
 | `.latency` | Mede uma chamada real à API e informa idade do update, fila local, exclusões, duração dos comandos, retries, falhas de polling e último erro observado. | Somente `OWNER_IDS` |
 | `.divulgar 30m on` | Cria uma nova republicação periódica de uma mensagem de texto, foto ou vídeo respondido no grupo atual. Aceita intervalos de `30s` a `30d`. | Somente `OWNER_IDS` |
@@ -24,7 +26,7 @@ As ações da Bot API usam retries limitados com backoff para falhas transitóri
 
 ### Divulgação periódica
 
-Para ativar, responda à mensagem que será divulgada — texto, foto ou vídeo — usando `.divulgar 30m on`. Cada ativação cria uma nova agenda independente; portanto, o mesmo grupo pode ter, por exemplo, uma publicação a cada 20 minutos e outra a cada 30 minutos. O texto de uma mensagem de texto é republicado como texto; a legenda de uma foto ou vídeo é preservada como legenda. O intervalo permitido vai de 30 segundos a 30 dias, com limite de 32 agendas por grupo. Use `.divulgar list` para consultar os IDs, `.divulgar off ID` para cancelar apenas uma agenda e `.divulgar off all` para cancelar todas. O comando `.divulgar off` sem ID desliga diretamente quando existe apenas uma agenda e, quando há várias, mostra a lista sem cancelar nada. Os agendamentos ficam salvos no banco do Bot API, são restaurados após reinícios e recebem notificações privadas para `6822870889` (`@OnlyExaltarei`) na ativação, em cada envio, no desligamento e em falhas com limitação de repetição.
+Para ativar, responda à mensagem que será divulgada — texto, foto ou vídeo — usando `.divulgar 30m on`. Cada ativação cria uma nova agenda independente; portanto, o mesmo grupo pode ter, por exemplo, uma publicação a cada 20 minutos e outra a cada 30 minutos. O texto de uma mensagem de texto é republicado como texto; a legenda de uma foto ou vídeo é preservada como legenda. O intervalo permitido vai de 30 segundos a 30 dias, com limite de 32 agendas por grupo. Use `.divulgar list` para consultar os IDs, `.divulgar off ID` para cancelar apenas uma agenda e `.divulgar off all` para cancelar todas. O comando `.divulgar off` sem ID desliga diretamente quando existe apenas uma agenda e, quando há várias, mostra a lista sem cancelar nada. Os agendamentos ficam salvos no banco do Bot API, são restaurados após reinícios e recebem notificações privadas para `6822870889` (`@OnlyExaltarei`) na ativação, em cada envio, no desligamento e em falhas com limitação de repetição. O envio da notificação é desacoplado do worker: uma falha na mensagem privada não interrompe nem atrasa o próximo ciclo da divulgação.
 
 ## Userbot — prefixos
 
