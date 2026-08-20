@@ -113,6 +113,14 @@ DIVULGAR_MAX_SCHEDULES_PER_CHAT = 32
 LIST_MAX_VISIBLE_ENTRIES = 30
 LIST_MAX_OUTPUT_CHARS = 3600
 LIST_REASON_MAX_CHARS = 80
+SPAM_MIN_COUNT = 1
+SPAM_MAX_COUNT = 100
+# Grupos têm limites de envio mais restritos; o intervalo conservador reduz RetryAfter e falhas parciais.
+SPAM_DELAY_SECONDS = 3.1
+SPAM_MAX_ACTIVE_PER_CHAT = 1
+SPAM_MAX_TEXT_LENGTH = 4096
+SPAM_MAX_CAPTION_LENGTH = 1024
+SPAM_SUPPORTED_TYPES = {"text", "photo", "video", "animation", "document", "audio", "voice", "sticker"}
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -556,6 +564,8 @@ DIVULGAR_TASKS: dict[int, asyncio.Task] = {}
 DIVULGAR_CONFIGS: dict[int, dict] = {}
 DIVULGAR_LAST_FAILURE_NOTIFY: dict[int, float] = {}
 DIVULGAR_FAILURE_NOTIFY_COOLDOWN_SECONDS = 15 * 60
+SPAM_TASKS: dict[int, asyncio.Task] = {}
+SPAM_CONFIGS: dict[int, dict] = {}
 HEARTBEAT_TASK: asyncio.Task | None = None
 KNOWN_USERNAME_IDS = {
     username.lower(): int(user_id)
@@ -590,6 +600,12 @@ BLACKLIST_TELEMETRY = {
     "polling_errors": 0,
     "last_polling_error": "",
     "background_task_errors": 0,
+    "spam_started": 0,
+    "spam_completed": 0,
+    "spam_failed": 0,
+    "spam_sent": 0,
+    "spam_active": 0,
+    "last_spam_error": "",
 }
 
 
@@ -1081,6 +1097,111 @@ async def _notify_divulgar_failure(bot, schedule_id: int, detail: str):
     )
 
 
+async def _cancel_spam_task(chat_id: int):
+    chat_id = int(chat_id)
+    task = SPAM_TASKS.pop(chat_id, None)
+    SPAM_CONFIGS.pop(chat_id, None)
+    if task and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def _send_spam_status(bot, chat_id: int, text: str):
+    try:
+        status_message = await _api_call(
+            bot.send_message,
+            chat_id=int(chat_id),
+            text=text,
+            parse_mode="HTML",
+            disable_notification=True,
+            operation_name="status do spam",
+        )
+        _schedule_delete(status_message)
+    except asyncio.CancelledError:
+        raise
+    except TelegramError:
+        logger.debug("Não foi possível enviar o status temporário do spam", exc_info=True)
+    except Exception:
+        logger.debug("Falha inesperada no status temporário do spam", exc_info=True)
+
+
+async def _spam_worker(bot, chat_id: int, config: dict):
+    chat_id = int(chat_id)
+    requested = int(config["count"])
+    sent = 0
+    try:
+        for index in range(requested):
+            if SPAM_CONFIGS.get(chat_id) is not config:
+                return
+            try:
+                if config["source_message_id"] is not None:
+                    await _api_call(
+                        bot.copy_message,
+                        chat_id=chat_id,
+                        from_chat_id=chat_id,
+                        message_id=int(config["source_message_id"]),
+                        operation_name="cópia de mensagem do spam",
+                        retry_after_maximum=120.0,
+                    )
+                else:
+                    await _api_call(
+                        bot.send_message,
+                        chat_id=chat_id,
+                        text=config["text"],
+                        operation_name="envio de texto do spam",
+                        retry_after_maximum=120.0,
+                    )
+                sent += 1
+                BLACKLIST_TELEMETRY["spam_sent"] += 1
+            except asyncio.CancelledError:
+                raise
+            except (BadRequest, Forbidden, TelegramError) as exc:
+                BLACKLIST_TELEMETRY["spam_failed"] += 1
+                BLACKLIST_TELEMETRY["last_spam_error"] = type(exc).__name__
+                logger.warning(
+                    "Spam interrompido em chat_id=%s após %s/%s mensagens: %s",
+                    chat_id,
+                    sent,
+                    requested,
+                    exc,
+                )
+                _track_task(
+                    _send_spam_status(
+                        bot,
+                        chat_id,
+                        f"⚠️ <b>Spam interrompido</b>: <code>{sent}/{requested}</code> mensagens enviadas. "
+                        "A API recusou ou limitou a próxima publicação.",
+                    )
+                )
+                return
+            except Exception:
+                BLACKLIST_TELEMETRY["spam_failed"] += 1
+                BLACKLIST_TELEMETRY["last_spam_error"] = "internal_error"
+                logger.exception("Falha inesperada no spam em chat_id=%s", chat_id)
+                _track_task(
+                    _send_spam_status(
+                        bot,
+                        chat_id,
+                        f"⚠️ <b>Spam interrompido</b>: <code>{sent}/{requested}</code> mensagens enviadas por erro interno.",
+                    )
+                )
+                return
+            if index + 1 < requested:
+                await asyncio.sleep(SPAM_DELAY_SECONDS)
+        BLACKLIST_TELEMETRY["spam_completed"] += 1
+        logger.info("Spam concluído em chat_id=%s: %s mensagens", chat_id, sent)
+    except asyncio.CancelledError:
+        logger.info("Spam cancelado em chat_id=%s após %s/%s mensagens", chat_id, sent, requested)
+        raise
+    finally:
+        current = asyncio.current_task()
+        if SPAM_TASKS.get(chat_id) is current:
+            SPAM_TASKS.pop(chat_id, None)
+        if SPAM_CONFIGS.get(chat_id) is config:
+            SPAM_CONFIGS.pop(chat_id, None)
+        BLACKLIST_TELEMETRY["spam_active"] = len(SPAM_TASKS)
+
+
 async def _divulgar_worker(bot, schedule_id: int, config: dict):
     schedule_id = int(schedule_id)
     chat_id = int(config["chat_id"])
@@ -1510,6 +1631,91 @@ async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_owner_access(update, context):
+        return
+    if not _is_group(update):
+        await _reply_and_cleanup(update, "❌ O `.spam` só pode ser usado em grupos ou supergrupos.")
+        return
+    message = update.effective_message
+    args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
+    if not args:
+        await _reply_and_cleanup(
+            update,
+            "ℹ️ Uso: responda a uma mensagem com <code>.spam 10</code> ou use "
+            "<code>.spam 10 seu texto</code>. O limite é de 1 a 100.",
+        )
+        return
+    chat_id = int(update.effective_chat.id)
+    if args[0].lower() == "off":
+        if len(args) != 1:
+            await _reply_and_cleanup(update, "ℹ️ Uso: <code>.spam off</code> para cancelar o spam em andamento neste grupo.")
+            return
+        if not SPAM_TASKS.get(chat_id) or SPAM_TASKS[chat_id].done():
+            SPAM_TASKS.pop(chat_id, None)
+            SPAM_CONFIGS.pop(chat_id, None)
+            BLACKLIST_TELEMETRY["spam_active"] = len(SPAM_TASKS)
+            await _reply_and_cleanup(update, "ℹ️ Não há spam em andamento neste grupo.")
+            return
+        await _cancel_spam_task(chat_id)
+        BLACKLIST_TELEMETRY["spam_active"] = len(SPAM_TASKS)
+        await _reply_and_cleanup(update, "⏹️ Spam cancelado com segurança neste grupo.")
+        return
+    try:
+        count = int(args[0])
+    except (TypeError, ValueError):
+        count = 0
+    if not SPAM_MIN_COUNT <= count <= SPAM_MAX_COUNT:
+        await _reply_and_cleanup(update, f"❌ A quantidade deve ser um número entre {SPAM_MIN_COUNT} e {SPAM_MAX_COUNT}.")
+        return
+
+    custom_text = " ".join(args[1:]).strip()
+    reply = message.reply_to_message if message else None
+    if reply and custom_text:
+        await _reply_and_cleanup(
+            update,
+            "❌ Escolha apenas uma fonte: responda à mensagem sem texto adicional ou use "
+            "<code>.spam N seu texto</code> sem responder outra mensagem.",
+        )
+        return
+    if not reply and not custom_text:
+        await _reply_and_cleanup(
+            update,
+            "❌ Responda a uma mensagem ou informe o texto: <code>.spam 10 seu texto</code>.",
+        )
+        return
+    if custom_text and len(custom_text) > SPAM_MAX_TEXT_LENGTH:
+        await _reply_and_cleanup(update, f"❌ O texto do spam não pode exceder {SPAM_MAX_TEXT_LENGTH} caracteres.")
+        return
+
+    existing = SPAM_TASKS.get(chat_id)
+    if existing and not existing.done():
+        await _reply_and_cleanup(
+            update,
+            "⚠️ Já existe um spam em andamento neste grupo. Aguarde a conclusão ou use "
+            "<code>.spam off</code> para cancelá-lo.",
+        )
+        return
+
+    config = {
+        "chat_id": chat_id,
+        "count": count,
+        "source_message_id": int(reply.message_id) if reply else None,
+        "text": custom_text,
+        "owner_id": int(update.effective_user.id),
+    }
+    SPAM_CONFIGS[chat_id] = config
+    SPAM_TASKS[chat_id] = _track_task(_spam_worker(context.bot, chat_id, config))
+    BLACKLIST_TELEMETRY["spam_started"] += 1
+    BLACKLIST_TELEMETRY["spam_active"] = len(SPAM_TASKS)
+    source_label = "mensagem respondida" if reply else "texto informado"
+    await _reply_and_cleanup(
+        update,
+        f"🚀 Spam iniciado: <b>{count}</b> repetição(ões) usando {source_label}.\n"
+        "Use <code>.spam off</code> para cancelar com segurança.",
+    )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_and_cleanup(
         update,
@@ -1538,6 +1744,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>.divulgar 30m on</code> — cria uma nova agenda para texto, foto ou vídeo respondido.\n"
         "<code>.divulgar list</code> — lista as agendas ativas com seus IDs.\n"
         "<code>.divulgar off ID</code> — desliga uma agenda específica; <code>off all</code> desliga todas.\n"
+        "<code>.spam N</code> — repete uma mensagem respondida de 1 a 100 vezes.\n"
+        "<code>.spam N texto</code> — repete um texto; <code>.spam off</code> cancela o envio.\n"
+        "O spam aceita texto, foto, vídeo, GIF, sticker, documento, áudio, voz e outras mídias copiáveis.\n"
         "Cada envio usa retry isolado e uma falha de notificação privada não interrompe o agendamento.\n\n"
         "Somente os dois proprietários configurados podem usar e receber respostas deste bot. "
         "A moderação local ainda exige que o bot seja administrador com permissão para apagar mensagens "
@@ -1682,6 +1891,7 @@ async def cmd_latency(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Polling: <code>{BLACKLIST_TELEMETRY['polling_errors']}</code> falhas recuperadas; última <code>{_safe_html(BLACKLIST_TELEMETRY['last_polling_error'] or 'nenhuma')}</code>\n"
         f"• Último erro: <code>{_safe_html(BLACKLIST_TELEMETRY['last_error'] or 'nenhum')}</code>\n"
         f"• Workers: <code>{BLACKLIST_TELEMETRY['background_task_errors']}</code> falhas capturadas\n"
+        f"• Spam: <code>{BLACKLIST_TELEMETRY['spam_active']}</code> ativo; <code>{BLACKLIST_TELEMETRY['spam_started']}</code> iniciados; <code>{BLACKLIST_TELEMETRY['spam_completed']}</code> concluídos; <code>{BLACKLIST_TELEMETRY['spam_sent']}</code> enviados; <code>{BLACKLIST_TELEMETRY['spam_failed']}</code> falhas\n"
         "• Polling: ✅ processo monitorado pelo watchdog + heartbeat\n"
         "• Userbot: ⏸️ desligado\n"
         "\nA medição separa atraso do update, fila local e tempo do RPC de exclusão."
@@ -1706,7 +1916,7 @@ async def cmd_unblacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_and_cleanup(update, f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) removido da blacklist local.")
 
 
-DOT_COMMAND_RE = re.compile(r"^\.(help|unblacklist|unbanperm|unjtbn|blacklist|banperm|jtbn|lock|unlock|latency|divulgar)(?:\s+.*)?$", re.IGNORECASE)
+DOT_COMMAND_RE = re.compile(r"^\.(help|unblacklist|unbanperm|unjtbn|blacklist|banperm|jtbn|lock|unlock|latency|divulgar|spam)(?:\s+.*)?$", re.IGNORECASE)
 DOT_COMMANDS = {
     "help": "cmd_help",
     "blacklist": "cmd_blacklist",
@@ -1719,6 +1929,7 @@ DOT_COMMANDS = {
     "unlock": "cmd_unlock",
     "latency": "cmd_latency",
     "divulgar": "cmd_divulgar",
+    "spam": "cmd_spam",
 }
 
 
@@ -2084,6 +2295,7 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         KNOWN_CHAT_IDS.discard(chat.id)
         _chat_registration_seen.discard(chat.id)
         await _cancel_all_divulgar_tasks_for_chat(chat.id)
+        await _cancel_spam_task(chat.id)
         schedule_ids = [
             schedule_id
             for schedule_id, config in list(DIVULGAR_CONFIGS.items())
@@ -2185,12 +2397,16 @@ async def post_shutdown(app: Application):
     global HEARTBEAT_TASK
     for task in set(DIVULGAR_TASKS.values()):
         task.cancel()
+    for task in set(SPAM_TASKS.values()):
+        task.cancel()
     for task in list(_cleanup_tasks):
         task.cancel()
     if _cleanup_tasks:
         await asyncio.gather(*_cleanup_tasks, return_exceptions=True)
     DIVULGAR_TASKS.clear()
     DIVULGAR_CONFIGS.clear()
+    SPAM_TASKS.clear()
+    SPAM_CONFIGS.clear()
     if HEARTBEAT_TASK is not None:
         HEARTBEAT_TASK.cancel()
         await asyncio.gather(HEARTBEAT_TASK, return_exceptions=True)

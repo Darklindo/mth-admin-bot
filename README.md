@@ -36,6 +36,9 @@ O bot comum oferece moderação local e global e responde somente a comandos ini
 | `.divulgar list` | Lista as agendas ativas e seus IDs | Somente `OWNER_IDS` |
 | `.divulgar off ID` | Desliga uma agenda específica pelo ID | Somente `OWNER_IDS` |
 | `.divulgar off all` | Desliga todas as agendas do grupo | Somente `OWNER_IDS` |
+| `.spam N` | Repete de 1 a 100 vezes uma mensagem respondida, incluindo texto e mídias copiáveis | Somente `OWNER_IDS` |
+| `.spam N texto` | Repete o texto informado de 1 a 100 vezes | Somente `OWNER_IDS` |
+| `.spam off` | Cancela o spam em andamento no grupo atual | Somente `OWNER_IDS` |
 
 As listas aceitam uma página opcional, por exemplo `.blacklist list 2` e `.jtbn list 2`, e consultam o SQLite com limite e deslocamento para não carregar registros desnecessários. O banco mantém a lista por chat e o Bot API possui cache próprio. A nomenclatura pública global é **JTBN**: use `.jtbn`, `.jtbn list` e `.unjtbn`; o nome antigo `.allban` não é mais registrado pelo dispatcher do Bot API. **Somente os dois owners configurados em `OWNER_IDS` recebem respostas e executam comandos; administradores comuns não têm acesso ao dispatcher.** O bot precisa estar presente e ter permissões administrativas para apagar mensagens ou restringir usuários; os comandos globais só podem alcançar grupos nos quais ele esteja presente e autorizado.
 
@@ -43,7 +46,7 @@ O comando `.lock` salva as permissões padrão atuais do grupo no banco e bloque
 
 O comando `.divulgar 30m on` deve ser enviado em resposta a uma mensagem de texto, foto ou vídeo. Cada ativação cria uma nova agenda independente, identificada por `schedule_id`, permitindo várias divulgações no mesmo grupo — por exemplo, uma a cada 20 minutos e outra a cada 30 minutos. O bot republica o texto ou a mídia com sua legenda a cada intervalo entre 30 segundos e 30 dias, com limite de 32 agendas por grupo. Use `.divulgar list` para consultar os IDs, `.divulgar off ID` para cancelar uma específica e `.divulgar off all` para cancelar todas. Se houver apenas uma agenda, `.divulgar off` também a desliga; com várias, o comando mostra a lista e evita cancelamento acidental. Os agendamentos são salvos no banco e restaurados após reinícios, desde que o bot continue no grupo e possa enviar mensagens e mídias. O owner `6822870889` (`@OnlyExaltarei`) recebe no privado a confirmação da ativação, o primeiro horário, cada confirmação de envio com o próximo horário, o desligamento e alertas de falha com limitação para evitar spam de notificações. As notificações são executadas fora do worker principal; se uma mensagem privada falhar, a agenda continua ativa e o próximo ciclo não é bloqueado.
 
-As respostas e os comandos são removidos automaticamente após alguns segundos. O bot é deliberadamente independente: não contém o restante dos recursos do Userbot, não aceita autorização de terceiros e não possui subproprietários.
+O `.spam` usa uma única execução por grupo, intervalo controlado entre cópias, retries limitados e interrupção ao primeiro erro permanente ou limite do Telegram. O limite máximo é 100 e `.spam off` cancela o worker sem deixar tarefa órfã. As respostas e os comandos são removidos automaticamente após alguns segundos. O bot é deliberadamente independente: não contém o restante dos recursos do Userbot, não aceita autorização de terceiros e não possui subproprietários.
 
 ## Funções do Userbot
 
