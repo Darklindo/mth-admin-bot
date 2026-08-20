@@ -85,7 +85,7 @@ def _is_owner(user_id: int | None) -> bool:
 DB_PATH = DATA_DIR / "bot_api.db"
 HEARTBEAT_PATH = DATA_DIR / "bot_api.heartbeat"
 DELETE_AFTER_SECONDS = 5
-ALLBAN_CONCURRENCY = 4
+JTBN_CONCURRENCY = 4
 MAX_TARGET_ID_LENGTH = 20
 # O lote aguarda apenas alguns milissegundos para capturar uma rajada sem atrasar
 # uma mensagem isolada. O Telegram aceita de 1 a 100 IDs no deleteMessages.
@@ -385,10 +385,41 @@ class Database:
             (int(chat_id),),
         ).fetchall()
 
+    def count_blacklist_for_chat(self, chat_id: int) -> int:
+        row = self._execute("SELECT COUNT(*) AS total FROM blacklist WHERE chat_id=?", (int(chat_id),)).fetchone()
+        return int(row["total"] if row else 0)
+
+    def get_blacklist_for_chat_page(self, chat_id: int, limit: int, offset: int):
+        return self._execute(
+            """
+            SELECT user_id,username,reason,added_by,created_at
+            FROM blacklist WHERE chat_id=?
+            ORDER BY created_at,user_id LIMIT ? OFFSET ?
+            """,
+            (int(chat_id), max(1, int(limit)), max(0, int(offset))),
+        ).fetchall()
+
     def get_allban_entries(self):
         return self._execute(
             "SELECT user_id,username,reason,added_by,created_at FROM allban ORDER BY created_at,user_id"
         ).fetchall()
+
+    def count_allban(self) -> int:
+        row = self._execute("SELECT COUNT(*) AS total FROM allban").fetchone()
+        return int(row["total"] if row else 0)
+
+    def get_allban_entries_page(self, limit: int, offset: int):
+        return self._execute(
+            """
+            SELECT user_id,username,reason,added_by,created_at
+            FROM allban ORDER BY created_at,user_id LIMIT ? OFFSET ?
+            """,
+            (max(1, int(limit)), max(0, int(offset))),
+        ).fetchall()
+
+    def has_allban(self, user_id: int) -> bool:
+        row = self._execute("SELECT 1 FROM allban WHERE user_id=? LIMIT 1", (int(user_id),)).fetchone()
+        return row is not None
 
     def remove_blacklist(self, user_id: int, chat_id: int) -> bool:
         cursor = self._execute(
@@ -471,7 +502,7 @@ class Database:
 
 db = Database(DB_PATH)
 try:
-    KNOWN_CHAT_IDS, KNOWN_USERS, BLACKLIST_CACHE, BANPERM_CACHE, ALLBAN_CACHE = db.load_state()
+    KNOWN_CHAT_IDS, KNOWN_USERS, BLACKLIST_CACHE, BANPERM_CACHE, JTBN_CACHE = db.load_state()
 except sqlite3.Error:
     logger.exception("Falha ao carregar o estado do banco do Bot API")
     raise
@@ -518,6 +549,7 @@ BLACKLIST_TELEMETRY = {
     "last_error": "",
     "polling_errors": 0,
     "last_polling_error": "",
+    "background_task_errors": 0,
 }
 
 
@@ -543,14 +575,25 @@ def _format_ms(value) -> str:
     return "—" if value is None else f"{float(value):.0f} ms"
 
 
-def _format_user_list(rows, *, title: str, empty_text: str, scope_text: str = "") -> str:
-    """Renderiza listas de moderação sem exceder o limite de uma resposta do Telegram."""
-    total = len(rows)
+def _format_user_list(
+    rows,
+    *,
+    title: str,
+    empty_text: str,
+    scope_text: str = "",
+    total: int | None = None,
+    page: int = 1,
+) -> str:
+    """Renderiza uma página de moderação sem exceder o limite de resposta do Telegram."""
+    page = max(1, int(page))
+    total = max(0, int(len(rows) if total is None else total))
     if not total:
         return empty_text
-    visible_limit = min(total, LIST_MAX_VISIBLE_ENTRIES)
+    if not rows:
+        return f"{title} — <b>{total}</b> registro(s)\nℹ️ A página <b>{page}</b> está vazia."
+
     lines = []
-    for row in rows[:visible_limit]:
+    for row in rows[:LIST_MAX_VISIBLE_ENTRIES]:
         user_id = int(row["user_id"])
         username = (row["username"] or "").strip().lstrip("@")
         known_username, known_full_name = KNOWN_USERS.get(user_id, ("", ""))
@@ -561,6 +604,8 @@ def _format_user_list(rows, *, title: str, empty_text: str, scope_text: str = ""
         lines.append(f"• <b>{label}</b> (<code>{user_id}</code>){reason_text}")
 
     header = f"{title} — <b>{total}</b> registro(s)"
+    if page > 1:
+        header += f"\nPágina <b>{page}</b>"
     if scope_text:
         header += f"\n{scope_text}"
     output = header + "\n\n"
@@ -571,9 +616,10 @@ def _format_user_list(rows, *, title: str, empty_text: str, scope_text: str = ""
             break
         output = candidate
         rendered += 1
-    remaining = total - rendered
+    offset = (page - 1) * LIST_MAX_VISIBLE_ENTRIES
+    remaining = max(0, total - offset - rendered)
     if remaining > 0:
-        output += f"\n… e mais <b>{remaining}</b>. Refine a consulta ou use a listagem novamente."
+        output += f"\n… e mais <b>{remaining}</b>. Use `.blacklist list {page + 1}` ou `.jtbn list {page + 1}`."
     return output.rstrip()
 
 
@@ -587,10 +633,25 @@ def _retry_delay(exc: RetryAfter, maximum: float = 60.0) -> float:
     return min(max(delay, 0.0), maximum)
 
 
+def _consume_background_task_result(task: asyncio.Task):
+    _cleanup_tasks.discard(task)
+    if task.cancelled():
+        return
+    try:
+        error = task.exception()
+    except asyncio.CancelledError:
+        return
+    if error is None:
+        return
+    BLACKLIST_TELEMETRY["background_task_errors"] += 1
+    BLACKLIST_TELEMETRY["last_error"] = type(error).__name__
+    logger.error("Worker assíncrono terminou com erro: %s", error, exc_info=(type(error), error, error.__traceback__))
+
+
 def _track_task(coro):
     task = asyncio.create_task(coro)
     _cleanup_tasks.add(task)
-    task.add_done_callback(_cleanup_tasks.discard)
+    task.add_done_callback(_consume_background_task_result)
     return task
 
 
@@ -1382,7 +1443,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_and_cleanup(
         update,
         "🛡️ <b>Jtzin Administrator Bot</b>\n\n"
-        "Bot API dedicado a blacklist local, banimento permanente local e allban global.\n"
+        "Bot API dedicado a blacklist local, banimento permanente local e JTBN global.\n"
         "Use .help para consultar a forma de uso.",
     )
 
@@ -1397,9 +1458,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>.unblacklist</code> — remove a blacklist local.\n"
         "<code>.banperm</code> — bane permanentemente o alvo deste grupo.\n"
         "<code>.unbanperm</code> — remove o banimento deste grupo.\n"
-        "<code>.allban</code> — o proprietário bane o alvo nos grupos registrados.\n"
-        "<code>.allban list</code> — lista os usuários no allban global.\n"
-        "<code>.unallban</code> — remove o allban global e tenta desbanir o alvo.\n"
+        "<code>.jtbn</code> — o proprietário bane o alvo nos grupos registrados.\n"
+        "<code>.jtbn list</code> — lista os usuários no JTBN global.\n"
+        "<code>.unjtbn</code> — remove o JTBN global e tenta desbanir o alvo.\n"
         "<code>.latency</code> — mede uma chamada real à API do Telegram.\n"
         "<code>.divulgar 30m on</code> — cria uma nova agenda para texto, foto ou vídeo respondido.\n"
         "<code>.divulgar list</code> — lista as agendas ativas com seus IDs.\n"
@@ -1449,6 +1510,7 @@ async def cmd_latency(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Retries: <code>{BLACKLIST_TELEMETRY['retry_after_events']}</code> flood / <code>{BLACKLIST_TELEMETRY['network_errors']}</code> rede\n"
         f"• Polling: <code>{BLACKLIST_TELEMETRY['polling_errors']}</code> falhas recuperadas; última <code>{_safe_html(BLACKLIST_TELEMETRY['last_polling_error'] or 'nenhuma')}</code>\n"
         f"• Último erro: <code>{_safe_html(BLACKLIST_TELEMETRY['last_error'] or 'nenhum')}</code>\n"
+        f"• Workers: <code>{BLACKLIST_TELEMETRY['background_task_errors']}</code> falhas capturadas\n"
         "• Polling: ✅ processo monitorado pelo watchdog + heartbeat\n"
         "• Userbot: ⏸️ desligado\n"
         "\nA medição separa atraso do update, fila local e tempo do RPC de exclusão."
@@ -1473,15 +1535,15 @@ async def cmd_unblacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_and_cleanup(update, f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) removido da blacklist local.")
 
 
-DOT_COMMAND_RE = re.compile(r"^\.(help|unblacklist|unbanperm|unallban|blacklist|banperm|allban|latency|divulgar)(?:\s+.*)?$", re.IGNORECASE)
+DOT_COMMAND_RE = re.compile(r"^\.(help|unblacklist|unbanperm|unjtbn|blacklist|banperm|jtbn|latency|divulgar)(?:\s+.*)?$", re.IGNORECASE)
 DOT_COMMANDS = {
     "help": "cmd_help",
     "blacklist": "cmd_blacklist",
     "unblacklist": "cmd_unblacklist",
     "banperm": "cmd_banperm",
     "unbanperm": "cmd_unbanperm",
-    "allban": "cmd_allban",
-    "unallban": "cmd_unallban",
+    "jtbn": "cmd_jtbn",
+    "unjtbn": "cmd_unjtbn",
     "latency": "cmd_latency",
     "divulgar": "cmd_divulgar",
 }
@@ -1536,12 +1598,29 @@ async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
     chat_id = int(update.effective_chat.id)
-    if len(args) == 1 and args[0].lower() == "list":
-        rows = await _db_call(db.get_blacklist_for_chat, chat_id)
+    if args and args[0].lower() == "list":
+        if len(args) > 2:
+            await _reply_and_cleanup(update, "❌ Uso: <code>.blacklist list</code> ou <code>.blacklist list N</code>.")
+            return
+        page = 1
+        if len(args) == 2:
+            try:
+                page = int(args[1])
+            except ValueError:
+                page = 0
+        if page < 1:
+            await _reply_and_cleanup(update, "❌ O número da página deve ser um inteiro positivo.")
+            return
+        total, rows = await asyncio.gather(
+            _db_call(db.count_blacklist_for_chat, chat_id),
+            _db_call(db.get_blacklist_for_chat_page, chat_id, LIST_MAX_VISIBLE_ENTRIES, (page - 1) * LIST_MAX_VISIBLE_ENTRIES),
+        )
         await _reply_and_cleanup(
             update,
             _format_user_list(
                 rows,
+                total=total,
+                page=page,
                 title="📋 <b>Blacklist local</b>",
                 empty_text="ℹ️ Não há usuários na blacklist deste grupo.",
                 scope_text="As mensagens dos usuários listados são apagadas automaticamente.",
@@ -1692,26 +1771,30 @@ async def _unban_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, targe
         return "failed"
 
 
-async def cmd_unallban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_unjtbn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not _is_owner(update.effective_user.id):
         await _reply_and_cleanup(update, "⛔ Este comando é exclusivo dos proprietários configurados.")
         return
     target = await _resolve_target(update, context)
     if target is None:
-        await _reply_and_cleanup(update, _target_error("unallban"))
+        await _reply_and_cleanup(update, _target_error("unjtbn"))
         return
-    if target.user_id not in ALLBAN_CACHE:
-        await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> não estava no allban global.")
-        return
+    if target.user_id not in JTBN_CACHE:
+        # O cache é apenas um acelerador; em caso de processo reiniciado ou
+        # divergência transitória, confirma no SQLite antes de responder.
+        if not await _db_call(db.has_allban, target.user_id):
+            await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> não estava no JTBN global.")
+            return
+        JTBN_CACHE.add(target.user_id)
     if not await _db_call(db.remove_allban, target.user_id):
-        await _reply_and_cleanup(update, "❌ Não foi possível remover o allban global do banco.")
+        await _reply_and_cleanup(update, "❌ Não foi possível remover o JTBN global do banco.")
         return
-    ALLBAN_CACHE.discard(target.user_id)
+    JTBN_CACHE.discard(target.user_id)
     rows = await _db_call(db.active_chats)
     if not rows:
-        await _reply_and_cleanup(update, f"✅ Allban removido para <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>).")
+        await _reply_and_cleanup(update, f"✅ JTBN removido para <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>).")
         return
-    semaphore = asyncio.Semaphore(ALLBAN_CONCURRENCY)
+    semaphore = asyncio.Semaphore(JTBN_CONCURRENCY)
 
     async def apply(row):
         async with semaphore:
@@ -1721,7 +1804,7 @@ async def cmd_unallban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     counts = {key: results.count(key) for key in {"ok", "failed", "forbidden", "skipped"}}
     await _reply_and_cleanup(
         update,
-        f"✅ <b>Allban removido</b> para {_safe_html(target.label)} (<code>{target.user_id}</code>).\n\n"
+        f"✅ <b>JTBN removido</b> para {_safe_html(target.label)} (<code>{target.user_id}</code>).\n\n"
         f"✅ Desbanidos: <b>{counts['ok']}</b>\n"
         f"ℹ️ Já livres: <b>{counts['skipped']}</b>\n"
         f"🔒 Sem permissão: <b>{counts['forbidden']}</b>\n"
@@ -1730,45 +1813,68 @@ async def cmd_unallban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_allban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_jtbn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not _is_owner(update.effective_user.id):
         await _reply_and_cleanup(update, "⛔ Este comando é exclusivo dos proprietários configurados.")
         return
     args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
-    if len(args) == 1 and args[0].lower() == "list":
-        rows = await _db_call(db.get_allban_entries)
+    if args and args[0].lower() == "list":
+        if len(args) > 2:
+            await _reply_and_cleanup(update, "❌ Uso: <code>.jtbn list</code> ou <code>.jtbn list N</code>.")
+            return
+        page = 1
+        if len(args) == 2:
+            try:
+                page = int(args[1])
+            except ValueError:
+                page = 0
+        if page < 1:
+            await _reply_and_cleanup(update, "❌ O número da página deve ser um inteiro positivo.")
+            return
+        total, rows = await asyncio.gather(
+            _db_call(db.count_allban),
+            _db_call(db.get_allban_entries_page, LIST_MAX_VISIBLE_ENTRIES, (page - 1) * LIST_MAX_VISIBLE_ENTRIES),
+        )
         await _reply_and_cleanup(
             update,
             _format_user_list(
                 rows,
-                title="🌐 <b>Allban global</b>",
-                empty_text="ℹ️ Não há usuários no allban global.",
-                scope_text="O allban é aplicado aos grupos ativos registrados pelo Bot API.",
+                total=total,
+                page=page,
+                title="🌐 <b>JTBN global</b>",
+                empty_text="ℹ️ Não há usuários no JTBN global.",
+                scope_text="O JTBN é aplicado aos grupos ativos registrados pelo Bot API.",
             ),
         )
         return
     target = await _resolve_target(update, context)
     if target is None:
-        await _reply_and_cleanup(update, _target_error("allban"))
+        await _reply_and_cleanup(update, _target_error("jtbn"))
         return
     if _is_owner(target.user_id):
         await _reply_and_cleanup(update, "❌ O proprietário não pode ser banido.")
         return
-    if target.user_id in ALLBAN_CACHE:
-        await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> já está no allban global.")
+    if target.user_id in JTBN_CACHE:
+        await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> já está no JTBN global.")
+        return
+    # Autocorreção barata para evitar duplicidade quando o cache foi perdido,
+    # sem adicionar consulta em mensagens normais ou no fast path.
+    if await _db_call(db.has_allban, target.user_id):
+        JTBN_CACHE.add(target.user_id)
+        await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> já está no JTBN global.")
         return
     reason = _reason(context)
     if not await _db_call(db.add_allban, target, update.effective_user.id, reason):
-        await _reply_and_cleanup(update, "❌ Não foi possível registrar o allban global.")
+        await _reply_and_cleanup(update, "❌ Não foi possível registrar o JTBN global.")
         return
-    ALLBAN_CACHE.add(target.user_id)
+    JTBN_CACHE.add(target.user_id)
 
     rows = await _db_call(db.active_chats)
     if not rows:
-        await _reply_and_cleanup(update, "✅ Allban registrado. Nenhum grupo ativo está registrado para receber a ação agora.")
+        await _reply_and_cleanup(update, "✅ JTBN registrado. Nenhum grupo ativo está registrado para receber a ação agora.")
         return
 
-    semaphore = asyncio.Semaphore(ALLBAN_CONCURRENCY)
+    semaphore = asyncio.Semaphore(JTBN_CONCURRENCY)
 
     async def apply(row):
         async with semaphore:
@@ -1779,7 +1885,7 @@ async def cmd_allban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     counts = {key: results.count(key) for key in {"ok", "failed", "forbidden", "skipped"}}
     await _reply_and_cleanup(
         update,
-        f"✅ <b>Allban registrado</b> para {_safe_html(target.label)} (<code>{target.user_id}</code>).\n\n"
+        f"✅ <b>JTBN registrado</b> para {_safe_html(target.label)} (<code>{target.user_id}</code>).\n\n"
         f"✅ Banidos: <b>{counts['ok']}</b>\n"
         f"⚠️ Ignorados: <b>{counts['skipped']}</b>\n"
         f"🔒 Sem permissão: <b>{counts['forbidden']}</b>\n"
@@ -1826,7 +1932,7 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Fast path: decidir apenas com estruturas em memória antes de qualquer SQLite/RPC auxiliar.
     user_id = int(user.id)
-    if user_id in ALLBAN_CACHE and not _is_owner(user_id):
+    if user_id in JTBN_CACHE and not _is_owner(user_id):
         target = _remember_user_in_memory(user)
         BLACKLIST_TELEMETRY["matched"] += 1
         if getattr(message, "date", None) is not None:
@@ -1843,7 +1949,7 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Não desperdiçar SQLite com comandos pontuados já tratados pelo dispatcher.
     # A verificação ocorre depois do fast path para nunca deixar de apagar uma
-    # mensagem de usuário que esteja em allban, banperm ou blacklist.
+    # mensagem de usuário que esteja em JTBN, banperm ou blacklist.
     if (getattr(message, "text", "") or "").lstrip().startswith("."):
         return
     # Mensagens normais podem atualizar contexto e persistência sem atrasar a exclusão do fast path.

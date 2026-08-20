@@ -7,20 +7,20 @@ A V9.0 possui duas superfícies independentes. O **Bot API** usa somente comando
 | Comando | Função | Acesso |
 |---|---|---|
 | `.blacklist` | Registra o alvo na blacklist local do grupo atual e apaga mensagens dele enquanto o bot estiver ativo. | Somente `OWNER_IDS` |
-| `.blacklist list` | Lista os usuários da blacklist local do grupo atual, com ID e motivo quando houver. | Somente `OWNER_IDS` |
+| `.blacklist list [página]` | Lista os usuários da blacklist local em páginas limitadas, com ID e motivo quando houver. | Somente `OWNER_IDS` |
 | `.unblacklist` | Remove o alvo da blacklist local do grupo atual. | Somente `OWNER_IDS` |
 | `.banperm` | Bane permanentemente o alvo somente no grupo atual. | Somente `OWNER_IDS` |
 | `.unbanperm` | Retira o banimento permanente do alvo no grupo atual. | Somente `OWNER_IDS` |
-| `.allban` | Registra o alvo na lista global e tenta bani-lo em todos os grupos conhecidos do Bot API. | Somente um dos `OWNER_IDS` |
-| `.allban list` | Lista os usuários registrados no allban global, com saída limitada para permanecer legível. | Somente um dos `OWNER_IDS` |
-| `.unallban` | Remove o alvo da lista global e tenta desbaní-lo nos grupos conhecidos. | Somente um dos `OWNER_IDS` |
+| `.jtbn` | Registra o alvo na lista global JTBN e tenta bani-lo em todos os grupos conhecidos do Bot API. | Somente um dos `OWNER_IDS` |
+| `.jtbn list [página]` | Lista os usuários registrados no JTBN global em páginas limitadas. | Somente um dos `OWNER_IDS` |
+| `.unjtbn` | Remove o alvo da lista global JTBN e tenta desbaní-lo nos grupos conhecidos. | Somente um dos `OWNER_IDS` |
 | `.latency` | Mede uma chamada real à API e informa idade do update, fila local, exclusões, duração dos comandos, retries, falhas de polling e último erro observado. | Somente `OWNER_IDS` |
 | `.divulgar 30m on` | Cria uma nova republicação periódica de uma mensagem de texto, foto ou vídeo respondido no grupo atual. Aceita intervalos de `30s` a `30d`. | Somente `OWNER_IDS` |
 | `.divulgar list` | Lista as divulgações ativas do grupo e seus `schedule_id`. | Somente `OWNER_IDS` |
 | `.divulgar off ID` | Desliga somente a divulgação identificada pelo `schedule_id`. | Somente `OWNER_IDS` |
 | `.divulgar off all` | Desliga todas as divulgações do grupo; sem `ID`, `.divulgar off` só desliga diretamente quando há uma única agenda. | Somente `OWNER_IDS` |
 
-Todos os comandos aceitam reply à mensagem do alvo ou ID/username conhecido, mas **somente os dois owners configurados em `OWNER_IDS` recebem respostas e executam comandos**. Administradores comuns não têm acesso ao dispatcher do bot. O Bot API ainda precisa estar no grupo e possuir as permissões administrativas correspondentes para realizar as ações. A função global não consegue operar em chats que o bot não conhece, não acessa ou onde não pode restringir membros. O banco do Bot API é separado do banco do Userbot.
+Todos os comandos aceitam reply à mensagem do alvo ou ID/username conhecido, mas **somente os dois owners configurados em `OWNER_IDS` recebem respostas e executam comandos**. Administradores comuns não têm acesso ao dispatcher do bot. O Bot API ainda precisa estar no grupo e possuir as permissões administrativas correspondentes para realizar as ações. A função JTBN não consegue operar em chats que o bot não conhece, não acessa ou onde não pode restringir membros. O banco do Bot API é separado do banco do Userbot.
 
 As ações da Bot API usam retries limitados com backoff para falhas transitórias e `RetryAfter`, sem transformar erros permanentes de permissão ou conteúdo em loops infinitos. O polling possui conexão própria, e o watchdog monitora o processo e o arquivo `data/bot_api.heartbeat`; se o event loop travar e o heartbeat ficar obsoleto, somente o Bot API é reiniciado. O Userbot permanece desligado.
 
@@ -58,6 +58,7 @@ Todos os demais comandos permanecem com o prefixo normal, como `.kick`, `.lock`,
 | `.unbanperm` | Remove o banimento permanente local. |
 | `.unmute` | Remove o silêncio local. |
 | `.blacklist` | Ativa blacklist local, com duração opcional, apagando mensagens do alvo no chat atual. |
+| `.blacklist list [página]` | Lista a blacklist local em páginas limitadas, com IDs e motivos disponíveis. |
 | `.unblacklist` | Remove a blacklist local. |
 | `.jtdel` | Apaga somente a mensagem respondida. |
 | `.jtdelwarn` | Apaga a mensagem respondida e aplica advertência ao autor. |
@@ -98,7 +99,7 @@ A autorização de links é apenas uma configuração do AntiLink. Ela não conc
 
 | Comando | Função e exemplo |
 |---|---|
-| `.allban` | Banimento global nos chats compatíveis. Aceita duração e `--purge N`. |
+| `.allban` | Comando histórico do Userbot; o Userbot está desligado e este comando não pertence ao Bot API. |
 | `.allblack` | Blacklist global; apaga mensagens do alvo nos chats registrados. |
 | `.unallblack` | Remove a blacklist global. |
 | `.shadow` | Shadow ban global com duração opcional, como `.shadow 7d`. |
