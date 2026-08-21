@@ -623,6 +623,8 @@ DIVULGAR_FAILURE_NOTIFY_COOLDOWN_SECONDS = 15 * 60
 SPAM_TASKS: dict[int, asyncio.Task] = {}
 SPAM_CONFIGS: dict[int, dict] = {}
 JTBN_BAN_INFLIGHT: set[tuple[int, int]] = set()
+BANPERM_REENTRY_INFLIGHT: set[tuple[int, int]] = set()
+BANPERM_REENTRY_LAST_ENFORCED: dict[tuple[int, int], float] = {}
 HEARTBEAT_TASK: asyncio.Task | None = None
 KNOWN_USERNAME_IDS = {
     username.lower(): int(user_id)
@@ -633,7 +635,7 @@ CHAT_MEMBER_CACHE_TTL = 5.0
 CHAT_MEMBER_ERROR_TTL = 1.5
 CHAT_MEMBER_CACHE: dict[tuple[int, int], tuple[float, object | None]] = {}
 CHAT_MEMBER_INFLIGHT: dict[tuple[int, int], asyncio.Task] = {}
-ALLOWED_UPDATES = ["message", "my_chat_member"]
+ALLOWED_UPDATES = ["message", "my_chat_member", "chat_member"]
 BLACKLIST_TELEMETRY = {
     "matched": 0,
     "delete_scheduled": 0,
@@ -663,6 +665,9 @@ BLACKLIST_TELEMETRY = {
     "spam_sent": 0,
     "spam_active": 0,
     "last_spam_error": "",
+    "banperm_reentry_attempted": 0,
+    "banperm_reentry_success": 0,
+    "banperm_reentry_failed": 0,
 }
 
 
@@ -1977,7 +1982,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>.blacklist</code> — adiciona o alvo à blacklist deste grupo.\n"
         "<code>.blacklist list</code> — lista a blacklist local deste grupo.\n"
         "<code>.unblacklist</code> — remove a blacklist local.\n"
-        "<code>.banperm</code> — bane permanentemente o alvo deste grupo.\n"
+        "<code>.banperm</code> — bane permanentemente o alvo deste grupo e reaplica o bloqueio se ele tentar reentrar.\n"
         "<code>.unbanperm</code> — remove o banimento deste grupo.\n"
         "<code>.jtbn</code> — o proprietário bane o alvo nos grupos registrados.\n"
         "<code>.jtbn list</code> — lista os usuários no JTBN global.\n"
@@ -2246,6 +2251,7 @@ async def cmd_latency(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Último erro: <code>{_safe_html(BLACKLIST_TELEMETRY['last_error'] or 'nenhum')}</code>\n"
         f"• Workers: <code>{BLACKLIST_TELEMETRY['background_task_errors']}</code> falhas capturadas\n"
         f"• Spam: <code>{BLACKLIST_TELEMETRY['spam_active']}</code> ativo; <code>{BLACKLIST_TELEMETRY['spam_started']}</code> iniciados; <code>{BLACKLIST_TELEMETRY['spam_completed']}</code> concluídos; <code>{BLACKLIST_TELEMETRY['spam_sent']}</code> enviados; <code>{BLACKLIST_TELEMETRY['spam_failed']}</code> falhas\n"
+        f"• Banperm reentrada: <code>{BLACKLIST_TELEMETRY['banperm_reentry_attempted']}</code> tentativas / <code>{BLACKLIST_TELEMETRY['banperm_reentry_success']}</code> OK / <code>{BLACKLIST_TELEMETRY['banperm_reentry_failed']}</code> falhas\n"
         "• Polling: ✅ processo monitorado pelo watchdog + heartbeat\n"
         "• Userbot: ⏸️ desligado\n"
         "\nA medição separa atraso do update, fila local e tempo do RPC de exclusão."
@@ -2519,6 +2525,71 @@ async def _enforce_jtbn_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int
         JTBN_BAN_INFLIGHT.discard(key)
 
 
+async def _enforce_banperm_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, target: Target):
+    """Reaplica um banperm local com deduplicação e retry pelo próximo evento."""
+    chat_id = int(chat_id)
+    user_id = int(target.user_id)
+    if _is_owner(user_id):
+        return
+    key = (chat_id, user_id)
+    now = time.monotonic()
+    if len(BANPERM_REENTRY_LAST_ENFORCED) > 4096:
+        cutoff = now - 120.0
+        for old_key, timestamp in list(BANPERM_REENTRY_LAST_ENFORCED.items()):
+            if timestamp < cutoff:
+                BANPERM_REENTRY_LAST_ENFORCED.pop(old_key, None)
+    last = BANPERM_REENTRY_LAST_ENFORCED.get(key, 0.0)
+    if key in BANPERM_REENTRY_INFLIGHT or now - last < 2.0:
+        return
+    BANPERM_REENTRY_LAST_ENFORCED[key] = now
+    BANPERM_REENTRY_INFLIGHT.add(key)
+    BLACKLIST_TELEMETRY["banperm_reentry_attempted"] += 1
+    try:
+        result = await _ban_in_chat(context, chat_id, target)
+        if result in {"ok", "skipped"}:
+            BLACKLIST_TELEMETRY["banperm_reentry_success"] += 1
+            _invalidate_chat_member_cache(chat_id)
+            logger.info("Banperm reaplicado automaticamente em %s/%s: %s", chat_id, user_id, result)
+        else:
+            BLACKLIST_TELEMETRY["banperm_reentry_failed"] += 1
+            logger.warning("Falha ao reaplicar banperm em %s/%s: %s", chat_id, user_id, result)
+    finally:
+        BANPERM_REENTRY_INFLIGHT.discard(key)
+
+
+async def _enforce_banperm_reentry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reaplica banperm quando um usuário registrado reaparece no grupo.
+
+    O evento `chat_member` é a fonte principal porque cobre entradas sem mensagem.
+    O caminho de mensagens também chama o helper como fallback caso uma atualização
+    de entrada não tenha chegado ao processo.
+    """
+    chat = update.effective_chat
+    change = update.chat_member
+    if not chat or not change or chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        return
+    old_status = getattr(change.old_chat_member, "status", None)
+    new_status = getattr(change.new_chat_member, "status", None)
+    if new_status not in {"member", "restricted"} or old_status not in {"left", "kicked"}:
+        return
+    user = change.new_chat_member.user
+    if not user or getattr(user, "is_bot", False) or _is_owner(getattr(user, "id", None)):
+        return
+    user_id = int(user.id)
+    chat_id = int(chat.id)
+    in_memory = user_id in BANPERM_CACHE.get(chat_id, set())
+    persisted = False if in_memory else await _db_call(db.has_banperm, user_id, chat_id)
+    if not in_memory and not persisted:
+        return
+    BANPERM_CACHE.setdefault(chat_id, set()).add(user_id)
+    await _enforce_banperm_in_chat(context, chat_id, _remember_user_in_memory(user))
+
+
+async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Processa alterações de membros comuns, especialmente reentradas banperm."""
+    await _enforce_banperm_reentry(update, context)
+
+
 async def cmd_unjtbn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not _is_owner(update.effective_user.id):
         await _reply_and_cleanup(update, "⛔ Este comando é exclusivo dos proprietários configurados.")
@@ -2694,6 +2765,9 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if getattr(message, "date", None) is not None:
             BLACKLIST_TELEMETRY["last_update_age_ms"] = max(0.0, (time.time() - message.date.timestamp()) * 1000)
         _schedule_delete_now(context.bot, message)
+        if user_id in BANPERM_CACHE.get(chat.id, set()):
+            # Fallback para quando a atualização `chat_member` não chegou ao processo.
+            _track_task(_enforce_banperm_in_chat(context, chat.id, _remember_user_in_memory(user)))
         return
 
     # Não desperdiçar SQLite com comandos pontuados já tratados pelo dispatcher.
@@ -2798,6 +2872,8 @@ async def post_shutdown(app: Application):
         CHAT_MEMBER_INFLIGHT.clear()
     CHAT_MEMBER_CACHE.clear()
     JTBN_BAN_INFLIGHT.clear()
+    BANPERM_REENTRY_INFLIGHT.clear()
+    BANPERM_REENTRY_LAST_ENFORCED.clear()
     if HEARTBEAT_TASK is not None:
         HEARTBEAT_TASK.cancel()
         await asyncio.gather(HEARTBEAT_TASK, return_exceptions=True)
@@ -2837,6 +2913,7 @@ def main():
         .build()
     )
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.Regex(DOT_COMMAND_RE), on_dot_command))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_message), group=1)
     app.add_error_handler(error_handler)

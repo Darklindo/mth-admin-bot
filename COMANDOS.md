@@ -9,7 +9,7 @@ A V9.0 possui duas superfícies independentes. O **Bot API** usa somente comando
 | `.blacklist` | Registra o alvo na blacklist local do grupo atual e apaga mensagens dele enquanto o bot estiver ativo. | Somente `OWNER_IDS` |
 | `.blacklist list [página]` | Lista os usuários da blacklist local em páginas limitadas, com ID e motivo quando houver. | Somente `OWNER_IDS` |
 | `.unblacklist` | Remove o alvo da blacklist local do grupo atual. | Somente `OWNER_IDS` |
-| `.banperm` | Bane permanentemente o alvo somente no grupo atual. | Somente `OWNER_IDS` |
+| `.banperm` | Bane imediatamente o alvo no grupo atual e reaplica o bloqueio se ele tentar reentrar. | Somente `OWNER_IDS` |
 | `.unbanperm` | Retira o banimento permanente do alvo no grupo atual. | Somente `OWNER_IDS` |
 | `.jtbn` | Registra o alvo na lista global JTBN e tenta bani-lo em todos os grupos conhecidos do Bot API. | Somente um dos `OWNER_IDS` |
 | `.jtbn list [página]` | Lista os usuários registrados no JTBN global em páginas limitadas. | Somente um dos `OWNER_IDS` |
@@ -60,7 +60,7 @@ Todos os demais comandos permanecem com o prefixo normal, como `.kick`, `.lock`,
 | Comando | Função e exemplo |
 |---|---|
 | `.jtban` | Banimento temporário local. Exemplo: `.jtban 1h motivo`; exige duração explícita e pode usar `--purge N`. |
-| `.banperm` | Banimento permanente local no chat atual. Exemplo: `.banperm @usuario motivo`. |
+| `.banperm` | Banimento permanente local no chat atual; uma reentrada é bloqueada automaticamente. Exemplo: `.banperm @usuario motivo`. |
 | `.jtmute` | Silencia temporariamente no chat atual. Exemplo: `.jtmute 30m motivo`. |
 | `.kick` | Remove o usuário do chat sem banimento permanente. |
 | `.unban` | Remove o banimento local. |
