@@ -411,6 +411,13 @@ class Database:
             (int(chat_id),),
         )
 
+    def has_blacklist(self, user_id: int, chat_id: int) -> bool:
+        row = self._fetchone(
+            "SELECT 1 FROM blacklist WHERE chat_id=? AND user_id=? LIMIT 1",
+            (int(chat_id), int(user_id)),
+        )
+        return row is not None
+
     def count_blacklist_for_chat(self, chat_id: int) -> int:
         row = self._fetchone("SELECT COUNT(*) AS total FROM blacklist WHERE chat_id=?", (int(chat_id),))
         return int(row["total"] if row else 0)
@@ -420,6 +427,20 @@ class Database:
             """
             SELECT user_id,username,reason,added_by,created_at
             FROM blacklist WHERE chat_id=?
+            ORDER BY created_at,user_id LIMIT ? OFFSET ?
+            """,
+            (int(chat_id), max(1, int(limit)), max(0, int(offset))),
+        )
+
+    def count_banperm_for_chat(self, chat_id: int) -> int:
+        row = self._fetchone("SELECT COUNT(*) AS total FROM banperm WHERE chat_id=?", (int(chat_id),))
+        return int(row["total"] if row else 0)
+
+    def get_banperm_for_chat_page(self, chat_id: int, limit: int, offset: int):
+        return self._fetchall(
+            """
+            SELECT user_id,username,reason,added_by,created_at
+            FROM banperm WHERE chat_id=?
             ORDER BY created_at,user_id LIMIT ? OFFSET ?
             """,
             (int(chat_id), max(1, int(limit)), max(0, int(offset))),
@@ -796,6 +817,7 @@ def _format_user_list(
     scope_text: str = "",
     total: int | None = None,
     page: int = 1,
+    next_page_command: str = ".blacklist list",
 ) -> str:
     """Renderiza uma página de moderação sem exceder o limite de resposta do Telegram."""
     page = max(1, int(page))
@@ -832,7 +854,10 @@ def _format_user_list(
     offset = (page - 1) * LIST_MAX_VISIBLE_ENTRIES
     remaining = max(0, total - offset - rendered)
     if remaining > 0:
-        output += f"\n… e mais <b>{remaining}</b>. Use `.blacklist list {page + 1}` ou `.jtbn list {page + 1}`."
+        output += (
+            f"\n… e mais <b>{remaining}</b>. Use "
+            f"<code>{_safe_html(next_page_command)} {page + 1}</code>."
+        )
     return output.rstrip()
 
 
@@ -1983,6 +2008,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>.blacklist list</code> — lista a blacklist local deste grupo.\n"
         "<code>.unblacklist</code> — remove a blacklist local.\n"
         "<code>.banperm</code> — bane permanentemente o alvo deste grupo e reaplica o bloqueio se ele tentar reentrar.\n"
+        "<code>.banperm list [página]</code> — lista os banimentos permanentes deste grupo.\n"
         "<code>.unbanperm</code> — remove o banimento deste grupo.\n"
         "<code>.jtbn</code> — o proprietário bane o alvo nos grupos registrados.\n"
         "<code>.jtbn list</code> — lista os usuários no JTBN global.\n"
@@ -2365,6 +2391,7 @@ async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 title="📋 <b>Blacklist local</b>",
                 empty_text="ℹ️ Não há usuários na blacklist deste grupo.",
                 scope_text="As mensagens dos usuários listados são apagadas automaticamente.",
+                next_page_command=".blacklist list",
             ),
         )
         return
@@ -2378,6 +2405,10 @@ async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     # Idempotência rápida: não faça RPC de permissões se o alvo já está registrado.
     if target.user_id in BLACKLIST_CACHE.get(chat_id, set()):
+        await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> já está na blacklist deste grupo.")
+        return
+    if await _db_call(db.has_blacklist, target.user_id, chat_id):
+        BLACKLIST_CACHE.setdefault(chat_id, set()).add(target.user_id)
         await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> já está na blacklist deste grupo.")
         return
     if not await _bot_can_delete(chat_id, context):
@@ -2398,6 +2429,35 @@ async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_banperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _require_owner_access(update, context):
         return
+    args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
+    chat_id = int(update.effective_chat.id)
+    if args and args[0].lower() == "list":
+        if len(args) > 2:
+            await _reply_and_cleanup(update, "❌ Uso: <code>.banperm list</code> ou <code>.banperm list N</code>.")
+            return
+        page = 1
+        if len(args) == 2:
+            page = _parse_list_page(args[1])
+        if page is None or page < 1:
+            await _reply_and_cleanup(update, "❌ O número da página deve ser um inteiro positivo.")
+            return
+        total, rows = await asyncio.gather(
+            _db_call(db.count_banperm_for_chat, chat_id),
+            _db_call(db.get_banperm_for_chat_page, chat_id, LIST_MAX_VISIBLE_ENTRIES, (page - 1) * LIST_MAX_VISIBLE_ENTRIES),
+        )
+        await _reply_and_cleanup(
+            update,
+            _format_user_list(
+                rows,
+                total=total,
+                page=page,
+                title="🔨 <b>Banperm local</b>",
+                empty_text="ℹ️ Não há usuários banidos permanentemente neste grupo.",
+                scope_text="As reentradas são bloqueadas automaticamente quando detectadas.",
+                next_page_command=".banperm list",
+            ),
+        )
+        return
     target = await _resolve_target(update, context)
     if target is None:
         await _reply_and_cleanup(update, _target_error("banperm"))
@@ -2406,7 +2466,11 @@ async def cmd_banperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_and_cleanup(update, "❌ O proprietário é imune a banimentos.")
         return
     chat_id = update.effective_chat.id
-    if target.user_id in BANPERM_CACHE[chat_id]:
+    if target.user_id in BANPERM_CACHE.get(chat_id, set()):
+        await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> já está banido permanentemente neste grupo.")
+        return
+    if await _db_call(db.has_banperm, target.user_id, chat_id):
+        BANPERM_CACHE.setdefault(chat_id, set()).add(target.user_id)
         await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> já está banido permanentemente neste grupo.")
         return
     if not await _bot_can_restrict(chat_id, context):
@@ -2454,8 +2518,11 @@ async def cmd_unbanperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = "❌ Não foi possível retirar o banimento neste grupo."
         await _reply_and_cleanup(update, text)
         return
-    await _db_call(db.remove_banperm, target.user_id, chat_id)
+    removed = await _db_call(db.remove_banperm, target.user_id, chat_id)
     BANPERM_CACHE.get(chat_id, set()).discard(target.user_id)
+    if not removed:
+        await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> já não estava registrado como banperm neste grupo.")
+        return
     await _reply_and_cleanup(update, f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) desbanido neste grupo.")
 
 
@@ -2660,6 +2727,7 @@ async def cmd_jtbn(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 title="🌐 <b>JTBN global</b>",
                 empty_text="ℹ️ Não há usuários no JTBN global.",
                 scope_text="O JTBN é aplicado aos grupos ativos registrados pelo Bot API.",
+                next_page_command=".jtbn list",
             ),
         )
         return

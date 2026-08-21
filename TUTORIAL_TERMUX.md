@@ -109,6 +109,8 @@ O Bot API responde somente a comandos iniciados por `.`, e o menu nativo de coma
 .blacklist list 2
 .unblacklist
 .banperm
+.banperm list
+.banperm list 2
 .unbanperm
 .jtbn
 .jtbn list

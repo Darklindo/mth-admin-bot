@@ -25,6 +25,7 @@ O bot comum oferece moderação local e global e responde somente a comandos ini
 | `.blacklist list [página]` | Lista a blacklist local em páginas limitadas com IDs e motivos disponíveis | Somente `OWNER_IDS` |
 | `.unblacklist` | Remove o alvo da blacklist local do grupo | Somente `OWNER_IDS` |
 | `.banperm` | Bane imediatamente o alvo no grupo atual e bloqueia automaticamente uma reentrada | Somente `OWNER_IDS` |
+| `.banperm list [página]` | Lista os banimentos permanentes do grupo atual em páginas limitadas | Somente `OWNER_IDS` |
 | `.unbanperm` | Retira o banimento permanente do alvo no grupo atual | Somente `OWNER_IDS` |
 | `.jtbn` | Registra o alvo na lista global JTBN e tenta bani-lo em todos os grupos conhecidos | Somente um dos `OWNER_IDS` |
 | `.jtbn list [página]` | Lista os usuários registrados no JTBN global em páginas limitadas | Somente um dos `OWNER_IDS` |
