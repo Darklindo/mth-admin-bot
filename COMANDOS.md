@@ -22,7 +22,7 @@ A V9.0 possui duas superfícies independentes. O **Bot API** usa somente comando
 | `.divulgar off ID` | Desliga somente a divulgação identificada pelo `schedule_id`. | Somente `OWNER_IDS` |
 | `.divulgar off all` | Desliga todas as divulgações do grupo; sem `ID`, `.divulgar off` só desliga diretamente quando há uma única agenda. | Somente `OWNER_IDS` |
 | `.spam N` | Repete de 1 a 100 vezes a mensagem respondida; aceita texto, foto, vídeo, GIF, sticker, documento, áudio e voz. | Somente `OWNER_IDS` |
-| `.spam N texto` | Envia o texto informado N vezes, com limite de 100 repetições. | Somente `OWNER_IDS` |
+| `.spam N texto` | Envia o texto informado N vezes; quando usado em resposta, combina o texto com a fonte ou envia complemento para mídias sem legenda. | Somente `OWNER_IDS` |
 | `.spam off` | Cancela o spam em andamento no grupo atual. | Somente `OWNER_IDS` |
 
 Todos os comandos aceitam reply à mensagem do alvo ou ID/username conhecido, mas **somente os dois owners configurados em `OWNER_IDS` recebem respostas e executam comandos**. Administradores comuns não têm acesso ao dispatcher do bot. O Bot API ainda precisa estar no grupo e possuir as permissões administrativas correspondentes para realizar as ações. A função JTBN não consegue operar em chats que o bot não conhece, não acessa ou onde não pode restringir membros. O banco do Bot API é separado do banco do Userbot.

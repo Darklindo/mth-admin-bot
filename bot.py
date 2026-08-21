@@ -1295,15 +1295,30 @@ async def _spam_worker(bot, chat_id: int, config: dict):
             if SPAM_CONFIGS.get(chat_id) is not config:
                 return
             try:
-                if config["source_message_id"] is not None:
+                source_message_id = config.get("source_message_id")
+                if source_message_id is not None:
+                    copy_kwargs = {
+                        "chat_id": chat_id,
+                        "from_chat_id": chat_id,
+                        "message_id": int(source_message_id),
+                    }
+                    if config.get("caption_override") is not None:
+                        copy_kwargs["caption"] = config["caption_override"]
                     await _api_call(
                         bot.copy_message,
-                        chat_id=chat_id,
-                        from_chat_id=chat_id,
-                        message_id=int(config["source_message_id"]),
                         operation_name="cópia de mensagem do spam",
                         retry_after_maximum=120.0,
+                        **copy_kwargs,
                     )
+                    followup_text = config.get("followup_text")
+                    if followup_text:
+                        await _api_call(
+                            bot.send_message,
+                            chat_id=chat_id,
+                            text=followup_text,
+                            operation_name="texto complementar do spam",
+                            retry_after_maximum=120.0,
+                        )
                 else:
                     await _api_call(
                         bot.send_message,
@@ -1598,6 +1613,25 @@ async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return None
 
 
+def _combine_spam_text(base: str, extra: str, maximum: int) -> str | None:
+    parts = [str(value or "").strip() for value in (base, extra) if str(value or "").strip()]
+    combined = "\n\n".join(parts)
+    if len(combined) > int(maximum):
+        return None
+    return combined
+
+
+def _spam_caption_capable(message) -> bool:
+    return bool(
+        getattr(message, "photo", None)
+        or getattr(message, "video", None)
+        or getattr(message, "animation", None)
+        or getattr(message, "document", None)
+        or getattr(message, "audio", None)
+        or getattr(message, "voice", None)
+    )
+
+
 def _reason(context: ContextTypes.DEFAULT_TYPE) -> str:
     args = list(context.args or [])
     return " ".join(args[1:]).strip()[:500]
@@ -1858,13 +1892,6 @@ async def cmd_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     custom_text = " ".join(args[1:]).strip()
     reply = message.reply_to_message if message else None
-    if reply and custom_text:
-        await _reply_and_cleanup(
-            update,
-            "❌ Escolha apenas uma fonte: responda à mensagem sem texto adicional ou use "
-            "<code>.spam N seu texto</code> sem responder outra mensagem.",
-        )
-        return
     if not reply and not custom_text:
         await _reply_and_cleanup(
             update,
@@ -1874,6 +1901,35 @@ async def cmd_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if custom_text and len(custom_text) > SPAM_MAX_TEXT_LENGTH:
         await _reply_and_cleanup(update, f"❌ O texto do spam não pode exceder {SPAM_MAX_TEXT_LENGTH} caracteres.")
         return
+
+    source_message_id = int(reply.message_id) if reply else None
+    spam_text = custom_text
+    caption_override = None
+    followup_text = None
+    source_label = "texto informado"
+    if reply:
+        source_label = "mensagem respondida"
+        if custom_text and getattr(reply, "text", None):
+            spam_text = _combine_spam_text(reply.text, custom_text, SPAM_MAX_TEXT_LENGTH)
+            if spam_text is None:
+                await _reply_and_cleanup(update, f"❌ A mensagem combinada não pode exceder {SPAM_MAX_TEXT_LENGTH} caracteres.")
+                return
+            source_message_id = None
+            source_label = "mensagem respondida + texto adicional"
+        elif custom_text and _spam_caption_capable(reply):
+            base_caption = getattr(reply, "caption", "") or ""
+            caption_override = _combine_spam_text(base_caption, custom_text, SPAM_MAX_CAPTION_LENGTH)
+            if caption_override is None:
+                await _reply_and_cleanup(update, f"❌ A legenda combinada não pode exceder {SPAM_MAX_CAPTION_LENGTH} caracteres.")
+                return
+            source_label = "mídia respondida + legenda adicional"
+        elif custom_text:
+            # Stickers, video notes e outros tipos sem legenda são copiados e
+            # recebem o complemento como uma mensagem imediatamente posterior.
+            followup_text = custom_text
+            source_label = "mídia respondida + texto complementar"
+        elif getattr(reply, "text", None):
+            source_label = "mensagem respondida"
 
     existing = SPAM_TASKS.get(chat_id)
     if existing and not existing.done():
@@ -1887,15 +1943,16 @@ async def cmd_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = {
         "chat_id": chat_id,
         "count": count,
-        "source_message_id": int(reply.message_id) if reply else None,
-        "text": custom_text,
+        "source_message_id": source_message_id,
+        "text": spam_text,
+        "caption_override": caption_override,
+        "followup_text": followup_text,
         "owner_id": int(update.effective_user.id),
     }
     SPAM_CONFIGS[chat_id] = config
     SPAM_TASKS[chat_id] = _track_task(_spam_worker(context.bot, chat_id, config))
     BLACKLIST_TELEMETRY["spam_started"] += 1
     BLACKLIST_TELEMETRY["spam_active"] = len(SPAM_TASKS)
-    source_label = "mensagem respondida" if reply else "texto informado"
     await _reply_and_cleanup(
         update,
         f"🚀 Spam iniciado: <b>{count}</b> repetição(ões) usando {source_label}.\n"
@@ -1932,7 +1989,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>.divulgar list</code> — lista as agendas ativas com seus IDs.\n"
         "<code>.divulgar off ID</code> — desliga uma agenda específica; <code>off all</code> desliga todas.\n"
         "<code>.spam N</code> — repete uma mensagem respondida de 1 a 100 vezes.\n"
-        "<code>.spam N texto</code> — repete um texto; <code>.spam off</code> cancela o envio.\n"
+        "<code>.spam N texto</code> — repete um texto; ao responder uma fonte, acrescenta esse texto à mensagem/legenda.\n"
+        "Em sticker ou mídia sem legenda, o texto adicional é enviado logo após a cópia; <code>.spam off</code> cancela.\n"
         "O spam aceita texto, foto, vídeo, GIF, sticker, documento, áudio, voz e outras mídias copiáveis.\n"
         "Cada envio usa retry isolado e uma falha de notificação privada não interrompe o agendamento.\n\n"
         "Somente os dois proprietários configurados podem usar e receber respostas deste bot. "

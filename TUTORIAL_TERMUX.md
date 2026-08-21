@@ -122,7 +122,7 @@ O Bot API responde somente a comandos iniciados por `.`, e o menu nativo de coma
 .divulgar off ID
 .divulgar off all
 .spam 10              # respondendo a uma mensagem
-.spam 10 texto        # repetindo texto novo
+.spam 10 texto        # repetindo texto novo ou complemento da resposta
 .spam off             # cancelar execução atual
 ```
 
@@ -132,7 +132,7 @@ Use `.lock` para fechar o envio de mensagens para membros comuns. Administradore
 
 Para divulgar conteúdo periodicamente, responda a uma mensagem de texto, foto ou vídeo com `.divulgar 30m on`. Cada uso cria uma nova agenda independente no mesmo grupo, identificada por um `schedule_id`; são permitidas até 32 agendas por grupo. O bot republica o texto ou a mídia com a legenda original a cada intervalo entre 30 segundos e 30 dias. Use `.divulgar list` para consultar os IDs, `.divulgar off ID` para desligar uma agenda específica e `.divulgar off all` para desligar todas. Quando existe apenas uma agenda, `.divulgar off` também funciona; quando existem várias, ele apenas mostra a lista para evitar cancelamento acidental. Os agendamentos ficam persistidos no banco do Bot API e são restaurados depois de reinícios. O bot precisa continuar no grupo e ter permissão para enviar mensagens, fotos e vídeos. O owner `6822870889` (`@OnlyExaltarei`) recebe mensagens privadas com a ativação, o ID e primeiro horário, cada envio realizado e o próximo envio, além de alertas controlados quando houver falha. As notificações são executadas de forma independente: se o privado falhar, o worker continua publicando no grupo e tenta novamente conforme o ciclo normal.
 
-Para usar o spam controlado, responda à mensagem desejada e envie `.spam 10`. O Bot API copia até 100 vezes a mensagem respondida, aceitando texto, foto, vídeo, GIF, sticker, documento, áudio e voz quando forem copiáveis pelo Bot API. Para texto novo, use `.spam 10 meu texto`. O limite é de 1 a 100, existe no máximo uma execução por grupo e o intervalo entre cópias evita uma rajada descontrolada. Use `.spam off` para cancelar o worker atual. Falhas permanentes, falta de permissão e limites do Telegram interrompem a execução com segurança, sem retry infinito nem tarefas órfãs.
+Para usar o spam controlado, responda à mensagem desejada e envie `.spam 10`. O Bot API copia até 100 vezes a mensagem respondida, aceitando texto, foto, vídeo, GIF, sticker, documento, áudio e voz quando forem copiáveis pelo Bot API. Para texto novo, use `.spam 10 meu texto`. Também é possível responder a uma mensagem e usar `.spam 10 meu texto`: o texto é combinado com uma mensagem textual, anexado à legenda de fotos/vídeos e outras mídias com legenda, ou enviado logo depois de stickers e mídias sem legenda. O limite é de 1 a 100, existe no máximo uma execução por grupo e o intervalo entre cópias evita uma rajada descontrolada. Use `.spam off` para cancelar o worker atual. Falhas permanentes, falta de permissão e limites do Telegram interrompem a execução com segurança, sem retry infinito nem tarefas órfãs.
 
 ## 8. Comandos do Userbot
 
