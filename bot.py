@@ -463,6 +463,13 @@ class Database:
         )
         return cursor.rowcount > 0
 
+    def has_banperm(self, user_id: int, chat_id: int) -> bool:
+        row = self._fetchone(
+            "SELECT 1 FROM banperm WHERE chat_id=? AND user_id=? LIMIT 1",
+            (int(chat_id), int(user_id)),
+        )
+        return row is not None
+
     def remove_allban(self, user_id: int) -> bool:
         cursor = self._execute(
             "DELETE FROM allban WHERE user_id=?",
@@ -522,6 +529,45 @@ class Database:
             commit=True,
         )
         return int(cursor.lastrowid)
+
+    def save_divulgacao_if_capacity(self, chat_id: int, interval_seconds: int, content_type: str, text: str, file_id: str, source_message_id: int, owner_id: int, max_schedules: int, next_run_at: float | None = None) -> int | None:
+        """Insere uma divulgação somente se o limite ainda não foi atingido.
+
+        O bloqueio imediato torna a checagem e o INSERT uma única operação lógica,
+        evitando que dois comandos concorrentes ultrapassem o limite por corrida.
+        """
+        max_schedules = int(max_schedules)
+        if max_schedules < 1:
+            raise ValueError("max_schedules deve ser positivo")
+        now = int(time.time())
+        next_run_at = float(next_run_at if next_run_at is not None else time.time() + int(interval_seconds))
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.conn.execute(
+                    "SELECT COUNT(*) AS total FROM divulgacoes WHERE chat_id=?",
+                    (int(chat_id),),
+                ).fetchone()
+                if int(row["total"] if row else 0) >= max_schedules:
+                    self.conn.rollback()
+                    return None
+                cursor = self.conn.execute(
+                    """
+                    INSERT INTO divulgacoes(
+                        chat_id,interval_seconds,content_type,text,file_id,source_message_id,
+                        owner_id,created_at,updated_at,next_run_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        int(chat_id), int(interval_seconds), content_type, text or "", file_id or "",
+                        int(source_message_id), int(owner_id), now, now, next_run_at,
+                    ),
+                )
+                self.conn.commit()
+                return int(cursor.lastrowid)
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def get_divulgacoes(self):
         return self._fetchall(
@@ -639,7 +685,11 @@ def _safe_html(text: str) -> str:
 
 
 def _format_ms(value) -> str:
-    return "—" if value is None else f"{float(value):.0f} ms"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    return "—" if not math.isfinite(number) else f"{number:.0f} ms"
 
 
 _CHAT_PERMISSION_FIELDS = tuple(ChatPermissions.all_permissions().to_dict().keys())
@@ -654,11 +704,7 @@ def _permissions_to_json(permissions: ChatPermissions) -> str:
     return json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
-def _permissions_from_json(raw: str) -> ChatPermissions | None:
-    try:
-        payload = json.loads(raw)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
+def _permissions_from_payload(payload: object) -> ChatPermissions | None:
     if not isinstance(payload, dict):
         return None
     values = {}
@@ -673,6 +719,64 @@ def _permissions_from_json(raw: str) -> ChatPermissions | None:
         else:
             return None
     return ChatPermissions(**values) if values else None
+
+
+def _permissions_from_json(raw: str) -> ChatPermissions | None:
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if isinstance(payload, dict) and isinstance(payload.get("default"), dict):
+        payload = payload["default"]
+    return _permissions_from_payload(payload)
+
+
+def _lock_snapshot_json(default_permissions: ChatPermissions, owner_overrides: dict[int, ChatPermissions]) -> str:
+    owners = {
+        str(int(user_id)): json.loads(_permissions_to_json(permissions))
+        for user_id, permissions in owner_overrides.items()
+    }
+    return json.dumps(
+        {
+            "default": json.loads(_permissions_to_json(default_permissions)),
+            "owners": owners,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _decode_lock_snapshot(raw: str) -> tuple[ChatPermissions, dict[int, ChatPermissions]] | None:
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    # Snapshots antigos eram um objeto plano; continuam válidos para unlock.
+    if "default" not in payload:
+        permissions = _permissions_from_payload(payload)
+        return (permissions, {}) if permissions is not None else None
+    permissions = _permissions_from_payload(payload.get("default"))
+    if permissions is None:
+        return None
+    raw_owners = payload.get("owners", {})
+    if not isinstance(raw_owners, dict):
+        return None
+    owners = {}
+    for raw_user_id, raw_permissions in raw_owners.items():
+        try:
+            user_id = int(raw_user_id)
+        except (TypeError, ValueError):
+            return None
+        if user_id <= 0:
+            return None
+        owner_permissions = _permissions_from_payload(raw_permissions)
+        if owner_permissions is None:
+            return None
+        owners[user_id] = owner_permissions
+    return permissions, owners
 
 
 def _locked_permissions() -> ChatPermissions:
@@ -1000,7 +1104,13 @@ def _format_divulgar_interval(seconds: int) -> str:
 
 
 def _format_divulgar_datetime(timestamp: float) -> str:
-    return datetime.fromtimestamp(float(timestamp)).strftime("%d/%m/%Y às %H:%M:%S")
+    try:
+        value = float(timestamp)
+        if not math.isfinite(value):
+            return "indisponível"
+        return datetime.fromtimestamp(value).strftime("%d/%m/%Y às %H:%M:%S")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "indisponível"
 
 
 def _queue_divulgar_notification(bot, text: str):
@@ -1091,15 +1201,39 @@ async def _cancel_all_divulgar_tasks_for_chat(chat_id: int):
 def _divulgar_list_text(rows) -> str:
     lines = []
     for row in rows:
-        content_type = {"text": "texto", "photo": "foto", "video": "vídeo"}.get(row["content_type"], row["content_type"])
-        next_run_at = float(row["next_run_at"] or 0)
-        next_text = _format_divulgar_datetime(next_run_at) if next_run_at else "indisponível"
+        try:
+            raw_type = str(row["content_type"] or "desconhecido")
+        except (KeyError, IndexError, TypeError):
+            raw_type = "desconhecido"
+        content_type = _safe_html({"text": "texto", "photo": "foto", "video": "vídeo"}.get(raw_type, raw_type))
+        try:
+            next_run_at = float(row["next_run_at"] or 0)
+        except (KeyError, IndexError, TypeError, ValueError):
+            next_run_at = 0
+        try:
+            schedule_id = int(row["schedule_id"])
+            interval = int(row["interval_seconds"])
+        except (KeyError, TypeError, ValueError):
+            continue
         lines.append(
-            f"• ID <code>{int(row['schedule_id'])}</code> — {content_type}, "
-            f"a cada <code>{_format_divulgar_interval(int(row['interval_seconds']))}</code>; "
-            f"próximo: <b>{next_text}</b>"
+            f"• ID <code>{schedule_id}</code> — {content_type}, "
+            f"a cada <code>{_format_divulgar_interval(interval)}</code>; "
+            f"próximo: <b>{_format_divulgar_datetime(next_run_at) if next_run_at else 'indisponível'}</b>"
         )
-    return "\n".join(lines)
+    if not lines:
+        return "ℹ️ Nenhuma agenda válida encontrada."
+    output = ""
+    rendered = 0
+    for line in lines:
+        candidate = output + line + "\n"
+        suffix = f"\n… e mais <b>{len(lines) - rendered - 1}</b>. Use <code>.divulgar list</code> para consultar novamente."
+        if len(candidate.rstrip()) + (len(suffix) if rendered + 1 < len(lines) else 0) > LIST_MAX_OUTPUT_CHARS:
+            break
+        output = candidate
+        rendered += 1
+    if rendered < len(lines):
+        output += f"\n… e mais <b>{len(lines) - rendered}</b>. Use <code>.divulgar list</code> para consultar novamente."
+    return output.rstrip()
 
 
 async def _notify_divulgar_failure(bot, schedule_id: int, detail: str):
@@ -1318,11 +1452,13 @@ def _is_group(update: Update) -> bool:
     return bool(chat and chat.type in {ChatType.GROUP, ChatType.SUPERGROUP})
 
 
-async def _get_chat_member_cached(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def _get_chat_member_cached(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, *, strict: bool = False):
     key = (int(chat_id), int(user_id))
     now = time.monotonic()
     cached = CHAT_MEMBER_CACHE.get(key)
     if cached and cached[0] > now:
+        if strict and cached[1] is None:
+            raise TelegramError("consulta de membro indisponível")
         return cached[1]
 
     async def load_member():
@@ -1361,10 +1497,19 @@ async def _get_chat_member_cached(chat_id: int, user_id: int, context: ContextTy
 
         task.add_done_callback(clear_inflight)
     try:
-        return await asyncio.shield(task)
+        result = await asyncio.shield(task)
+        if strict and result is None:
+            raise TelegramError("consulta de membro indisponível")
+        return result
     except asyncio.CancelledError:
         raise
+    except TelegramError:
+        if strict:
+            raise
+        return None
     except Exception:
+        if strict:
+            raise TelegramError("consulta de membro indisponível")
         return None
 
 
@@ -1598,14 +1743,6 @@ async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    active_rows = await _db_call(db.get_divulgacoes_for_chat, chat_id)
-    if len(active_rows) >= DIVULGAR_MAX_SCHEDULES_PER_CHAT:
-        await _reply_and_cleanup(
-            update,
-            f"❌ Este grupo já atingiu o limite de {DIVULGAR_MAX_SCHEDULES_PER_CHAT} divulgações simultâneas. "
-            "Desligue uma agenda com <code>.divulgar off ID</code> antes de criar outra.",
-        )
-        return
     interval_seconds = _parse_divulgar_interval(args[0])
     if interval_seconds is None:
         await _reply_and_cleanup(update, "❌ Intervalo inválido. Use, por exemplo, <code>30s</code>, <code>30m</code>, <code>2h</code> ou <code>1d</code>; o mínimo é 30s.")
@@ -1616,7 +1753,7 @@ async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     next_run_at = time.time() + interval_seconds
     schedule_id = await _db_call(
-        db.save_divulgacao,
+        db.save_divulgacao_if_capacity,
         chat_id,
         interval_seconds,
         source["content_type"],
@@ -1624,8 +1761,16 @@ async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         source["file_id"],
         source["source_message_id"],
         update.effective_user.id,
+        DIVULGAR_MAX_SCHEDULES_PER_CHAT,
         next_run_at,
     )
+    if schedule_id is None:
+        await _reply_and_cleanup(
+            update,
+            f"❌ Este grupo já atingiu o limite de {DIVULGAR_MAX_SCHEDULES_PER_CHAT} divulgações simultâneas. "
+            "Desligue uma agenda com <code>.divulgar off ID</code> antes de criar outra.",
+        )
+        return
     config = {
         "schedule_id": int(schedule_id),
         "chat_id": chat_id,
@@ -1639,7 +1784,20 @@ async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     DIVULGAR_CONFIGS[int(schedule_id)] = config
     DIVULGAR_LAST_FAILURE_NOTIFY.pop(int(schedule_id), None)
-    await _ensure_divulgar_task(context.bot, schedule_id, config)
+    try:
+        await _ensure_divulgar_task(context.bot, schedule_id, config)
+    except asyncio.CancelledError:
+        DIVULGAR_CONFIGS.pop(int(schedule_id), None)
+        await _db_call(db.remove_divulgacao, int(schedule_id))
+        raise
+    except Exception:
+        DIVULGAR_CONFIGS.pop(int(schedule_id), None)
+        DIVULGAR_LAST_FAILURE_NOTIFY.pop(int(schedule_id), None)
+        await _db_call(db.remove_divulgacao, int(schedule_id))
+        logger.exception("Falha ao iniciar divulgação schedule_id=%s após persistência", schedule_id)
+        await _reply_and_cleanup(update, "❌ Não foi possível iniciar a divulgação; nenhuma agenda foi deixada ativa.")
+        return
+    active_rows = await _db_call(db.get_divulgacoes_for_chat, chat_id)
     await _reply_and_cleanup(
         update,
         f"✅ Divulgação <code>{schedule_id}</code> ativada neste grupo a cada "
@@ -1800,6 +1958,72 @@ def _lock_permission_error(exc: BaseException) -> str:
     return "❌ Não foi possível alterar as permissões do grupo. Tente novamente."
 
 
+async def _capture_lock_owner_overrides(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Retorna permissões a restaurar para owners que estejam restritos antes do lock."""
+    owner_restore: dict[int, ChatPermissions | None] = {}
+    if not callable(getattr(context.bot, "get_chat_member", None)):
+        return owner_restore, None
+    for owner_id in sorted(OWNER_IDS):
+        try:
+            member = await _get_chat_member_cached(chat_id, owner_id, context, strict=True)
+        except TelegramError:
+            logger.warning("Não foi possível verificar o owner %s antes do lock no grupo %s", owner_id, chat_id, exc_info=True)
+            return None, owner_id
+        if member is None or member.status in {"administrator", "creator", "left", "kicked"}:
+            continue
+        if member.status == "restricted":
+            permissions = getattr(member, "permissions", None)
+            if not isinstance(permissions, ChatPermissions):
+                return None, owner_id
+            owner_restore[owner_id] = permissions
+        else:
+            # O owner era um membro comum; depois do unlock o snapshot padrão já o restaura.
+            owner_restore[owner_id] = None
+    return owner_restore, None
+
+
+async def _apply_lock_owner_overrides(chat_id: int, context: ContextTypes.DEFAULT_TYPE, owner_restore: dict[int, ChatPermissions | None]):
+    failures = []
+    for owner_id in owner_restore:
+        try:
+            await _api_call(
+                context.bot.restrict_chat_member,
+                chat_id=chat_id,
+                user_id=owner_id,
+                permissions=ChatPermissions.all_permissions(),
+                use_independent_chat_permissions=True,
+                operation_name="liberação do owner durante lock",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failures.append((owner_id, exc))
+    _invalidate_chat_member_cache(chat_id)
+    return failures
+
+
+async def _restore_lock_owner_overrides(chat_id: int, context: ContextTypes.DEFAULT_TYPE, owner_restore: dict[int, ChatPermissions | None]):
+    failures = []
+    for owner_id, permissions in owner_restore.items():
+        if permissions is None:
+            continue
+        try:
+            await _api_call(
+                context.bot.restrict_chat_member,
+                chat_id=chat_id,
+                user_id=owner_id,
+                permissions=permissions,
+                use_independent_chat_permissions=True,
+                operation_name="restauração da permissão original do owner",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failures.append((owner_id, exc))
+    _invalidate_chat_member_cache(chat_id)
+    return failures
+
+
 async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _require_owner_access(update, context):
         return
@@ -1821,7 +2045,15 @@ async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not isinstance(current_permissions, ChatPermissions):
             await _reply_and_cleanup(update, "❌ Não consegui ler as permissões atuais deste grupo.")
             return
-        snapshot = _permissions_to_json(current_permissions)
+        owner_restore, failed_owner = await _capture_lock_owner_overrides(chat.id, context)
+        if owner_restore is None:
+            await _reply_and_cleanup(
+                update,
+                f"❌ Não consegui ler as permissões originais do owner <code>{failed_owner}</code>; "
+                "o lock não foi aplicado para evitar alterar o estado dele.",
+            )
+            return
+        snapshot = _lock_snapshot_json(current_permissions, owner_restore)
         saved = await _db_call(db.save_chat_lock, chat.id, snapshot, operator.id)
         if not saved:
             await _reply_and_cleanup(update, "❌ Não consegui salvar o estado atual do grupo; o lock não foi aplicado.")
@@ -1834,7 +2066,27 @@ async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 use_independent_chat_permissions=True,
                 operation_name="bloqueio de mensagens do grupo",
             )
+            override_failures = await _apply_lock_owner_overrides(chat.id, context, owner_restore)
+            if override_failures:
+                raise TelegramError(
+                    "não foi possível liberar todos os owners durante o lock: "
+                    + ", ".join(str(owner_id) for owner_id, _exc in override_failures)
+                )
         except Exception:
+            try:
+                await _restore_lock_owner_overrides(chat.id, context, owner_restore)
+            except Exception:
+                logger.exception("Falha ao restaurar exceções de owners após lock incompleto no grupo %s", chat.id)
+            try:
+                await _api_call(
+                    context.bot.set_chat_permissions,
+                    chat_id=chat.id,
+                    permissions=current_permissions,
+                    use_independent_chat_permissions=True,
+                    operation_name="rollback do bloqueio de mensagens",
+                )
+            except Exception:
+                logger.exception("Falha ao reverter permissões após lock incompleto no grupo %s", chat.id)
             await _db_call(db.remove_chat_lock, chat.id)
             raise
     except (BadRequest, Forbidden, TelegramError) as exc:
@@ -1849,7 +2101,7 @@ async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await _reply_and_cleanup(
         update,
-        "🔒 <b>Grupo fechado.</b> Apenas administradores e o dono do grupo podem enviar mensagens; "
+        "🔒 <b>Grupo fechado.</b> Apenas administradores e os dois proprietários configurados podem enviar mensagens; "
         "o Bot API continua podendo publicar e executar suas tarefas administrativas.",
     )
 
@@ -1864,10 +2116,11 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not saved:
         await _reply_and_cleanup(update, "ℹ️ O grupo já está aberto ou não há um lock do Bot API registrado.")
         return
-    permissions = _permissions_from_json(saved.get("permissions_json", ""))
-    if permissions is None:
+    decoded = _decode_lock_snapshot(saved.get("permissions_json", ""))
+    if decoded is None:
         await _reply_and_cleanup(update, "❌ O snapshot de permissões está inválido; não alterei o grupo para evitar perda de configuração.")
         return
+    permissions, owner_restore = decoded
     try:
         await _api_call(
             context.bot.set_chat_permissions,
@@ -1876,6 +2129,20 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
             use_independent_chat_permissions=True,
             operation_name="restauração das permissões do grupo",
         )
+        owner_failures = await _restore_lock_owner_overrides(chat.id, context, owner_restore)
+        if owner_failures:
+            logger.error(
+                "Grupo %s aberto, mas não foi possível restaurar owners: %s",
+                chat.id,
+                ", ".join(str(owner_id) for owner_id, _exc in owner_failures),
+            )
+            await _reply_and_cleanup(
+                update,
+                "⚠️ O grupo foi aberto, mas não consegui restaurar as permissões individuais de "
+                + ", ".join(f"<code>{owner_id}</code>" for owner_id, _exc in owner_failures)
+                + ". O snapshot foi preservado; tente <code>.unlock</code> novamente.",
+            )
+            return
         await _db_call(db.remove_chat_lock, chat.id)
     except (BadRequest, Forbidden, TelegramError) as exc:
         await _reply_and_cleanup(update, _lock_permission_error(exc))
@@ -2111,7 +2378,7 @@ async def cmd_unbanperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     was_cached = target.user_id in BANPERM_CACHE.get(chat_id, set())
-    if not was_cached:
+    if not was_cached and not await _db_call(db.has_banperm, target.user_id, chat_id):
         await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> não estava banido permanentemente neste grupo.")
         return
     unban_result = await _unban_in_chat(context, chat_id, target)
@@ -2407,24 +2674,41 @@ async def post_init(app: Application):
     BOT_USER_ID = (await _api_call(app.bot.get_me, operation_name="identificação do bot")).id
     rows = await _db_call(db.get_divulgacoes)
     for row in rows:
-        schedule_id = int(row["schedule_id"])
-        chat_id = int(row["chat_id"])
+        try:
+            schedule_id = int(row["schedule_id"])
+            chat_id = int(row["chat_id"])
+            interval_seconds = int(row["interval_seconds"])
+            source_message_id = int(row["source_message_id"])
+            owner_id = int(row["owner_id"])
+            next_run_at = float(row["next_run_at"] or 0)
+        except (KeyError, IndexError, TypeError, ValueError, OverflowError):
+            logger.warning("Divulgação inválida ignorada durante o startup: linha=%r", tuple(row), exc_info=True)
+            continue
+        if chat_id == 0 or source_message_id <= 0 or owner_id <= 0 or not math.isfinite(next_run_at):
+            logger.warning("Divulgação com identificadores/timestamp inválidos ignorada: chat_id=%s schedule_id=%s", chat_id, schedule_id)
+            continue
         config = {
             "schedule_id": schedule_id,
             "chat_id": chat_id,
-            "interval_seconds": int(row["interval_seconds"]),
-            "content_type": row["content_type"],
-            "text": row["text"] or "",
-            "file_id": row["file_id"] or "",
-            "source_message_id": int(row["source_message_id"]),
-            "owner_id": int(row["owner_id"]),
-            "next_run_at": float(row["next_run_at"] or 0),
+            "interval_seconds": interval_seconds,
+            "content_type": str(row["content_type"] or ""),
+            "text": str(row["text"] or ""),
+            "file_id": str(row["file_id"] or ""),
+            "source_message_id": source_message_id,
+            "owner_id": owner_id,
+            "next_run_at": next_run_at,
         }
         if config["content_type"] not in {"text", "photo", "video"}:
             logger.warning("Divulgação inválida ignorada no chat_id=%s schedule_id=%s", chat_id, schedule_id)
             continue
-        if not DIVULGAR_MIN_INTERVAL_SECONDS <= config["interval_seconds"] <= DIVULGAR_MAX_INTERVAL_SECONDS:
+        if not DIVULGAR_MIN_INTERVAL_SECONDS <= interval_seconds <= DIVULGAR_MAX_INTERVAL_SECONDS:
             logger.warning("Intervalo de divulgação inválido ignorado no chat_id=%s schedule_id=%s", chat_id, schedule_id)
+            continue
+        if config["content_type"] != "text" and not config["file_id"]:
+            logger.warning("Divulgação de mídia sem file_id ignorada no chat_id=%s schedule_id=%s", chat_id, schedule_id)
+            continue
+        if config["content_type"] == "text" and not config["text"]:
+            logger.warning("Divulgação de texto vazia ignorada no chat_id=%s schedule_id=%s", chat_id, schedule_id)
             continue
         DIVULGAR_CONFIGS[schedule_id] = config
         await _ensure_divulgar_task(app.bot, schedule_id, config)
