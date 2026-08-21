@@ -2007,9 +2007,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>.blacklist</code> — adiciona o alvo à blacklist deste grupo.\n"
         "<code>.blacklist list</code> — lista a blacklist local deste grupo.\n"
         "<code>.unblacklist</code> — remove a blacklist local.\n"
-        "<code>.banperm</code> — bane permanentemente o alvo deste grupo e reaplica o bloqueio se ele tentar reentrar.\n"
-        "<code>.banperm list [página]</code> — lista os banimentos permanentes deste grupo.\n"
-        "<code>.unbanperm</code> — remove o banimento deste grupo.\n"
+        "<code>.jtperm</code> — bane permanentemente o alvo deste grupo e reaplica o bloqueio se ele tentar reentrar.\n"
+        "<code>.jtperm list [página]</code> — lista os banimentos permanentes deste grupo.\n"
+        "<code>.unjtperm</code> — remove o banimento deste grupo.\n"
         "<code>.jtbn</code> — o proprietário bane o alvo nos grupos registrados.\n"
         "<code>.jtbn list</code> — lista os usuários no JTBN global.\n"
         "<code>.unjtbn</code> — remove o JTBN global e tenta desbanir o alvo.\n"
@@ -2302,13 +2302,13 @@ async def cmd_unblacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_and_cleanup(update, f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) removido da blacklist local.")
 
 
-DOT_COMMAND_RE = re.compile(r"^\.(help|unblacklist|unbanperm|unjtbn|blacklist|banperm|jtbn|lock|unlock|latency|divulgar|spam)(?:\s+.*)?$", re.IGNORECASE)
+DOT_COMMAND_RE = re.compile(r"^\.(help|unblacklist|unjtperm|unjtbn|blacklist|jtperm|jtbn|lock|unlock|latency|divulgar|spam)(?:\s+.*)?$", re.IGNORECASE)
 DOT_COMMANDS = {
     "help": "cmd_help",
     "blacklist": "cmd_blacklist",
     "unblacklist": "cmd_unblacklist",
-    "banperm": "cmd_banperm",
-    "unbanperm": "cmd_unbanperm",
+    "jtperm": "cmd_banperm",
+    "unjtperm": "cmd_unbanperm",
     "jtbn": "cmd_jtbn",
     "unjtbn": "cmd_unjtbn",
     "lock": "cmd_lock",
@@ -2433,7 +2433,7 @@ async def cmd_banperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = int(update.effective_chat.id)
     if args and args[0].lower() == "list":
         if len(args) > 2:
-            await _reply_and_cleanup(update, "❌ Uso: <code>.banperm list</code> ou <code>.banperm list N</code>.")
+            await _reply_and_cleanup(update, "❌ Uso: <code>.jtperm list</code> ou <code>.jtperm list N</code>.")
             return
         page = 1
         if len(args) == 2:
@@ -2454,13 +2454,13 @@ async def cmd_banperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 title="🔨 <b>Banperm local</b>",
                 empty_text="ℹ️ Não há usuários banidos permanentemente neste grupo.",
                 scope_text="As reentradas são bloqueadas automaticamente quando detectadas.",
-                next_page_command=".banperm list",
+                next_page_command=".jtperm list",
             ),
         )
         return
     target = await _resolve_target(update, context)
     if target is None:
-        await _reply_and_cleanup(update, _target_error("banperm"))
+        await _reply_and_cleanup(update, _target_error("jtperm"))
         return
     if _is_owner(target.user_id):
         await _reply_and_cleanup(update, "❌ O proprietário é imune a banimentos.")
@@ -2502,7 +2502,7 @@ async def cmd_unbanperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     target = await _resolve_target(update, context)
     if target is None:
-        await _reply_and_cleanup(update, _target_error("unbanperm"))
+        await _reply_and_cleanup(update, _target_error("unjtperm"))
         return
     chat_id = update.effective_chat.id
     was_cached = target.user_id in BANPERM_CACHE.get(chat_id, set())
