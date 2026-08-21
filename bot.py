@@ -111,6 +111,7 @@ DIVULGAR_MAX_CAPTION_LENGTH = 1024
 DIVULGAR_ALLOWED_MEDIA = {"photo", "video"}
 DIVULGAR_MAX_SCHEDULES_PER_CHAT = 32
 LIST_MAX_VISIBLE_ENTRIES = 30
+LIST_MAX_PAGE = 1_000_000
 LIST_MAX_OUTPUT_CHARS = 3600
 LIST_REASON_MAX_CHARS = 80
 SPAM_MIN_COUNT = 1
@@ -256,14 +257,15 @@ class Database:
                         )
                         """
                     )
+                    legacy_next_run_expression = "next_run_at" if "next_run_at" in columns else "0"
                     self.conn.execute(
-                        """
+                        f"""
                         INSERT INTO divulgacoes(
                             chat_id,interval_seconds,content_type,text,file_id,source_message_id,
                             owner_id,created_at,updated_at,next_run_at
                         )
                         SELECT chat_id,interval_seconds,content_type,text,file_id,source_message_id,
-                               owner_id,created_at,updated_at,next_run_at
+                               owner_id,created_at,updated_at,{legacy_next_run_expression}
                         FROM divulgacoes_legacy_v1
                         """
                     )
@@ -284,6 +286,14 @@ class Database:
             if commit:
                 self.conn.commit()
             return cursor
+
+    def _fetchone(self, sql, params=()):
+        with self._lock:
+            return self.conn.execute(sql, params).fetchone()
+
+    def _fetchall(self, sql, params=()):
+        with self._lock:
+            return self.conn.execute(sql, params).fetchall()
 
     def load_state(self):
         with self._lock:
@@ -344,10 +354,10 @@ class Database:
         )
 
     def resolve_username(self, username: str):
-        row = self._execute(
+        row = self._fetchone(
             "SELECT user_id,username,full_name FROM users WHERE username = ? COLLATE NOCASE LIMIT 1",
             (username.lstrip("@"),),
-        ).fetchone()
+        )
         return dict(row) if row else None
 
     def add_blacklist(self, target: Target, chat_id: int, added_by: int, reason: str):
@@ -396,45 +406,45 @@ class Database:
         return cursor.rowcount >= 0
 
     def get_blacklist_for_chat(self, chat_id: int):
-        return self._execute(
+        return self._fetchall(
             "SELECT user_id,username,reason,added_by,created_at FROM blacklist WHERE chat_id=? ORDER BY created_at,user_id",
             (int(chat_id),),
-        ).fetchall()
+        )
 
     def count_blacklist_for_chat(self, chat_id: int) -> int:
-        row = self._execute("SELECT COUNT(*) AS total FROM blacklist WHERE chat_id=?", (int(chat_id),)).fetchone()
+        row = self._fetchone("SELECT COUNT(*) AS total FROM blacklist WHERE chat_id=?", (int(chat_id),))
         return int(row["total"] if row else 0)
 
     def get_blacklist_for_chat_page(self, chat_id: int, limit: int, offset: int):
-        return self._execute(
+        return self._fetchall(
             """
             SELECT user_id,username,reason,added_by,created_at
             FROM blacklist WHERE chat_id=?
             ORDER BY created_at,user_id LIMIT ? OFFSET ?
             """,
             (int(chat_id), max(1, int(limit)), max(0, int(offset))),
-        ).fetchall()
+        )
 
     def get_allban_entries(self):
-        return self._execute(
+        return self._fetchall(
             "SELECT user_id,username,reason,added_by,created_at FROM allban ORDER BY created_at,user_id"
-        ).fetchall()
+        )
 
     def count_allban(self) -> int:
-        row = self._execute("SELECT COUNT(*) AS total FROM allban").fetchone()
+        row = self._fetchone("SELECT COUNT(*) AS total FROM allban")
         return int(row["total"] if row else 0)
 
     def get_allban_entries_page(self, limit: int, offset: int):
-        return self._execute(
+        return self._fetchall(
             """
             SELECT user_id,username,reason,added_by,created_at
             FROM allban ORDER BY created_at,user_id LIMIT ? OFFSET ?
             """,
             (max(1, int(limit)), max(0, int(offset))),
-        ).fetchall()
+        )
 
     def has_allban(self, user_id: int) -> bool:
-        row = self._execute("SELECT 1 FROM allban WHERE user_id=? LIMIT 1", (int(user_id),)).fetchone()
+        row = self._fetchone("SELECT 1 FROM allban WHERE user_id=? LIMIT 1", (int(user_id),))
         return row is not None
 
     def remove_blacklist(self, user_id: int, chat_id: int) -> bool:
@@ -479,10 +489,10 @@ class Database:
         return cursor.rowcount >= 0
 
     def get_chat_lock(self, chat_id: int):
-        row = self._execute(
+        row = self._fetchone(
             "SELECT chat_id,permissions_json,locked_by,locked_at,updated_at FROM chat_locks WHERE chat_id=? LIMIT 1",
             (int(chat_id),),
-        ).fetchone()
+        )
         return dict(row) if row else None
 
     def remove_chat_lock(self, chat_id: int) -> bool:
@@ -494,9 +504,9 @@ class Database:
         return cursor.rowcount > 0
 
     def active_chats(self):
-        return self._execute(
+        return self._fetchall(
             "SELECT chat_id,title,chat_type FROM chats WHERE active=1 AND chat_type IN ('group','supergroup') ORDER BY chat_id"
-        ).fetchall()
+        )
 
     def save_divulgacao(self, chat_id: int, interval_seconds: int, content_type: str, text: str, file_id: str, source_message_id: int, owner_id: int, next_run_at: float | None = None) -> int:
         now = int(time.time())
@@ -514,15 +524,15 @@ class Database:
         return int(cursor.lastrowid)
 
     def get_divulgacoes(self):
-        return self._execute(
+        return self._fetchall(
             "SELECT schedule_id,chat_id,interval_seconds,content_type,text,file_id,source_message_id,owner_id,next_run_at FROM divulgacoes ORDER BY chat_id,schedule_id"
-        ).fetchall()
+        )
 
     def get_divulgacoes_for_chat(self, chat_id: int):
-        return self._execute(
+        return self._fetchall(
             "SELECT schedule_id,chat_id,interval_seconds,content_type,text,file_id,source_message_id,owner_id,next_run_at FROM divulgacoes WHERE chat_id=? ORDER BY schedule_id",
             (int(chat_id),),
-        ).fetchall()
+        )
 
     def update_divulgacao_next_run(self, schedule_id: int, next_run_at: float):
         self._execute(
@@ -566,6 +576,7 @@ DIVULGAR_LAST_FAILURE_NOTIFY: dict[int, float] = {}
 DIVULGAR_FAILURE_NOTIFY_COOLDOWN_SECONDS = 15 * 60
 SPAM_TASKS: dict[int, asyncio.Task] = {}
 SPAM_CONFIGS: dict[int, dict] = {}
+JTBN_BAN_INFLIGHT: set[tuple[int, int]] = set()
 HEARTBEAT_TASK: asyncio.Task | None = None
 KNOWN_USERNAME_IDS = {
     username.lower(): int(user_id)
@@ -650,11 +661,17 @@ def _permissions_from_json(raw: str) -> ChatPermissions | None:
         return None
     if not isinstance(payload, dict):
         return None
-    values = {
-        field: bool(payload[field])
-        for field in _CHAT_PERMISSION_FIELDS
-        if field in payload
-    }
+    values = {}
+    for field in _CHAT_PERMISSION_FIELDS:
+        if field not in payload:
+            continue
+        value = payload[field]
+        if isinstance(value, bool):
+            values[field] = value
+        elif isinstance(value, int) and value in {0, 1}:
+            values[field] = bool(value)
+        else:
+            return None
     return ChatPermissions(**values) if values else None
 
 
@@ -710,7 +727,14 @@ def _format_user_list(
     return output.rstrip()
 
 
-def _retry_delay(exc: RetryAfter, maximum: float = 60.0) -> float:
+def _parse_list_page(raw: str) -> int | None:
+    if not re.fullmatch(r"[1-9]\d{0,6}", (raw or "").strip()):
+        return None
+    page = int(raw)
+    return page if page <= LIST_MAX_PAGE else None
+
+
+def _retry_delay(exc: RetryAfter, maximum: float = 60.0):
     try:
         delay = float(exc.retry_after)
     except (TypeError, ValueError):
@@ -952,10 +976,13 @@ async def _reply_and_cleanup(update: Update, text: str, *, parse_mode: str | Non
 
 
 def _parse_divulgar_interval(raw: str) -> int | None:
-    match = re.fullmatch(r"(\d+)([smhd])", (raw or "").strip().lower())
+    match = re.fullmatch(r"(\d{1,12})([smhd])", (raw or "").strip().lower())
     if not match:
         return None
-    amount = int(match.group(1))
+    try:
+        amount = int(match.group(1))
+    except (TypeError, ValueError):
+        return None
     unit = match.group(2)
     multiplier = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
     seconds = amount * multiplier
@@ -1403,8 +1430,10 @@ async def _resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not args:
         return None
     raw = args[0].strip()
-    if re.fullmatch(r"\d{4,20}", raw):
+    if re.fullmatch(rf"[0-9]{{1,{MAX_TARGET_ID_LENGTH}}}", raw):
         user_id = int(raw)
+        if user_id <= 0:
+            return None
         username, full_name = KNOWN_USERS.get(user_id, ("", ""))
         return Target(user_id, username, full_name)
     if raw.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{5,32}", raw):
@@ -1988,11 +2017,8 @@ async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         page = 1
         if len(args) == 2:
-            try:
-                page = int(args[1])
-            except ValueError:
-                page = 0
-        if page < 1:
+            page = _parse_list_page(args[1])
+        if page is None or page < 1:
             await _reply_and_cleanup(update, "❌ O número da página deve ser um inteiro positivo.")
             return
         total, rows = await asyncio.gather(
@@ -2155,6 +2181,19 @@ async def _unban_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, targe
         return "failed"
 
 
+async def _enforce_jtbn_in_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int, target: Target):
+    key = (int(chat_id), int(target.user_id))
+    if key in JTBN_BAN_INFLIGHT:
+        return
+    JTBN_BAN_INFLIGHT.add(key)
+    try:
+        result = await _ban_in_chat(context, key[0], target)
+        if result not in {"ok", "skipped"}:
+            logger.debug("JTBN não conseguiu reforçar o banimento em %s/%s: %s", key[0], key[1], result)
+    finally:
+        JTBN_BAN_INFLIGHT.discard(key)
+
+
 async def cmd_unjtbn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not _is_owner(update.effective_user.id):
         await _reply_and_cleanup(update, "⛔ Este comando é exclusivo dos proprietários configurados.")
@@ -2208,11 +2247,8 @@ async def cmd_jtbn(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         page = 1
         if len(args) == 2:
-            try:
-                page = int(args[1])
-            except ValueError:
-                page = 0
-        if page < 1:
+            page = _parse_list_page(args[1])
+        if page is None or page < 1:
             await _reply_and_cleanup(update, "❌ O número da página deve ser um inteiro positivo.")
             return
         total, rows = await asyncio.gather(
@@ -2323,9 +2359,12 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if getattr(message, "date", None) is not None:
             BLACKLIST_TELEMETRY["last_update_age_ms"] = max(0.0, (time.time() - message.date.timestamp()) * 1000)
         _schedule_delete_now(context.bot, message)
-        _track_task(_ban_in_chat(context, chat.id, target))
+        _track_task(_enforce_jtbn_in_chat(context, chat.id, target))
         return
-    if user_id in BANPERM_CACHE.get(chat.id, set()) or user_id in BLACKLIST_CACHE.get(chat.id, set()):
+    if not _is_owner(user_id) and (
+        user_id in BANPERM_CACHE.get(chat.id, set())
+        or user_id in BLACKLIST_CACHE.get(chat.id, set())
+    ):
         BLACKLIST_TELEMETRY["matched"] += 1
         if getattr(message, "date", None) is not None:
             BLACKLIST_TELEMETRY["last_update_age_ms"] = max(0.0, (time.time() - message.date.timestamp()) * 1000)
@@ -2355,7 +2394,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         logger.warning("Falha transitória de rede no Bot API; o polling continuará tentando: %s", error)
     else:
         BLACKLIST_TELEMETRY["last_polling_error"] = type(error).__name__
-        logger.exception("Erro não tratado no Bot API", exc_info=error)
+        logger.error(
+            "Erro não tratado no Bot API",
+            exc_info=(type(error), error, getattr(error, "__traceback__", None)),
+        )
 
 
 async def post_init(app: Application):
@@ -2407,6 +2449,13 @@ async def post_shutdown(app: Application):
     DIVULGAR_CONFIGS.clear()
     SPAM_TASKS.clear()
     SPAM_CONFIGS.clear()
+    for task in set(CHAT_MEMBER_INFLIGHT.values()):
+        task.cancel()
+    if CHAT_MEMBER_INFLIGHT:
+        await asyncio.gather(*CHAT_MEMBER_INFLIGHT.values(), return_exceptions=True)
+        CHAT_MEMBER_INFLIGHT.clear()
+    CHAT_MEMBER_CACHE.clear()
+    JTBN_BAN_INFLIGHT.clear()
     if HEARTBEAT_TASK is not None:
         HEARTBEAT_TASK.cancel()
         await asyncio.gather(HEARTBEAT_TASK, return_exceptions=True)
