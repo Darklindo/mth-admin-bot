@@ -112,6 +112,11 @@ COMMAND_ARGUMENT_MAX_CHARS = 1024
 JTBYPASS_MAX_URL_LENGTH = 2048
 JTBYPASS_MAX_REDIRECTS = 8
 JTBYPASS_TIMEOUT_SECONDS = 8.0
+# Fallback sem chave para redirects HTTP públicos. O serviço pode registrar URLs;
+# por isso a entrada continua limitada aos dois hosts explicitamente permitidos.
+JTBYPASS_REMOTE_API_URL = "https://www.redirectcheck.org/api/check"
+JTBYPASS_REMOTE_API_TIMEOUT_SECONDS = 12.0
+JTBYPASS_REMOTE_API_ENABLED = True
 JTBYPASS_ENTRY_HOSTS = frozenset({
     "alpharede.com",
     "www.alpharede.com",
@@ -1085,9 +1090,8 @@ def _validate_jtbypass_url(raw_url: str, *, entry: bool) -> str:
     return urllib.parse.urlunsplit((scheme, parsed.netloc, parsed.path or "/", parsed.query, parsed.fragment))
 
 
-def _resolve_public_redirect(raw_url: str) -> tuple[str, int]:
-    """Segue apenas redirecionamentos HTTP(S) públicos, sem executar a página."""
-    start_url = _validate_jtbypass_url(raw_url, entry=True)
+def _resolve_public_redirect_local(start_url: str) -> tuple[str, int]:
+    """Segue redirects HTTP(S) públicos localmente, sem executar a página."""
     handler = _PublicRedirectHandler()
     opener = urllib.request.build_opener(handler)
     request = urllib.request.Request(
@@ -1109,6 +1113,62 @@ def _resolve_public_redirect(raw_url: str) -> tuple[str, int]:
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise JtBypassError("falha de rede ao consultar o link") from exc
     return final_url, handler.redirect_count
+
+
+def _resolve_public_redirect_remote(start_url: str) -> tuple[str, int]:
+    """Consulta um expander público que só segue Location HTTP(S), sem JavaScript."""
+    api_url = _validate_jtbypass_url(JTBYPASS_REMOTE_API_URL, entry=False)
+    payload = json.dumps(
+        {
+            "url": start_url,
+            "method": "GET",
+            "followMetaRefresh": False,
+            "maxHops": JTBYPASS_MAX_REDIRECTS,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        api_url,
+        data=payload,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "JtzinBot/1.0 public-redirect-check",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=JTBYPASS_REMOTE_API_TIMEOUT_SECONDS) as response:
+            raw_body = response.read(512 * 1024)
+    except urllib.error.HTTPError as exc:
+        raise JtBypassError(f"API pública respondeu HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise JtBypassError("API pública indisponível") from exc
+    try:
+        result = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise JtBypassError("API pública retornou JSON inválido") from exc
+    if not isinstance(result, dict) or result.get("error"):
+        raise JtBypassError("API pública não conseguiu consultar o link")
+    final_result = result.get("final_result")
+    final_url = final_result.get("final_url") if isinstance(final_result, dict) else None
+    if not isinstance(final_url, str) or not final_url.strip():
+        raise JtBypassError("API pública não retornou a URL final")
+    validated_url = _validate_jtbypass_url(final_url, entry=False)
+    redirects = result.get("redirects")
+    redirect_count = len(redirects) if isinstance(redirects, list) else 0
+    return validated_url, min(redirect_count, JTBYPASS_MAX_REDIRECTS)
+
+
+def _resolve_public_redirect(raw_url: str) -> tuple[str, int]:
+    """Retorna a URL final de redirects públicos, com API sem chave e fallback local."""
+    start_url = _validate_jtbypass_url(raw_url, entry=True)
+    if JTBYPASS_REMOTE_API_ENABLED:
+        try:
+            return _resolve_public_redirect_remote(start_url)
+        except JtBypassError as exc:
+            logger.info("Fallback local do JtBypass após falha da API pública: %s", exc)
+    return _resolve_public_redirect_local(start_url)
 
 
 def _retry_backoff(attempt: int) -> float:
@@ -2347,12 +2407,13 @@ async def cmd_jtbypass(update: Update, context: ContextTypes.DEFAULT_TYPE):
         detail = f"{redirect_count} redirecionamento(s) HTTP"
     else:
         detail = "nenhum redirecionamento HTTP"
+    safe_final_url = _safe_html(final_url)
     await _reply_and_cleanup(
         update,
         "✅ <b>Destino público encontrado</b>\n"
         f"🔁 {detail}.\n"
-        f"🔗 <code>{_safe_html(final_url)}</code>\n\n"
-        "O comando segue somente redirecionamentos HTTP(S) públicos; não executa JavaScript nem baixa arquivos.",
+        f"🔗 <a href=\"{safe_final_url}\">{safe_final_url}</a>\n\n"
+        "O comando retorna a URL final observada em redirects HTTP(S) públicos; não executa JavaScript nem baixa arquivos.",
     )
 
 
@@ -2387,7 +2448,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>.lock</code> — fecha o grupo para membros; administradores e o dono continuam podendo falar.\n"
         "<code>.unlock</code> — abre o grupo e restaura as permissões anteriores.\n"
         "<code>.latency</code> — mede uma chamada real à API do Telegram.\n"
-        "<code>.jtbypass URL</code> — owner-only; segue redirecionamentos HTTP(S) públicos de alpharede.com e monteolympus.com.\n"
+        "<code>.jtbypass URL</code> — owner-only; retorna a URL final de redirects HTTP(S) públicos de alpharede.com e monteolympus.com, com consulta local e fallback público.\n"
         "O <code>.jtbypass</code> não contorna captcha, login, anúncios obrigatórios, monetização ou proteções anti-bot.\n"
         "<code>.divulgar 30m on</code> — cria uma nova agenda para texto, foto ou vídeo respondido.\n"
         "<code>.divulgar list</code> — lista as agendas ativas com seus IDs.\n"

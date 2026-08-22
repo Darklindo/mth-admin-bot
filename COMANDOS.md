@@ -21,7 +21,7 @@ A V9.0 possui duas superfícies independentes. O **Bot API** usa somente comando
 | `.lock` | Fecha o envio de mensagens para membros comuns; administradores e o dono do grupo continuam podendo enviar, e o Bot API permanece operacional. | Somente `OWNER_IDS` |
 | `.unlock` | Abre o grupo e restaura as permissões anteriores salvas pelo Bot API. | Somente `OWNER_IDS` |
 | `.latency` | Mede uma chamada real à API e informa idade do update, fila local, exclusões, duração dos comandos, retries, falhas de polling e último erro observado. | Owners ou autorizados |
-| `.jtbypass URL` | Segue somente redirecionamentos HTTP(S) públicos de `alpharede.com` e `monteolympus.com`, sem executar JavaScript ou baixar arquivos. Não contorna captcha, login, monetização ou proteção anti-bot. | Somente `OWNER_IDS` |
+| `.jtbypass URL` | Retorna a URL final de redirecionamentos HTTP(S) públicos de `alpharede.com` e `monteolympus.com`, com consulta local e fallback público; o resultado é clicável. Não contorna captcha, login, monetização ou proteção anti-bot. | Somente `OWNER_IDS` |
 | `.divulgar 30m on` | Cria uma nova republicação periódica de uma mensagem de texto, foto ou vídeo respondido no grupo atual. Aceita intervalos de `30s` a `30d`. | Somente `OWNER_IDS` |
 | `.divulgar list` | Lista as divulgações ativas do grupo e seus `schedule_id`. | Somente `OWNER_IDS` |
 | `.divulgar off ID` | Desliga somente a divulgação identificada pelo `schedule_id`. | Somente `OWNER_IDS` |
