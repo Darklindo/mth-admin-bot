@@ -8,7 +8,7 @@ Projeto de administração para Telegram com dois processos independentes no Ter
 
 | Processo | Arquivo | Prefixo | Acesso | Banco |
 |---|---|---|---|---|
-| Bot comum | `bot.py` | `.` | Somente os dois `OWNER_IDS`; administradores comuns não recebem respostas | `data/bot_api.db` |
+| Bot comum | `bot.py` | `.` | Owners têm acesso total; usuários autorizados pelo `.jt` têm acesso delegado por grupo | `data/bot_api.db` |
 | Userbot | `bot_v2.py` | `.` | Somente o `OWNER_ID` configurado | `data/bot.db` |
 
 O Bot API e o Userbot não compartilham sessão, token, banco nem estado de autorização. O Userbot não possui mais subproprietários ou autorização delegada; os comandos `.autorizar`, `.desautorizar` e `.listauth` não fazem parte da superfície operacional da V9.0.
@@ -21,18 +21,19 @@ O bot comum oferece moderação local e global e responde somente a comandos ini
 
 | Comando | Função | Permissão |
 |---|---|---|
-| `.blacklist` | Cadastra o alvo na blacklist local do grupo e apaga as mensagens dele enquanto o bot estiver ativo | Somente `OWNER_IDS` |
-| `.blacklist list [página]` | Lista a blacklist local em páginas limitadas com IDs e motivos disponíveis | Somente `OWNER_IDS` |
-| `.unblacklist` | Remove o alvo da blacklist local do grupo | Somente `OWNER_IDS` |
-| `.jtperm` | Bane imediatamente o alvo no grupo atual e bloqueia automaticamente uma reentrada | Somente `OWNER_IDS` |
-| `.jtperm list [página]` | Lista os banimentos permanentes do grupo atual em páginas limitadas | Somente `OWNER_IDS` |
-| `.unjtperm` | Retira o banimento permanente do alvo no grupo atual | Somente `OWNER_IDS` |
+| `.help` | Exibe a ajuda operacional do Bot API | `OWNER_IDS` ou usuário autorizado pelo `.jt` |
+| `.blacklist` | Cadastra o alvo na blacklist local do grupo e apaga as mensagens dele enquanto o bot estiver ativo | `OWNER_IDS` ou usuário autorizado pelo `.jt` |
+| `.blacklist list [página]` | Lista a blacklist local em páginas limitadas com IDs e motivos disponíveis | `OWNER_IDS` ou usuário autorizado pelo `.jt` |
+| `.unblacklist` | Remove o alvo da blacklist local do grupo | `OWNER_IDS` ou usuário autorizado pelo `.jt` |
+| `.jtperm` | Bane imediatamente o alvo no grupo atual e bloqueia automaticamente uma reentrada | `OWNER_IDS` ou usuário autorizado pelo `.jt` |
+| `.jtperm list [página]` | Lista os banimentos permanentes do grupo atual em páginas limitadas | `OWNER_IDS` ou usuário autorizado pelo `.jt` |
+| `.unjtperm` | Retira o banimento permanente do alvo no grupo atual | `OWNER_IDS` ou usuário autorizado pelo `.jt` |
 | `.jtbn` | Registra o alvo na lista global JTBN e tenta bani-lo em todos os grupos conhecidos | Somente um dos `OWNER_IDS` |
 | `.jtbn list [página]` | Lista os usuários registrados no JTBN global em páginas limitadas | Somente um dos `OWNER_IDS` |
 | `.unjtbn` | Remove o alvo da lista global JTBN e tenta desbaní-lo nos grupos conhecidos | Somente um dos `OWNER_IDS` |
 | `.lock` | Fecha o grupo para membros comuns; administradores e o dono do grupo continuam podendo enviar | Somente `OWNER_IDS` |
 | `.unlock` | Abre o grupo e restaura as permissões anteriores salvas pelo Bot API | Somente `OWNER_IDS` |
-| `.latency` | Mede uma chamada real à API do Telegram | Somente `OWNER_IDS` |
+| `.latency` | Mede uma chamada real à API do Telegram | `OWNER_IDS` ou usuário autorizado pelo `.jt` |
 | `.divulgar 30m on` | Cria uma nova republicação de texto, foto ou vídeo respondido no grupo atual | Somente `OWNER_IDS` |
 | `.divulgar list` | Lista as agendas ativas e seus IDs | Somente `OWNER_IDS` |
 | `.divulgar off ID` | Desliga uma agenda específica pelo ID | Somente `OWNER_IDS` |
@@ -41,13 +42,13 @@ O bot comum oferece moderação local e global e responde somente a comandos ini
 | `.spam N texto` | Repete o texto informado; em uma resposta, combina texto/legenda ou envia complemento para mídia sem legenda | Somente `OWNER_IDS` |
 | `.spam off` | Cancela o spam em andamento no grupo atual | Somente `OWNER_IDS` |
 
-As listas aceitam uma página opcional, por exemplo `.blacklist list 2` e `.jtbn list 2`, e consultam o SQLite com limite e deslocamento para não carregar registros desnecessários. O banco mantém a lista por chat e o Bot API possui cache próprio. A nomenclatura pública global é **JTBN**: use `.jtbn`, `.jtbn list` e `.unjtbn`; o nome antigo `.allban` não é mais registrado pelo dispatcher do Bot API. **Somente os dois owners configurados em `OWNER_IDS` recebem respostas e executam comandos; administradores comuns não têm acesso ao dispatcher.** O bot precisa estar presente e ter permissões administrativas para apagar mensagens ou restringir usuários; os comandos globais só podem alcançar grupos nos quais ele esteja presente e autorizado.
+As listas aceitam uma página opcional, por exemplo `.blacklist list 2` e `.jtbn list 2`, e consultam o SQLite com limite e deslocamento para não carregar registros desnecessários. O banco mantém a lista por chat e o Bot API possui cache próprio. A nomenclatura pública global é **JTBN**: use `.jtbn`, `.jtbn list` e `.unjtbn`; o nome antigo `.allban` não é mais registrado pelo dispatcher do Bot API. **Somente os dois owners configurados em `OWNER_IDS` podem usar `.jt`, `.jtbn`, `.unjtbn`, `.lock`, `.unlock`, `.divulgar` e `.spam`; usuários autorizados pelo `.jt` podem usar apenas `.help`, `.blacklist`, `.unblacklist`, `.jtperm`, `.unjtperm` e `.latency`, somente no grupo em que foram autorizados.** Usuários não autorizados, inclusive administradores comuns, permanecem silenciosos. O bot precisa estar presente e ter permissões administrativas para apagar mensagens ou restringir usuários; os comandos globais só podem alcançar grupos nos quais ele esteja presente e autorizado.
 
 O comando `.lock` salva as permissões padrão atuais do grupo no banco e bloqueia o envio para membros comuns. Administradores e o dono do grupo continuam podendo enviar mensagens, e o Bot API continua podendo publicar e administrar o grupo. `.unlock` restaura o snapshot anterior; ambos são idempotentes e não deixam um lock incompleto salvo se o Telegram recusar a alteração.
 
 O comando `.divulgar 30m on` deve ser enviado em resposta a uma mensagem de texto, foto ou vídeo. Cada ativação cria uma nova agenda independente, identificada por `schedule_id`, permitindo várias divulgações no mesmo grupo — por exemplo, uma a cada 20 minutos e outra a cada 30 minutos. O bot republica o texto ou a mídia com sua legenda a cada intervalo entre 30 segundos e 30 dias, com limite de 32 agendas por grupo. Use `.divulgar list` para consultar os IDs, `.divulgar off ID` para cancelar uma específica e `.divulgar off all` para cancelar todas. Se houver apenas uma agenda, `.divulgar off` também a desliga; com várias, o comando mostra a lista e evita cancelamento acidental. Os agendamentos são salvos no banco e restaurados após reinícios, desde que o bot continue no grupo e possa enviar mensagens e mídias. O owner `6822870889` (`@OnlyExaltarei`) recebe no privado a confirmação da ativação, o primeiro horário, cada confirmação de envio com o próximo horário, o desligamento e alertas de falha com limitação para evitar spam de notificações. As notificações são executadas fora do worker principal; se uma mensagem privada falhar, a agenda continua ativa e o próximo ciclo não é bloqueado.
 
-O `.spam` usa uma única execução por grupo, intervalo controlado entre cópias, retries limitados e interrupção ao primeiro erro permanente ou limite do Telegram. O limite máximo é 100 e `.spam off` cancela o worker sem deixar tarefa órfã. Ao responder a uma mensagem, é possível acrescentar texto: em mensagens de texto ele é combinado; em fotos, vídeos e mídias com legenda ele é anexado à legenda; em stickers e mídias sem legenda ele é enviado imediatamente depois da cópia. As respostas e os comandos são removidos automaticamente após alguns segundos. O `.jtperm` bane o usuário imediatamente e acompanha atualizações de entrada; se um banido tentar reentrar, o Bot API reaplica o banimento automaticamente, usando o primeiro texto como fallback caso a atualização de membro não chegue. O bot é deliberadamente independente: não contém o restante dos recursos do Userbot, não aceita autorização de terceiros e não possui subproprietários.
+O `.spam` usa uma única execução por grupo, intervalo controlado entre cópias, retries limitados e interrupção ao primeiro erro permanente ou limite do Telegram. O limite máximo é 100 e `.spam off` cancela o worker sem deixar tarefa órfã. Ao responder a uma mensagem, é possível acrescentar texto: em mensagens de texto ele é combinado; em fotos, vídeos e mídias com legenda ele é anexado à legenda; em stickers e mídias sem legenda ele é enviado imediatamente depois da cópia. As respostas e os comandos são removidos automaticamente após alguns segundos. O `.jtperm` bane o usuário imediatamente e acompanha atualizações de entrada; se um banido tentar reentrar, o Bot API reaplica o banimento automaticamente, usando o primeiro texto como fallback caso a atualização de membro não chegue. O comando `.jt` é exclusivo dos owners e mantém autorizações independentes por grupo; um usuário delegado não ganha acesso a comandos owner-only nem a outro grupo. O bot é deliberadamente independente do Userbot e não possui subproprietários globais.
 
 ## Funções do Userbot
 

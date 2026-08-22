@@ -6,18 +6,21 @@ A V9.0 possui duas superfícies independentes. O **Bot API** usa somente comando
 
 | Comando | Função | Acesso |
 |---|---|---|
-| `.blacklist` | Registra o alvo na blacklist local do grupo atual e apaga mensagens dele enquanto o bot estiver ativo. | Somente `OWNER_IDS` |
-| `.blacklist list [página]` | Lista os usuários da blacklist local em páginas limitadas, com ID e motivo quando houver. | Somente `OWNER_IDS` |
-| `.unblacklist` | Remove o alvo da blacklist local do grupo atual. | Somente `OWNER_IDS` |
-| `.jtperm` | Bane imediatamente o alvo no grupo atual e reaplica o bloqueio se ele tentar reentrar. | Somente `OWNER_IDS` |
-| `.jtperm list [página]` | Lista os banimentos permanentes do grupo atual em páginas limitadas, com ID, username e motivo quando disponíveis. | Somente `OWNER_IDS` |
-| `.unjtperm` | Retira o banimento permanente do alvo no grupo atual. | Somente `OWNER_IDS` |
+| `.jt` | Autoriza um usuário neste grupo por reply, ID ou @username; somente owners podem conceder autorização. | Somente `OWNER_IDS` |
+| `.jt off` | Revoga a autorização de um usuário neste grupo. | Somente `OWNER_IDS` |
+| `.jt list [página]` | Lista os usuários autorizados neste grupo em páginas limitadas. | Somente `OWNER_IDS` |
+| `.blacklist` | Registra o alvo na blacklist local do grupo atual e apaga mensagens dele enquanto o bot estiver ativo. | Owners ou autorizados |
+| `.blacklist list [página]` | Lista os usuários da blacklist local em páginas limitadas, com ID e motivo quando houver. | Owners ou autorizados |
+| `.unblacklist` | Remove o alvo da blacklist local do grupo atual. | Owners ou autorizados |
+| `.jtperm` | Bane imediatamente o alvo no grupo atual e reaplica o bloqueio se ele tentar reentrar. | Owners ou autorizados |
+| `.jtperm list [página]` | Lista os banimentos permanentes do grupo atual em páginas limitadas, com ID, username e motivo quando disponíveis. | Owners ou autorizados |
+| `.unjtperm` | Retira o banimento permanente do alvo no grupo atual. | Owners ou autorizados |
 | `.jtbn` | Registra o alvo na lista global JTBN e tenta bani-lo em todos os grupos conhecidos do Bot API. | Somente um dos `OWNER_IDS` |
 | `.jtbn list [página]` | Lista os usuários registrados no JTBN global em páginas limitadas. | Somente um dos `OWNER_IDS` |
 | `.unjtbn` | Remove o alvo da lista global JTBN e tenta desbaní-lo nos grupos conhecidos. | Somente um dos `OWNER_IDS` |
 | `.lock` | Fecha o envio de mensagens para membros comuns; administradores e o dono do grupo continuam podendo enviar, e o Bot API permanece operacional. | Somente `OWNER_IDS` |
 | `.unlock` | Abre o grupo e restaura as permissões anteriores salvas pelo Bot API. | Somente `OWNER_IDS` |
-| `.latency` | Mede uma chamada real à API e informa idade do update, fila local, exclusões, duração dos comandos, retries, falhas de polling e último erro observado. | Somente `OWNER_IDS` |
+| `.latency` | Mede uma chamada real à API e informa idade do update, fila local, exclusões, duração dos comandos, retries, falhas de polling e último erro observado. | Owners ou autorizados |
 | `.divulgar 30m on` | Cria uma nova republicação periódica de uma mensagem de texto, foto ou vídeo respondido no grupo atual. Aceita intervalos de `30s` a `30d`. | Somente `OWNER_IDS` |
 | `.divulgar list` | Lista as divulgações ativas do grupo e seus `schedule_id`. | Somente `OWNER_IDS` |
 | `.divulgar off ID` | Desliga somente a divulgação identificada pelo `schedule_id`. | Somente `OWNER_IDS` |
@@ -26,7 +29,7 @@ A V9.0 possui duas superfícies independentes. O **Bot API** usa somente comando
 | `.spam N texto` | Envia o texto informado N vezes; quando usado em resposta, combina o texto com a fonte ou envia complemento para mídias sem legenda. | Somente `OWNER_IDS` |
 | `.spam off` | Cancela o spam em andamento no grupo atual. | Somente `OWNER_IDS` |
 
-Todos os comandos aceitam reply à mensagem do alvo ou ID/username conhecido, mas **somente os dois owners configurados em `OWNER_IDS` recebem respostas e executam comandos**. Administradores comuns não têm acesso ao dispatcher do bot. O Bot API ainda precisa estar no grupo e possuir as permissões administrativas correspondentes para realizar as ações. A função JTBN não consegue operar em chats que o bot não conhece, não acessa ou onde não pode restringir membros. O banco do Bot API é separado do banco do Userbot.
+Os comandos delegáveis aceitam reply à mensagem do alvo ou ID/username conhecido. Os dois owners configurados em `OWNER_IDS` têm acesso total; usuários autorizados pelo `.jt` podem usar somente blacklist, jtperm, unblacklist, unjtperm, latency e help neste grupo. `.jt`, JTBN, lock/unlock, divulgar e spam continuam exclusivos dos owners. Administradores comuns e usuários não autorizados permanecem silenciosos. O Bot API ainda precisa estar no grupo e possuir as permissões administrativas correspondentes para realizar as ações. A função JTBN não consegue operar em chats que o bot não conhece, não acessa ou onde não pode restringir membros. O banco do Bot API é separado do banco do Userbot.
 
 As ações da Bot API usam retries limitados com backoff para falhas transitórias e `RetryAfter`, sem transformar erros permanentes de permissão ou conteúdo em loops infinitos. O polling possui conexão própria, e o watchdog monitora o processo e o arquivo `data/bot_api.heartbeat`; se o event loop travar e o heartbeat ficar obsoleto, somente o Bot API é reiniciado. O Userbot permanece desligado.
 
@@ -54,7 +57,7 @@ Todos os comandos do Userbot usam `.`. Para evitar conflito com o Group Help, so
 
 Todos os demais comandos permanecem com o prefixo normal, como `.kick`, `.lock`, `.infojt` e `.exu`.
 
-> **Acesso:** na V9.0 não existem subproprietários nem autorização de terceiros. Os comandos `.autorizar`, `.desautorizar` e `.listauth` foram removidos. Somente o `OWNER_ID` usa o Userbot.
+> **Acesso:** no Bot API, `.jt` é a autorização delegada por grupo. Ela não concede acesso a `.jt`, JTBN, `.lock`, `.unlock`, `.divulgar` ou `.spam`; esses comandos continuam exclusivos dos owners. No Userbot, não existem subproprietários nem autorização de terceiros: os comandos `.autorizar`, `.desautorizar` e `.listauth` foram removidos, e somente o `OWNER_ID` usa o Userbot.
 
 ## Moderação local
 

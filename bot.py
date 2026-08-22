@@ -123,6 +123,12 @@ SPAM_MAX_TEXT_LENGTH = 4096
 SPAM_MAX_CAPTION_LENGTH = 1024
 SPAM_SUPPORTED_TYPES = {"text", "photo", "video", "animation", "document", "audio", "voice", "sticker"}
 
+# `.jt` é exclusivo dos owners. Usuários autorizados pelo owner podem usar
+# somente os comandos explicitamente listados aqui, sempre dentro do grupo em
+# que foram autorizados; não existe elevação de privilégio entre grupos.
+OWNER_ONLY_COMMANDS = frozenset({"jt", "jtbn", "unjtbn", "lock", "unlock", "divulgar", "spam"})
+DELEGATED_COMMANDS = frozenset({"help", "blacklist", "unblacklist", "jtperm", "unjtperm", "latency"})
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -201,6 +207,16 @@ class Database:
                     added_by INTEGER NOT NULL,
                     created_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS authorized_users (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT NOT NULL DEFAULT '',
+                    full_name TEXT NOT NULL DEFAULT '',
+                    added_by INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(chat_id, user_id)
+                );
                 CREATE TABLE IF NOT EXISTS chat_locks (
                     chat_id INTEGER PRIMARY KEY,
                     permissions_json TEXT NOT NULL,
@@ -229,6 +245,7 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_blacklist_chat_created ON blacklist(chat_id,created_at,user_id);
                 CREATE INDEX IF NOT EXISTS idx_banperm_chat ON banperm(chat_id);
                 CREATE INDEX IF NOT EXISTS idx_allban_created ON allban(created_at,user_id);
+                CREATE INDEX IF NOT EXISTS idx_authorized_users_chat ON authorized_users(chat_id,created_at,user_id);
                 """
             )
             columns = {row[1] for row in self.conn.execute("PRAGMA table_info(divulgacoes)").fetchall()}
@@ -468,6 +485,71 @@ class Database:
         row = self._fetchone("SELECT 1 FROM allban WHERE user_id=? LIMIT 1", (int(user_id),))
         return row is not None
 
+    def load_authorized_users(self):
+        return self._fetchall(
+            "SELECT chat_id,user_id FROM authorized_users"
+        )
+
+    def add_authorized(self, target: Target, chat_id: int, added_by: int) -> bool:
+        now = int(time.time())
+        cursor = self._execute(
+            """
+            INSERT INTO authorized_users(chat_id,user_id,username,full_name,added_by,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(chat_id,user_id) DO UPDATE SET
+                username=excluded.username,
+                full_name=excluded.full_name,
+                added_by=excluded.added_by,
+                updated_at=excluded.updated_at
+            """,
+            (
+                int(chat_id), target.user_id, target.username, target.full_name,
+                int(added_by), now, now,
+            ),
+            commit=True,
+        )
+        return cursor.rowcount >= 0
+
+    def remove_authorized(self, user_id: int, chat_id: int) -> bool:
+        cursor = self._execute(
+            "DELETE FROM authorized_users WHERE chat_id=? AND user_id=?",
+            (int(chat_id), int(user_id)),
+            commit=True,
+        )
+        return cursor.rowcount > 0
+
+    def remove_all_authorized(self, chat_id: int) -> int:
+        cursor = self._execute(
+            "DELETE FROM authorized_users WHERE chat_id=?",
+            (int(chat_id),),
+            commit=True,
+        )
+        return int(cursor.rowcount)
+
+    def has_authorized(self, user_id: int, chat_id: int) -> bool:
+        row = self._fetchone(
+            "SELECT 1 FROM authorized_users WHERE chat_id=? AND user_id=? LIMIT 1",
+            (int(chat_id), int(user_id)),
+        )
+        return row is not None
+
+    def count_authorized_for_chat(self, chat_id: int) -> int:
+        row = self._fetchone(
+            "SELECT COUNT(*) AS total FROM authorized_users WHERE chat_id=?",
+            (int(chat_id),),
+        )
+        return int(row["total"] if row else 0)
+
+    def get_authorized_for_chat_page(self, chat_id: int, limit: int, offset: int):
+        return self._fetchall(
+            """
+            SELECT user_id,username,full_name,added_by,created_at
+            FROM authorized_users WHERE chat_id=?
+            ORDER BY created_at,user_id LIMIT ? OFFSET ?
+            """,
+            (int(chat_id), max(1, int(limit)), max(0, int(offset))),
+        )
+
     def remove_blacklist(self, user_id: int, chat_id: int) -> bool:
         cursor = self._execute(
             "DELETE FROM blacklist WHERE chat_id=? AND user_id=?",
@@ -628,9 +710,17 @@ class Database:
 db = Database(DB_PATH)
 try:
     KNOWN_CHAT_IDS, KNOWN_USERS, BLACKLIST_CACHE, BANPERM_CACHE, JTBN_CACHE = db.load_state()
+    _authorized_rows = db.load_authorized_users()
 except sqlite3.Error:
     logger.exception("Falha ao carregar o estado do banco do Bot API")
     raise
+
+AUTHORIZED_CACHE: dict[int, set[int]] = defaultdict(set)
+for _authorized_row in _authorized_rows:
+    try:
+        AUTHORIZED_CACHE[int(_authorized_row["chat_id"])].add(int(_authorized_row["user_id"]))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        logger.warning("Registro de autorização inválido ignorado no startup: %r", tuple(_authorized_row))
 
 BOT_USER_ID = 0
 _cleanup_tasks: set[asyncio.Task] = set()
@@ -830,11 +920,14 @@ def _format_user_list(
     lines = []
     for row in rows[:LIST_MAX_VISIBLE_ENTRIES]:
         user_id = int(row["user_id"])
-        username = (row["username"] or "").strip().lstrip("@")
+        keys = set(row.keys()) if hasattr(row, "keys") else set()
+        username = (row["username"] or "").strip().lstrip("@") if "username" in keys else ""
+        row_full_name = row["full_name"] if "full_name" in keys else ""
         known_username, known_full_name = KNOWN_USERS.get(user_id, ("", ""))
-        target = Target(user_id, username or known_username, known_full_name)
+        target = Target(user_id, username or known_username, str(row_full_name or known_full_name))
         label = _safe_html(target.label)
-        reason = " ".join(str(row["reason"] or "").split())[:LIST_REASON_MAX_CHARS]
+        reason_value = row["reason"] if "reason" in keys else ""
+        reason = " ".join(str(reason_value or "").split())[:LIST_REASON_MAX_CHARS]
         reason_text = f" — {_safe_html(reason)}" if reason else ""
         lines.append(f"• <b>{label}</b> (<code>{user_id}</code>){reason_text}")
 
@@ -1582,6 +1675,25 @@ async def _require_owner_access(update: Update, context: ContextTypes.DEFAULT_TY
     return False
 
 
+async def _require_command_access(update: Update, context: ContextTypes.DEFAULT_TYPE, command: str) -> bool:
+    """Autoriza owners e usuários delegados somente nos comandos não restritos."""
+    if not _is_group(update):
+        await _reply_and_cleanup(update, "❌ Este comando só pode ser usado em grupos ou supergrupos.")
+        return False
+    user = update.effective_user
+    if not user:
+        return False
+    if _is_owner(user.id):
+        return True
+    if command not in DELEGATED_COMMANDS or command in OWNER_ONLY_COMMANDS:
+        return False
+    chat = update.effective_chat
+    if chat and user.id in AUTHORIZED_CACHE.get(int(chat.id), set()):
+        return True
+    # Usuários comuns continuam silenciosos, como no contrato anterior.
+    return False
+
+
 async def _bot_can_restrict(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     global BOT_USER_ID
     if not BOT_USER_ID:
@@ -1698,6 +1810,102 @@ async def _safe_delete(message) -> bool:
         return True
     except (BadRequest, Forbidden, TelegramError):
         return False
+
+
+async def cmd_jt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gerencia usuários autorizados por grupo; o comando permanece exclusivo dos owners."""
+    if not await _require_owner_access(update, context):
+        return
+    chat = update.effective_chat
+    operator = update.effective_user
+    if not chat or not operator:
+        return
+    chat_id = int(chat.id)
+    args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
+    action = args[0].lower() if args else "add"
+
+    if action == "list":
+        if len(args) > 2:
+            await _reply_and_cleanup(update, "❌ Uso: <code>.jt list</code> ou <code>.jt list N</code>.")
+            return
+        page = 1
+        if len(args) == 2:
+            page = _parse_list_page(args[1])
+        if page is None or page < 1:
+            await _reply_and_cleanup(update, "❌ O número da página deve ser um inteiro positivo.")
+            return
+        total, rows = await asyncio.gather(
+            _db_call(db.count_authorized_for_chat, chat_id),
+            _db_call(db.get_authorized_for_chat_page, chat_id, LIST_MAX_VISIBLE_ENTRIES, (page - 1) * LIST_MAX_VISIBLE_ENTRIES),
+        )
+        await _reply_and_cleanup(
+            update,
+            _format_user_list(
+                rows,
+                total=total,
+                page=page,
+                title="✅ <b>Usuários autorizados</b>",
+                empty_text="ℹ️ Não há usuários autorizados neste grupo.",
+                scope_text="Eles podem usar somente os comandos delegáveis do Bot API.",
+                next_page_command=".jt list",
+            ),
+        )
+        return
+
+    revoke = action in {"off", "remove", "revoke", "revogar", "remover"}
+    target_args = args[1:] if revoke else args
+    if len(target_args) > 1:
+        await _reply_and_cleanup(
+            update,
+            "❌ Informe apenas um alvo por vez: responda à mensagem, use um ID ou um @username.",
+        )
+        return
+    original_args = getattr(context, "args", None)
+    context.args = target_args
+    try:
+        target = await _resolve_target(update, context)
+    finally:
+        context.args = original_args
+    if target is None:
+        command = ".jt off" if revoke else ".jt"
+        await _reply_and_cleanup(
+            update,
+            f"❌ Uso: <code>{command}</code> respondendo à mensagem do usuário, ou "
+            f"<code>{command} ID/@username</code>. Para consultar: <code>.jt list</code>.",
+        )
+        return
+    if _is_owner(target.user_id):
+        await _reply_and_cleanup(update, "ℹ️ Os owners já têm acesso total e não precisam ser autorizados.")
+        return
+
+    already_authorized = target.user_id in AUTHORIZED_CACHE.get(chat_id, set())
+    if not already_authorized:
+        already_authorized = await _db_call(db.has_authorized, target.user_id, chat_id)
+
+    if revoke:
+        removed = await _db_call(db.remove_authorized, target.user_id, chat_id)
+        AUTHORIZED_CACHE.get(chat_id, set()).discard(target.user_id)
+        if removed:
+            await _reply_and_cleanup(update, f"✅ <b>{_safe_html(target.label)}</b> não pode mais usar os comandos delegáveis neste grupo.")
+        elif already_authorized:
+            await _reply_and_cleanup(update, f"ℹ️ A autorização de <b>{_safe_html(target.label)}</b> já não estava registrada no banco.")
+        else:
+            await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> não estava autorizado neste grupo.")
+        return
+
+    added = await _db_call(db.add_authorized, target, chat_id, operator.id)
+    if not added:
+        await _reply_and_cleanup(update, "❌ Não foi possível persistir a autorização.")
+        return
+    AUTHORIZED_CACHE[chat_id].add(target.user_id)
+    if already_authorized:
+        await _reply_and_cleanup(update, f"ℹ️ <b>{_safe_html(target.label)}</b> já estava autorizado neste grupo; os dados foram atualizados.")
+    else:
+        await _reply_and_cleanup(
+            update,
+            f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) foi autorizado neste grupo.\n"
+            "Ele pode usar apenas os comandos delegáveis; comandos de gestão e owner continuam bloqueados.",
+        )
 
 
 async def cmd_divulgar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2000,10 +2208,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_command_access(update, context, "help"):
+        return
     await _reply_and_cleanup(
         update,
         "🛡️ <b>Jtzin Administrator Bot</b>\n\n"
         "<b>Comandos disponíveis</b>\n"
+        "<code>.jt</code> — owner autoriza um usuário por reply, ID ou @username neste grupo.\n"
+        "<code>.jt off</code> — revoga a autorização de um usuário; <code>.jt list [página]</code> lista os autorizados.\n"
+        "Usuários autorizados podem usar apenas <code>.help</code>, <code>.blacklist</code>, <code>.unblacklist</code>, <code>.jtperm</code>, <code>.unjtperm</code> e <code>.latency</code>; comandos owner permanecem bloqueados.\n"
         "<code>.blacklist</code> — adiciona o alvo à blacklist deste grupo.\n"
         "<code>.blacklist list</code> — lista a blacklist local deste grupo.\n"
         "<code>.unblacklist</code> — remove a blacklist local.\n"
@@ -2024,7 +2237,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Em sticker ou mídia sem legenda, o texto adicional é enviado logo após a cópia; <code>.spam off</code> cancela.\n"
         "O spam aceita texto, foto, vídeo, GIF, sticker, documento, áudio, voz e outras mídias copiáveis.\n"
         "Cada envio usa retry isolado e uma falha de notificação privada não interrompe o agendamento.\n\n"
-        "Somente os dois proprietários configurados podem usar e receber respostas deste bot. "
+        "Somente os dois proprietários configurados têm acesso total; usuários autorizados pelo <code>.jt</code> recebem somente os comandos delegáveis deste grupo. "
         "A moderação local ainda exige que o bot seja administrador com permissão para apagar mensagens "
         "e restringir membros.",
     )
@@ -2246,7 +2459,7 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_latency(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _require_operator(update, context):
+    if not await _require_command_access(update, context, "latency"):
         return
     started = time.perf_counter()
     try:
@@ -2286,7 +2499,7 @@ async def cmd_latency(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_unblacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _require_owner_access(update, context):
+    if not await _require_command_access(update, context, "unblacklist"):
         return
     target = await _resolve_target(update, context)
     if target is None:
@@ -2302,7 +2515,7 @@ async def cmd_unblacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_and_cleanup(update, f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) removido da blacklist local.")
 
 
-DOT_COMMAND_RE = re.compile(r"^\.(help|unblacklist|unjtperm|unjtbn|blacklist|jtperm|jtbn|lock|unlock|latency|divulgar|spam)(?:\s+.*)?$", re.IGNORECASE)
+DOT_COMMAND_RE = re.compile(r"^\.(help|jt|unblacklist|unjtperm|unjtbn|blacklist|jtperm|jtbn|lock|unlock|latency|divulgar|spam)(?:\s+.*)?$", re.IGNORECASE)
 DOT_COMMANDS = {
     "help": "cmd_help",
     "blacklist": "cmd_blacklist",
@@ -2316,6 +2529,7 @@ DOT_COMMANDS = {
     "latency": "cmd_latency",
     "divulgar": "cmd_divulgar",
     "spam": "cmd_spam",
+    "jt": "cmd_jt",
 }
 
 
@@ -2325,14 +2539,16 @@ async def on_dot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     match = DOT_COMMAND_RE.fullmatch(text)
     if not match:
         return
+    parts = text.split()
+    command = parts[0][1:].lower()
     if not message.from_user or not _is_owner(message.from_user.id):
-        # Não responder, não editar e não enviar mensagem para qualquer não-owner.
-        return
+        # Não owners só passam se o comando estiver delegado neste grupo.
+        if not message.from_user or command not in DELEGATED_COMMANDS or not await _require_command_access(update, context, command):
+            # Não responder, não editar e não enviar mensagem a usuários não autorizados.
+            return
     if len(text) > COMMAND_ARGUMENT_MAX_CHARS:
         await _reply_and_cleanup(update, f"❌ O comando excede o limite de {COMMAND_ARGUMENT_MAX_CHARS} caracteres.")
         return
-    parts = text.split()
-    command = parts[0][1:].lower()
     handler_name = DOT_COMMANDS.get(command)
     handler = globals().get(handler_name) if handler_name else None
     if handler is None:
@@ -2364,7 +2580,7 @@ async def on_dot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _require_owner_access(update, context):
+    if not await _require_command_access(update, context, "blacklist"):
         return
     args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
     chat_id = int(update.effective_chat.id)
@@ -2427,7 +2643,7 @@ async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_banperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _require_owner_access(update, context):
+    if not await _require_command_access(update, context, "jtperm"):
         return
     args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
     chat_id = int(update.effective_chat.id)
@@ -2498,7 +2714,7 @@ async def cmd_banperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_unbanperm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _require_owner_access(update, context):
+    if not await _require_command_access(update, context, "unjtperm"):
         return
     target = await _resolve_target(update, context)
     if target is None:
