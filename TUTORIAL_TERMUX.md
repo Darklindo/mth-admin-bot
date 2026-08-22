@@ -123,6 +123,8 @@ O Bot API responde somente a comandos iniciados por `.`, e o menu nativo de coma
 .lock
 .unlock
 .latency
+.jtbypass https://alpharede.com/seu-link  # somente owner; redirect HTTP público
+.jtbypass https://monteolympus.com/seu-link # somente owner; redirect HTTP público
 .divulgar 30m on
 .divulgar list
 .divulgar off ID
@@ -132,7 +134,9 @@ O Bot API responde somente a comandos iniciados por `.`, e o menu nativo de coma
 .spam off             # cancelar execução atual
 ```
 
-As listas aceitam uma página opcional, por exemplo `.blacklist list 2` e `.jtbn list 2`; o Bot API consulta somente a página solicitada no SQLite. Responda à mensagem do alvo ou informe um ID numérico. Usernames só podem ser resolvidos quando o bot já os conhece ou quando foram registrados anteriormente. **Somente os dois owners configurados em `OWNER_IDS` podem usar `.jt`, `.jtbn`, `.unjtbn`, `.lock`, `.unlock`, `.divulgar` e `.spam`.** Um owner pode usar `.jt` respondendo à mensagem, com ID ou com `@username`; a autorização vale somente para o grupo atual. O usuário autorizado pode usar apenas `.help`, `.blacklist`, `.unblacklist`, `.jtperm`, `.unjtperm` e `.latency` nesse grupo. Usuários não autorizados, inclusive administradores comuns, não recebem respostas e não executam comandos. O Bot API ainda precisa ter as permissões administrativas correspondentes para realizar as ações. `.jtbn` e `.unjtbn` também são exclusivos dos dois IDs e tentam operar nos chats conhecidos em que o bot tenha acesso.
+As listas aceitam uma página opcional, por exemplo `.blacklist list 2` e `.jtbn list 2`; o Bot API consulta somente a página solicitada no SQLite. Responda à mensagem do alvo ou informe um ID numérico. Usernames só podem ser resolvidos quando o bot já os conhece ou quando foram registrados anteriormente. **Somente os dois owners configurados em `OWNER_IDS` podem usar `.jt`, `.jtbn`, `.unjtbn`, `.lock`, `.unlock`, `.divulgar`, `.spam` e `.jtbypass`.** Um owner pode usar `.jt` respondendo à mensagem, com ID ou com `@username`; a autorização vale somente para o grupo atual. O usuário autorizado pode usar apenas `.help`, `.blacklist`, `.unblacklist`, `.jtperm`, `.unjtperm` e `.latency` nesse grupo. Usuários não autorizados, inclusive administradores comuns, não recebem respostas e não executam comandos. O Bot API ainda precisa ter as permissões administrativas correspondentes para realizar as ações. `.jtbn` e `.unjtbn` também são exclusivos dos dois IDs e tentam operar nos chats conhecidos em que o bot tenha acesso.
+
+O `.jtbypass` aceita somente URLs iniciadas em `alpharede.com` ou `monteolympus.com` e segue até oito redirecionamentos HTTP(S) públicos usando HEAD, sem executar JavaScript ou baixar arquivos. Ele não contorna captcha, login, anúncios obrigatórios, monetização, tokens protegidos ou proteção anti-bot; quando o destino exigir interação no navegador, o bot informa que não encontrou um redirecionamento público. O resultado é apenas o endereço final observado e não uma garantia de que o conteúdo esteja disponível.
 
 Use `.lock` para fechar o envio de mensagens para membros comuns. Administradores e o dono do grupo continuam liberados, e o Bot API continua podendo enviar mensagens e administrar o chat. O bot salva as permissões padrão anteriores antes de aplicar o bloqueio. Use `.unlock` para restaurar exatamente essas permissões; repetir qualquer um dos comandos não reaplica alterações desnecessárias. O Bot API precisa ser administrador com permissão para restringir membros.
 
@@ -169,7 +173,7 @@ tail -f ~/mth-admin/logs/bot_api.log
 tail -f ~/mth-admin/logs/userbot.log
 ```
 
-O Bot API oferece os comandos de moderação, diagnóstico e divulgação listados acima no modo dot-only. Os owners configurados têm acesso total; autorizações concedidas por `.jt` são independentes por grupo e ficam limitadas aos seis comandos delegáveis: `.help`, `.blacklist`, `.unblacklist`, `.jtperm`, `.unjtperm` e `.latency`. O `.jt` e os comandos de gestão permanecem exclusivos dos owners. O `.latency` exibe a chamada real à API, idade do update, fila local, tempos de exclusão, duração dos comandos, retries de flood/rede, falhas recuperadas do polling e o último erro observado. Use essa separação para diferenciar latência do Telegram de atraso local do Termux. O Userbot oferece `.status`, `.health` e `.latency` quando for reativado. Para interromper o processo atual do Bot API:
+O Bot API oferece os comandos de moderação, diagnóstico, divulgação e resolução limitada de redirects listados acima no modo dot-only. Os owners configurados têm acesso total; autorizações concedidas por `.jt` são independentes por grupo e ficam limitadas aos seis comandos delegáveis: `.help`, `.blacklist`, `.unblacklist`, `.jtperm`, `.unjtperm` e `.latency`. O `.jtbypass` permanece exclusivo dos owners. O `.jt` e os comandos de gestão permanecem exclusivos dos owners. O `.latency` exibe a chamada real à API, idade do update, fila local, tempos de exclusão, duração dos comandos, retries de flood/rede, falhas recuperadas do polling e o último erro observado. Use essa separação para diferenciar latência do Telegram de atraso local do Termux. O Userbot oferece `.status`, `.health` e `.latency` quando for reativado. Para interromper o processo atual do Bot API:
 
 ```bash
 tmux kill-session -t jtzin

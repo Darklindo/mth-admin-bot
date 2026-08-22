@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import math
 from datetime import datetime
 import os
 import re
+import socket
 import sqlite3
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
 from html import escape
@@ -104,6 +109,15 @@ API_RETRY_MAX_SECONDS = 4.0
 HEARTBEAT_INTERVAL_SECONDS = 15.0
 HEARTBEAT_STALE_AFTER_SECONDS = 180.0
 COMMAND_ARGUMENT_MAX_CHARS = 1024
+JTBYPASS_MAX_URL_LENGTH = 2048
+JTBYPASS_MAX_REDIRECTS = 8
+JTBYPASS_TIMEOUT_SECONDS = 8.0
+JTBYPASS_ENTRY_HOSTS = frozenset({
+    "alpharede.com",
+    "www.alpharede.com",
+    "monteolympus.com",
+    "www.monteolympus.com",
+})
 DIVULGAR_MIN_INTERVAL_SECONDS = 30
 DIVULGAR_MAX_INTERVAL_SECONDS = 30 * 24 * 60 * 60
 DIVULGAR_MAX_TEXT_LENGTH = 4096
@@ -126,7 +140,7 @@ SPAM_SUPPORTED_TYPES = {"text", "photo", "video", "animation", "document", "audi
 # `.jt` é exclusivo dos owners. Usuários autorizados pelo owner podem usar
 # somente os comandos explicitamente listados aqui, sempre dentro do grupo em
 # que foram autorizados; não existe elevação de privilégio entre grupos.
-OWNER_ONLY_COMMANDS = frozenset({"jt", "jtbn", "unjtbn", "lock", "unlock", "divulgar", "spam"})
+OWNER_ONLY_COMMANDS = frozenset({"jt", "jtbn", "unjtbn", "lock", "unlock", "divulgar", "spam", "jtbypass"})
 DELEGATED_COMMANDS = frozenset({"help", "blacklist", "unblacklist", "jtperm", "unjtperm", "latency"})
 
 logging.basicConfig(
@@ -995,6 +1009,106 @@ def _track_task(coro):
 
 def _is_transient_api_error(exc: BaseException) -> bool:
     return isinstance(exc, (RetryAfter, TimedOut, NetworkError))
+
+
+class JtBypassError(ValueError):
+    """Falha controlada ao resolver um redirecionamento público."""
+
+
+class _PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
+    max_redirections = JTBYPASS_MAX_REDIRECTS
+
+    def __init__(self):
+        super().__init__()
+        self.redirect_count = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        resolved_url = urllib.parse.urljoin(req.full_url, newurl)
+        self.redirect_count += 1
+        if self.redirect_count > JTBYPASS_MAX_REDIRECTS:
+            raise JtBypassError("limite de redirecionamentos excedido")
+        _validate_jtbypass_url(resolved_url, entry=False)
+        return super().redirect_request(req, fp, code, msg, headers, resolved_url)
+
+
+def _is_public_ip(address: str) -> bool:
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return not (
+        parsed.is_private
+        or parsed.is_loopback
+        or parsed.is_link_local
+        or parsed.is_reserved
+        or parsed.is_multicast
+        or parsed.is_unspecified
+    )
+
+
+def _validate_jtbypass_url(raw_url: str, *, entry: bool) -> str:
+    value = str(raw_url or "").strip()
+    if not value or len(value) > JTBYPASS_MAX_URL_LENGTH:
+        raise JtBypassError("URL vazia ou longa demais")
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise JtBypassError("URL inválida") from exc
+    if scheme not in {"http", "https"} or not hostname:
+        raise JtBypassError("somente URLs HTTP(S) são aceitas")
+    if parsed.username is not None or parsed.password is not None:
+        raise JtBypassError("URLs com credenciais não são aceitas")
+    if port not in {None, 80, 443}:
+        raise JtBypassError("portas personalizadas não são aceitas")
+    try:
+        normalized_host = hostname.encode("idna").decode("ascii").lower().rstrip(".")
+    except UnicodeError as exc:
+        raise JtBypassError("hostname inválido") from exc
+    if entry and normalized_host not in JTBYPASS_ENTRY_HOSTS:
+        raise JtBypassError("o domínio inicial não está permitido")
+    try:
+        resolved_addresses = {
+            result[4][0]
+            for result in socket.getaddrinfo(
+                normalized_host,
+                port or (443 if scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        }
+    except OSError as exc:
+        raise JtBypassError("não foi possível consultar o domínio") from exc
+    if not resolved_addresses or any(not _is_public_ip(address) for address in resolved_addresses):
+        raise JtBypassError("o destino não é um endereço público")
+    return urllib.parse.urlunsplit((scheme, parsed.netloc, parsed.path or "/", parsed.query, parsed.fragment))
+
+
+def _resolve_public_redirect(raw_url: str) -> tuple[str, int]:
+    """Segue apenas redirecionamentos HTTP(S) públicos, sem executar a página."""
+    start_url = _validate_jtbypass_url(raw_url, entry=True)
+    handler = _PublicRedirectHandler()
+    opener = urllib.request.build_opener(handler)
+    request = urllib.request.Request(
+        start_url,
+        headers={
+            "Accept": "*/*",
+            "Cache-Control": "no-cache",
+            "User-Agent": "JtzinBot/1.0 public-redirect-check",
+        },
+        method="HEAD",
+    )
+    try:
+        with opener.open(request, timeout=JTBYPASS_TIMEOUT_SECONDS) as response:
+            final_url = _validate_jtbypass_url(response.geturl(), entry=False)
+    except JtBypassError:
+        raise
+    except urllib.error.HTTPError as exc:
+        raise JtBypassError(f"resposta HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise JtBypassError("falha de rede ao consultar o link") from exc
+    return final_url, handler.redirect_count
 
 
 def _retry_backoff(attempt: int) -> float:
@@ -2198,6 +2312,50 @@ async def cmd_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_jtbypass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resolve redirecionamentos HTTP(S) públicos de hosts permitidos."""
+    if not await _require_owner_access(update, context):
+        return
+    args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
+    if len(args) != 1:
+        await _reply_and_cleanup(
+            update,
+            "❌ Uso: <code>.jtbypass https://alpharede.com/seu-link</code> ou "
+            "<code>.jtbypass https://monteolympus.com/seu-link</code>.",
+        )
+        return
+    raw_url = args[0]
+    if len(raw_url) > JTBYPASS_MAX_URL_LENGTH:
+        await _reply_and_cleanup(update, f"❌ O link excede o limite de {JTBYPASS_MAX_URL_LENGTH} caracteres.")
+        return
+    try:
+        final_url, redirect_count = await asyncio.to_thread(_resolve_public_redirect, raw_url)
+    except JtBypassError as exc:
+        logger.info("JtBypass recusado: %s", exc)
+        await _reply_and_cleanup(
+            update,
+            "⚠️ Não encontrei um redirecionamento HTTP público permitido. "
+            "O link pode exigir etapas no navegador, captcha, login, monetização ou proteção anti-bot; "
+            "essas barreiras não são contornadas pelo bot.",
+        )
+        return
+    except Exception:
+        logger.exception("Falha inesperada ao resolver JtBypass")
+        await _reply_and_cleanup(update, "❌ Não foi possível consultar o link agora. Tente novamente mais tarde.")
+        return
+    if redirect_count:
+        detail = f"{redirect_count} redirecionamento(s) HTTP"
+    else:
+        detail = "nenhum redirecionamento HTTP"
+    await _reply_and_cleanup(
+        update,
+        "✅ <b>Destino público encontrado</b>\n"
+        f"🔁 {detail}.\n"
+        f"🔗 <code>{_safe_html(final_url)}</code>\n\n"
+        "O comando segue somente redirecionamentos HTTP(S) públicos; não executa JavaScript nem baixa arquivos.",
+    )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_and_cleanup(
         update,
@@ -2229,6 +2387,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>.lock</code> — fecha o grupo para membros; administradores e o dono continuam podendo falar.\n"
         "<code>.unlock</code> — abre o grupo e restaura as permissões anteriores.\n"
         "<code>.latency</code> — mede uma chamada real à API do Telegram.\n"
+        "<code>.jtbypass URL</code> — owner-only; segue redirecionamentos HTTP(S) públicos de alpharede.com e monteolympus.com.\n"
+        "O <code>.jtbypass</code> não contorna captcha, login, anúncios obrigatórios, monetização ou proteções anti-bot.\n"
         "<code>.divulgar 30m on</code> — cria uma nova agenda para texto, foto ou vídeo respondido.\n"
         "<code>.divulgar list</code> — lista as agendas ativas com seus IDs.\n"
         "<code>.divulgar off ID</code> — desliga uma agenda específica; <code>off all</code> desliga todas.\n"
@@ -2515,7 +2675,7 @@ async def cmd_unblacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_and_cleanup(update, f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) removido da blacklist local.")
 
 
-DOT_COMMAND_RE = re.compile(r"^\.(help|jt|unblacklist|unjtperm|unjtbn|blacklist|jtperm|jtbn|lock|unlock|latency|divulgar|spam)(?:\s+.*)?$", re.IGNORECASE)
+DOT_COMMAND_RE = re.compile(r"^\.(help|jt|jtbypass|unblacklist|unjtperm|unjtbn|blacklist|jtperm|jtbn|lock|unlock|latency|divulgar|spam)(?:\s+.*)?$", re.IGNORECASE)
 DOT_COMMANDS = {
     "help": "cmd_help",
     "blacklist": "cmd_blacklist",
@@ -2530,6 +2690,7 @@ DOT_COMMANDS = {
     "divulgar": "cmd_divulgar",
     "spam": "cmd_spam",
     "jt": "cmd_jt",
+    "jtbypass": "cmd_jtbypass",
 }
 
 
