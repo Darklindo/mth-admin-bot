@@ -1,20 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import logging
 import math
 from datetime import datetime
 import os
 import re
-import socket
 import sqlite3
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
 from html import escape
@@ -29,6 +24,7 @@ from telegram.ext import (
     ApplicationBuilder,
     ChatMemberHandler,
     ContextTypes,
+    MessageReactionHandler,
     MessageHandler,
     filters,
 )
@@ -109,20 +105,6 @@ API_RETRY_MAX_SECONDS = 4.0
 HEARTBEAT_INTERVAL_SECONDS = 15.0
 HEARTBEAT_STALE_AFTER_SECONDS = 180.0
 COMMAND_ARGUMENT_MAX_CHARS = 1024
-JTBYPASS_MAX_URL_LENGTH = 2048
-JTBYPASS_MAX_REDIRECTS = 8
-JTBYPASS_TIMEOUT_SECONDS = 8.0
-# Fallback sem chave para redirects HTTP públicos. O serviço pode registrar URLs;
-# por isso a entrada continua limitada aos dois hosts explicitamente permitidos.
-JTBYPASS_REMOTE_API_URL = "https://www.redirectcheck.org/api/check"
-JTBYPASS_REMOTE_API_TIMEOUT_SECONDS = 12.0
-JTBYPASS_REMOTE_API_ENABLED = True
-JTBYPASS_ENTRY_HOSTS = frozenset({
-    "alpharede.com",
-    "www.alpharede.com",
-    "monteolympus.com",
-    "www.monteolympus.com",
-})
 DIVULGAR_MIN_INTERVAL_SECONDS = 30
 DIVULGAR_MAX_INTERVAL_SECONDS = 30 * 24 * 60 * 60
 DIVULGAR_MAX_TEXT_LENGTH = 4096
@@ -145,7 +127,7 @@ SPAM_SUPPORTED_TYPES = {"text", "photo", "video", "animation", "document", "audi
 # `.jt` é exclusivo dos owners. Usuários autorizados pelo owner podem usar
 # somente os comandos explicitamente listados aqui, sempre dentro do grupo em
 # que foram autorizados; não existe elevação de privilégio entre grupos.
-OWNER_ONLY_COMMANDS = frozenset({"jt", "jtbn", "unjtbn", "lock", "unlock", "divulgar", "spam", "jtbypass"})
+OWNER_ONLY_COMMANDS = frozenset({"jt", "jtbn", "unjtbn", "lock", "unlock", "divulgar", "spam"})
 DELEGATED_COMMANDS = frozenset({"help", "blacklist", "unblacklist", "jtperm", "unjtperm", "latency"})
 
 logging.basicConfig(
@@ -765,7 +747,7 @@ CHAT_MEMBER_CACHE_TTL = 5.0
 CHAT_MEMBER_ERROR_TTL = 1.5
 CHAT_MEMBER_CACHE: dict[tuple[int, int], tuple[float, object | None]] = {}
 CHAT_MEMBER_INFLIGHT: dict[tuple[int, int], asyncio.Task] = {}
-ALLOWED_UPDATES = ["message", "my_chat_member", "chat_member"]
+ALLOWED_UPDATES = ["message", "edited_message", "message_reaction", "my_chat_member", "chat_member"]
 BLACKLIST_TELEMETRY = {
     "matched": 0,
     "delete_scheduled": 0,
@@ -798,6 +780,9 @@ BLACKLIST_TELEMETRY = {
     "banperm_reentry_attempted": 0,
     "banperm_reentry_success": 0,
     "banperm_reentry_failed": 0,
+    "reaction_detected": 0,
+    "reaction_removed": 0,
+    "reaction_remove_failed": 0,
 }
 
 
@@ -1016,161 +1001,6 @@ def _is_transient_api_error(exc: BaseException) -> bool:
     return isinstance(exc, (RetryAfter, TimedOut, NetworkError))
 
 
-class JtBypassError(ValueError):
-    """Falha controlada ao resolver um redirecionamento público."""
-
-
-class _PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
-    max_redirections = JTBYPASS_MAX_REDIRECTS
-
-    def __init__(self):
-        super().__init__()
-        self.redirect_count = 0
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        resolved_url = urllib.parse.urljoin(req.full_url, newurl)
-        self.redirect_count += 1
-        if self.redirect_count > JTBYPASS_MAX_REDIRECTS:
-            raise JtBypassError("limite de redirecionamentos excedido")
-        _validate_jtbypass_url(resolved_url, entry=False)
-        return super().redirect_request(req, fp, code, msg, headers, resolved_url)
-
-
-def _is_public_ip(address: str) -> bool:
-    try:
-        parsed = ipaddress.ip_address(address)
-    except ValueError:
-        return False
-    return not (
-        parsed.is_private
-        or parsed.is_loopback
-        or parsed.is_link_local
-        or parsed.is_reserved
-        or parsed.is_multicast
-        or parsed.is_unspecified
-    )
-
-
-def _validate_jtbypass_url(raw_url: str, *, entry: bool) -> str:
-    value = str(raw_url or "").strip()
-    if not value or len(value) > JTBYPASS_MAX_URL_LENGTH:
-        raise JtBypassError("URL vazia ou longa demais")
-    try:
-        parsed = urllib.parse.urlsplit(value)
-        scheme = parsed.scheme.lower()
-        hostname = parsed.hostname
-        port = parsed.port
-    except ValueError as exc:
-        raise JtBypassError("URL inválida") from exc
-    if scheme not in {"http", "https"} or not hostname:
-        raise JtBypassError("somente URLs HTTP(S) são aceitas")
-    if parsed.username is not None or parsed.password is not None:
-        raise JtBypassError("URLs com credenciais não são aceitas")
-    if port not in {None, 80, 443}:
-        raise JtBypassError("portas personalizadas não são aceitas")
-    try:
-        normalized_host = hostname.encode("idna").decode("ascii").lower().rstrip(".")
-    except UnicodeError as exc:
-        raise JtBypassError("hostname inválido") from exc
-    if entry and normalized_host not in JTBYPASS_ENTRY_HOSTS:
-        raise JtBypassError("o domínio inicial não está permitido")
-    try:
-        resolved_addresses = {
-            result[4][0]
-            for result in socket.getaddrinfo(
-                normalized_host,
-                port or (443 if scheme == "https" else 80),
-                type=socket.SOCK_STREAM,
-            )
-        }
-    except OSError as exc:
-        raise JtBypassError("não foi possível consultar o domínio") from exc
-    if not resolved_addresses or any(not _is_public_ip(address) for address in resolved_addresses):
-        raise JtBypassError("o destino não é um endereço público")
-    return urllib.parse.urlunsplit((scheme, parsed.netloc, parsed.path or "/", parsed.query, parsed.fragment))
-
-
-def _resolve_public_redirect_local(start_url: str) -> tuple[str, int]:
-    """Segue redirects HTTP(S) públicos localmente, sem executar a página."""
-    handler = _PublicRedirectHandler()
-    opener = urllib.request.build_opener(handler)
-    request = urllib.request.Request(
-        start_url,
-        headers={
-            "Accept": "*/*",
-            "Cache-Control": "no-cache",
-            "User-Agent": "JtzinBot/1.0 public-redirect-check",
-        },
-        method="HEAD",
-    )
-    try:
-        with opener.open(request, timeout=JTBYPASS_TIMEOUT_SECONDS) as response:
-            final_url = _validate_jtbypass_url(response.geturl(), entry=False)
-    except JtBypassError:
-        raise
-    except urllib.error.HTTPError as exc:
-        raise JtBypassError(f"resposta HTTP {exc.code}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise JtBypassError("falha de rede ao consultar o link") from exc
-    return final_url, handler.redirect_count
-
-
-def _resolve_public_redirect_remote(start_url: str) -> tuple[str, int]:
-    """Consulta um expander público que só segue Location HTTP(S), sem JavaScript."""
-    api_url = _validate_jtbypass_url(JTBYPASS_REMOTE_API_URL, entry=False)
-    payload = json.dumps(
-        {
-            "url": start_url,
-            "method": "GET",
-            "followMetaRefresh": False,
-            "maxHops": JTBYPASS_MAX_REDIRECTS,
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        api_url,
-        data=payload,
-        headers={
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": "JtzinBot/1.0 public-redirect-check",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=JTBYPASS_REMOTE_API_TIMEOUT_SECONDS) as response:
-            raw_body = response.read(512 * 1024)
-    except urllib.error.HTTPError as exc:
-        raise JtBypassError(f"API pública respondeu HTTP {exc.code}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise JtBypassError("API pública indisponível") from exc
-    try:
-        result = json.loads(raw_body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise JtBypassError("API pública retornou JSON inválido") from exc
-    if not isinstance(result, dict) or result.get("error"):
-        raise JtBypassError("API pública não conseguiu consultar o link")
-    final_result = result.get("final_result")
-    final_url = final_result.get("final_url") if isinstance(final_result, dict) else None
-    if not isinstance(final_url, str) or not final_url.strip():
-        raise JtBypassError("API pública não retornou a URL final")
-    validated_url = _validate_jtbypass_url(final_url, entry=False)
-    redirects = result.get("redirects")
-    redirect_count = len(redirects) if isinstance(redirects, list) else 0
-    return validated_url, min(redirect_count, JTBYPASS_MAX_REDIRECTS)
-
-
-def _resolve_public_redirect(raw_url: str) -> tuple[str, int]:
-    """Retorna a URL final de redirects públicos, com API sem chave e fallback local."""
-    start_url = _validate_jtbypass_url(raw_url, entry=True)
-    if JTBYPASS_REMOTE_API_ENABLED:
-        try:
-            return _resolve_public_redirect_remote(start_url)
-        except JtBypassError as exc:
-            logger.info("Fallback local do JtBypass após falha da API pública: %s", exc)
-    return _resolve_public_redirect_local(start_url)
-
-
 def _retry_backoff(attempt: int) -> float:
     # Backoff exponencial pequeno: recupera falhas transitórias sem travar comandos.
     return min(API_RETRY_MAX_SECONDS, API_RETRY_BASE_SECONDS * (2 ** max(0, int(attempt))))
@@ -1326,6 +1156,73 @@ def _schedule_delete_now(bot, message):
     pending[int(message_id)] = time.perf_counter()
     if int(chat_id) not in _delete_batch_tasks:
         _delete_batch_tasks[int(chat_id)] = _track_task(_delete_batch_worker(bot, int(chat_id)))
+
+
+async def _remove_all_user_reactions(bot, chat_id: int, user_id: int):
+    """Remove as reações recentes do usuário sem apagar mensagens de terceiros."""
+    remove_all = getattr(bot, "delete_all_message_reactions", None)
+    if not callable(remove_all):
+        return False
+    try:
+        await _api_call(
+            remove_all,
+            chat_id=int(chat_id),
+            user_id=int(user_id),
+            operation_name="remoção das reações do usuário",
+            retry_after_maximum=60.0,
+        )
+        return True
+    except (BadRequest, Forbidden, TelegramError):
+        BLACKLIST_TELEMETRY["reaction_remove_failed"] += 1
+        logger.debug("Telegram recusou a remoção das reações do usuário", exc_info=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        BLACKLIST_TELEMETRY["reaction_remove_failed"] += 1
+        logger.debug("Falha inesperada ao remover as reações do usuário", exc_info=True)
+    return False
+
+
+async def on_message_reaction_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove a reação nova de um usuário punido sem apagar a mensagem reagida."""
+    reaction = getattr(update, "message_reaction", None)
+    chat = getattr(reaction, "chat", None) if reaction else None
+    user = getattr(reaction, "user", None) if reaction else None
+    new_reaction = getattr(reaction, "new_reaction", ()) if reaction else ()
+    if not reaction or not chat or not user or user.is_bot or not new_reaction:
+        return
+    user_id = int(user.id)
+    chat_id = int(chat.id)
+    if _is_owner(user_id):
+        return
+    if user_id not in BLACKLIST_CACHE.get(chat_id, set()):
+        return
+    BLACKLIST_TELEMETRY["reaction_detected"] += 1
+    remove_one = getattr(context.bot, "delete_message_reaction", None)
+    if not callable(remove_one):
+        BLACKLIST_TELEMETRY["reaction_remove_failed"] += 1
+        return
+    try:
+        removed = await _api_call(
+            remove_one,
+            chat_id=chat_id,
+            message_id=int(reaction.message_id),
+            user_id=user_id,
+            operation_name="remoção de reação blacklistada",
+            retry_after_maximum=60.0,
+        )
+        if removed:
+            BLACKLIST_TELEMETRY["reaction_removed"] += 1
+        else:
+            BLACKLIST_TELEMETRY["reaction_remove_failed"] += 1
+    except (BadRequest, Forbidden, TelegramError):
+        BLACKLIST_TELEMETRY["reaction_remove_failed"] += 1
+        logger.debug("Telegram recusou a remoção da reação blacklistada", exc_info=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        BLACKLIST_TELEMETRY["reaction_remove_failed"] += 1
+        logger.debug("Falha inesperada ao remover a reação blacklistada", exc_info=True)
 
 
 def _schedule_delete(message, delay: int = DELETE_AFTER_SECONDS):
@@ -2372,51 +2269,6 @@ async def cmd_spam(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cmd_jtbypass(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Resolve redirecionamentos HTTP(S) públicos de hosts permitidos."""
-    if not await _require_owner_access(update, context):
-        return
-    args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
-    if len(args) != 1:
-        await _reply_and_cleanup(
-            update,
-            "❌ Uso: <code>.jtbypass https://alpharede.com/seu-link</code> ou "
-            "<code>.jtbypass https://monteolympus.com/seu-link</code>.",
-        )
-        return
-    raw_url = args[0]
-    if len(raw_url) > JTBYPASS_MAX_URL_LENGTH:
-        await _reply_and_cleanup(update, f"❌ O link excede o limite de {JTBYPASS_MAX_URL_LENGTH} caracteres.")
-        return
-    try:
-        final_url, redirect_count = await asyncio.to_thread(_resolve_public_redirect, raw_url)
-    except JtBypassError as exc:
-        logger.info("JtBypass recusado: %s", exc)
-        await _reply_and_cleanup(
-            update,
-            "⚠️ Não encontrei um redirecionamento HTTP público permitido. "
-            "O link pode exigir etapas no navegador, captcha, login, monetização ou proteção anti-bot; "
-            "essas barreiras não são contornadas pelo bot.",
-        )
-        return
-    except Exception:
-        logger.exception("Falha inesperada ao resolver JtBypass")
-        await _reply_and_cleanup(update, "❌ Não foi possível consultar o link agora. Tente novamente mais tarde.")
-        return
-    if redirect_count:
-        detail = f"{redirect_count} redirecionamento(s) HTTP"
-    else:
-        detail = "nenhum redirecionamento HTTP"
-    safe_final_url = _safe_html(final_url)
-    await _reply_and_cleanup(
-        update,
-        "✅ <b>Destino público encontrado</b>\n"
-        f"🔁 {detail}.\n"
-        f"🔗 <a href=\"{safe_final_url}\">{safe_final_url}</a>\n\n"
-        "O comando retorna a URL final observada em redirects HTTP(S) públicos; não executa JavaScript nem baixa arquivos.",
-    )
-
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_and_cleanup(
         update,
@@ -2436,7 +2288,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>.jt</code> — owner autoriza um usuário por reply, ID ou @username neste grupo.\n"
         "<code>.jt off</code> — revoga a autorização de um usuário; <code>.jt list [página]</code> lista os autorizados.\n"
         "Usuários autorizados podem usar apenas <code>.help</code>, <code>.blacklist</code>, <code>.unblacklist</code>, <code>.jtperm</code>, <code>.unjtperm</code> e <code>.latency</code>; comandos owner permanecem bloqueados.\n"
-        "<code>.blacklist</code> — adiciona o alvo à blacklist deste grupo.\n"
+        "<code>.blacklist</code> — adiciona o alvo à blacklist deste grupo e remove texto, mídias e reações permitidas pela Bot API.\n"
         "<code>.blacklist list</code> — lista a blacklist local deste grupo.\n"
         "<code>.unblacklist</code> — remove a blacklist local.\n"
         "<code>.jtperm</code> — bane permanentemente o alvo deste grupo e reaplica o bloqueio se ele tentar reentrar.\n"
@@ -2448,8 +2300,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>.lock</code> — fecha o grupo para membros; administradores e o dono continuam podendo falar.\n"
         "<code>.unlock</code> — abre o grupo e restaura as permissões anteriores.\n"
         "<code>.latency</code> — mede uma chamada real à API do Telegram.\n"
-        "<code>.jtbypass URL</code> — owner-only; retorna a URL final de redirects HTTP(S) públicos de alpharede.com e monteolympus.com, com consulta local e fallback público.\n"
-        "O <code>.jtbypass</code> não contorna captcha, login, anúncios obrigatórios, monetização ou proteções anti-bot.\n"
         "<code>.divulgar 30m on</code> — cria uma nova agenda para texto, foto ou vídeo respondido.\n"
         "<code>.divulgar list</code> — lista as agendas ativas com seus IDs.\n"
         "<code>.divulgar off ID</code> — desliga uma agenda específica; <code>off all</code> desliga todas.\n"
@@ -2712,6 +2562,7 @@ async def cmd_latency(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Workers: <code>{BLACKLIST_TELEMETRY['background_task_errors']}</code> falhas capturadas\n"
         f"• Spam: <code>{BLACKLIST_TELEMETRY['spam_active']}</code> ativo; <code>{BLACKLIST_TELEMETRY['spam_started']}</code> iniciados; <code>{BLACKLIST_TELEMETRY['spam_completed']}</code> concluídos; <code>{BLACKLIST_TELEMETRY['spam_sent']}</code> enviados; <code>{BLACKLIST_TELEMETRY['spam_failed']}</code> falhas\n"
         f"• Banperm reentrada: <code>{BLACKLIST_TELEMETRY['banperm_reentry_attempted']}</code> tentativas / <code>{BLACKLIST_TELEMETRY['banperm_reentry_success']}</code> OK / <code>{BLACKLIST_TELEMETRY['banperm_reentry_failed']}</code> falhas\n"
+        f"• Reações blacklistadas: <code>{BLACKLIST_TELEMETRY['reaction_detected']}</code> detectadas / <code>{BLACKLIST_TELEMETRY['reaction_removed']}</code> removidas / <code>{BLACKLIST_TELEMETRY['reaction_remove_failed']}</code> falhas\n"
         "• Polling: ✅ processo monitorado pelo watchdog + heartbeat\n"
         "• Userbot: ⏸️ desligado\n"
         "\nA medição separa atraso do update, fila local e tempo do RPC de exclusão."
@@ -2736,7 +2587,7 @@ async def cmd_unblacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_and_cleanup(update, f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) removido da blacklist local.")
 
 
-DOT_COMMAND_RE = re.compile(r"^\.(help|jt|jtbypass|unblacklist|unjtperm|unjtbn|blacklist|jtperm|jtbn|lock|unlock|latency|divulgar|spam)(?:\s+.*)?$", re.IGNORECASE)
+DOT_COMMAND_RE = re.compile(r"^\.(help|jt|unblacklist|unjtperm|unjtbn|blacklist|jtperm|jtbn|lock|unlock|latency|divulgar|spam)(?:\s+.*)?$", re.IGNORECASE)
 DOT_COMMANDS = {
     "help": "cmd_help",
     "blacklist": "cmd_blacklist",
@@ -2751,7 +2602,6 @@ DOT_COMMANDS = {
     "divulgar": "cmd_divulgar",
     "spam": "cmd_spam",
     "jt": "cmd_jt",
-    "jtbypass": "cmd_jtbypass",
 }
 
 
@@ -2857,10 +2707,13 @@ async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_and_cleanup(update, "❌ Não foi possível persistir a blacklist.")
         return
     BLACKLIST_CACHE[chat_id].add(target.user_id)
+    # Limpa as reações existentes sem apagar mensagens de terceiros; as novas
+    # reações são removidas pelo MessageReactionHandler em tempo real.
+    _track_task(_remove_all_user_reactions(context.bot, chat_id, target.user_id))
     await _reply_and_cleanup(
         update,
         f"✅ <b>{_safe_html(target.label)}</b> (<code>{target.user_id}</code>) foi adicionado à blacklist local.\n"
-        "As próximas mensagens dele serão apagadas automaticamente.",
+        "Texto, mídia, stickers, GIFs, documentos, áudios, vozes e outras mensagens dele serão apagados enquanto o bot estiver ativo; reações também serão removidas quando a API as reportar.",
     )
 
 
@@ -3096,8 +2949,7 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def cmd_unjtbn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not _is_owner(update.effective_user.id):
-        await _reply_and_cleanup(update, "⛔ Este comando é exclusivo dos proprietários configurados.")
+    if not await _require_owner_access(update, context):
         return
     target = await _resolve_target(update, context)
     if target is None:
@@ -3138,8 +2990,7 @@ async def cmd_unjtbn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_jtbn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user or not _is_owner(update.effective_user.id):
-        await _reply_and_cleanup(update, "⛔ Este comando é exclusivo dos proprietários configurados.")
+    if not await _require_owner_access(update, context):
         return
     args = [str(arg).strip() for arg in (context.args or []) if str(arg).strip()]
     if args and args[0].lower() == "list":
@@ -3420,6 +3271,11 @@ def main():
     )
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(MessageReactionHandler(
+        on_message_reaction_update,
+        message_reaction_types=MessageReactionHandler.MESSAGE_REACTION_UPDATED,
+        block=False,
+    ), group=1)
     app.add_handler(MessageHandler(filters.Regex(DOT_COMMAND_RE), on_dot_command))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_group_message), group=1)
     app.add_error_handler(error_handler)
